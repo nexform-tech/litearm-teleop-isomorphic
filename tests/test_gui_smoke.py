@@ -120,3 +120,35 @@ def test_teleop_button_emits_the_state_the_user_clicked(qapp):
     btn.click()
     assert got == [True, False], f"第二次点击应发 False（停止），实际 {got}"
     w.close()
+
+
+# ────────────────────────── 末端载荷（夹爪）──────────────────────────
+
+def test_gripper_preset_fills_600g_and_3cm(qapp):
+    w = MainWindow(Settings())
+    w.page_teleop.btn_gripper.click()
+    assert w.page_teleop.sp_mass.value() == 0.6
+    assert [sp.value() for sp in w.page_teleop.sp_com] == [0.03, 0.0, 0.0]
+    w.close()
+
+
+def test_apply_payload_emits_what_is_in_the_boxes(qapp):
+    w = MainWindow(Settings())
+    got = []
+    w.page_teleop.payload_applied.connect(lambda m, c: got.append((m, list(c))))
+    w.page_teleop.btn_gripper.click()
+    w.page_teleop.btn_payload.click()
+    assert got == [(0.6, [0.03, 0.0, 0.0])], got
+    w.close()
+
+
+def test_payload_label_shows_the_readback_not_the_input(qapp):
+    """⚠ 显示必须是**读回值** —— 固件静默钳制，显示输入值就是在撒谎。"""
+    w = MainWindow(Settings())
+    s = Snapshot(role=ROLE_MASTER)
+    s.payload_mass = 0.0            # 固件把 -5 钳成了 0
+    s.payload_com = [1.0, 0.0, 0.0]
+    w._on_state(s)
+    txt = w.page_teleop.lab_payload.text()
+    assert "0.000 kg" in txt and "没设上" in txt, txt
+    w.close()

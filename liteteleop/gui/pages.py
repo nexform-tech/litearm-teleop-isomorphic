@@ -5,6 +5,7 @@ from typing import Optional
 
 from PyQt5 import QtCore, QtWidgets
 
+from .. import servo
 from ..arm_worker import ROLE_MASTER, ROLE_SLAVE, Snapshot, PUB_HZ, SLAVE_HZ
 from ..ports import list_arms
 from ..settings import Settings
@@ -157,7 +158,10 @@ class JointsPage(QtWidgets.QWidget):
 
 
 class TeleopPage(QtWidgets.QWidget):
-    """遥操页：主臂 vs 从臂对照 + 参数。"""
+    """遥操页：主臂 vs 从臂对照 + 参数 + **末端载荷（夹爪）**。"""
+
+    #: (mass_kg, [x, y, z]) —— 由 main_window 接到 `worker.set_payload`
+    payload_applied = QtCore.pyqtSignal(float, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -179,6 +183,58 @@ class TeleopPage(QtWidgets.QWidget):
         self.lab_params.setWordWrap(True)
         lay.addWidget(self.lab_params)
 
+        # ── 末端载荷（夹爪）──────────────────────────────────────────────
+        box = QtWidgets.QGroupBox("末端载荷（夹爪）—— 影响重力前馈")
+        bl = QtWidgets.QGridLayout(box)
+
+        self.sp_mass = QtWidgets.QDoubleSpinBox()
+        self.sp_mass.setRange(0.0, 20.0); self.sp_mass.setDecimals(3)
+        self.sp_mass.setSingleStep(0.05); self.sp_mass.setSuffix(" kg")
+        self.sp_mass.setValue(servo.DEFAULT_PAYLOAD_MASS)
+        self.sp_com = []
+        for k, name in enumerate(("x", "y", "z")):
+            sp = QtWidgets.QDoubleSpinBox()
+            sp.setRange(-1.0, 1.0); sp.setDecimals(4)
+            sp.setSingleStep(0.005); sp.setSuffix(" m")
+            sp.setValue(servo.DEFAULT_PAYLOAD_COM[k])
+            self.sp_com.append(sp)
+
+        bl.addWidget(QtWidgets.QLabel("质量"), 0, 0)
+        bl.addWidget(self.sp_mass, 0, 1)
+        for k, name in enumerate(("质心 x", "质心 y", "质心 z")):
+            bl.addWidget(QtWidgets.QLabel(name), 0, 2 + k)
+            bl.addWidget(self.sp_com[k], 0, 3 + k)
+        bl.addWidget(QtWidgets.QLabel("⚠ 质心在 <b>ee_link 系</b>、单位米"), 1, 0, 1, 3)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_payload = QtWidgets.QPushButton("应用载荷")
+        self.btn_gripper = QtWidgets.QPushButton("预设：夹爪 600 g / 3 cm")
+        self.btn_gripper.clicked.connect(self._preset_gripper)
+        self.btn_payload.clicked.connect(self._apply_payload)
+        row.addWidget(self.btn_payload); row.addWidget(self.btn_gripper)
+        w = QtWidgets.QWidget(); w.setLayout(row)
+        bl.addWidget(w, 1, 3, 1, 3)
+
+        self.lab_payload = QtWidgets.QLabel("当前生效：—")
+        self.lab_payload.setWordWrap(True)
+        bl.addWidget(self.lab_payload, 2, 0, 1, 6)
+        note = QtWidgets.QLabel(
+            "⚠ 固件会**静默钳制**（质量 [0,20]、质心 [-1,1]）且照样回 ACK ⇒ "
+            "下面显示的是**读回值**，不是输入值。⛔ 只写 RAM，断电即还原。")
+        note.setWordWrap(True)
+        bl.addWidget(note, 3, 0, 1, 6)
+        lay.addWidget(box)
+
+    def _preset_gripper(self) -> None:
+        self.sp_mass.setValue(servo.DEFAULT_PAYLOAD_MASS)
+        for k, v in enumerate(servo.DEFAULT_PAYLOAD_COM):
+            self.sp_com[k].setValue(v)
+
+    def _apply_payload(self) -> None:
+        self.payload_applied.emit(
+            float(self.sp_mass.value()),
+            [float(sp.value()) for sp in self.sp_com])
+
     def apply(self, s: Snapshot) -> None:
         # 状态行：**没有状态机** —— litearm-server 用 `is_running` 派生 active
         if s.role == ROLE_MASTER:
@@ -193,6 +249,13 @@ class TeleopPage(QtWidgets.QWidget):
         for r in range(N_JOINTS):
             if len(s.q) == N_JOINTS:
                 self.cmp.item(r, 1).setText(f"{s.q[r]:+.4f}")
+        if s.payload_com:
+            self.lab_payload.setText(
+                f"当前生效：<b>{s.payload_mass:.3f} kg</b>，质心 "
+                f"[{', '.join(f'{v:+.4f}' for v in s.payload_com)}] m"
+                + ("　⚠ 全是 0 ⇒ 可能没设上" if s.payload_mass == 0.0 else ""))
+        else:
+            self.lab_payload.setText("当前生效：—（未连接或读不到）")
         self.lab_params.setText(
             "参数（逐值照抄 litearm-server 的 litearm_balanced.yaml · 执行器 move_js）\n"
             "  K = [25.0]×7   B = [0.5]×7   engage_sec = 0.3\n"

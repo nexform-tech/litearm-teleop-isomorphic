@@ -59,7 +59,8 @@ log = logging.getLogger("liteteleop.servo")
 
 __all__ = [
     "AlignTooFar", "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
-    "align_to_master", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
+    "align_to_master", "DEFAULT_PAYLOAD_MASS", "DEFAULT_PAYLOAD_COM",
+    "read_payload", "apply_payload", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
     "measure_move_js_cost",
 ]
@@ -95,11 +96,46 @@ class AlignTooFar(RuntimeError):
 #: ⚠ **等距遥操的正确用法是【先用手把两条臂摆到相近姿态再启动】** —— 对齐只兜小差。
 ALIGN_WARN_DELTA = 0.30
 
+# ── 末端载荷（夹爪）────────────────────────────────────────────────────────
+#: 默认载荷：**夹爪 600 g、质心 3 cm**（用户给的值，2026-09-28）。
+#: ⚠ 质心在 **`ee_link` 系**、单位 **米**（固件 `params.c:195` 逐轴钳 [-1, 1]）。
+#: ⚠ 夹爪是装在**主臂**上的，所以主臂进程要设；从臂若也装了就得各设各的。
+DEFAULT_PAYLOAD_MASS = 0.6
+DEFAULT_PAYLOAD_COM = (0.03, 0.0, 0.0)
+
+#: 载荷质量/质心的 ff item（`FF_SCALAR_ITEMS`）。
+_FF_ITEM_PAYLOAD_MASS = 4
+_FF_ITEM_PAYLOAD_COM = 5
+
 #: 连续被固件拒帧到这个次数 ⇒ 视作"链路/状态坏了"，抛出而不是继续硬撑。
 #: 理由：`move_js` 被拒 ⇒ **没有 kick 看门狗** ⇒ 0.1 s 后固件 fail-soft ⇒ **臂会垂**。
 #: 零星一两次没关系（下一拍就恢复），连续不停就是真问题，必须让人知道。
 _REJECT_ESCALATE = 20
 
+
+
+def read_payload(arm):
+    """读回**末端载荷** `(mass_kg, [x, y, z])`。
+
+    ⚠ 读回的是**固件钳后的真值** —— 这是唯一能确认"到底写进去了什么"的办法。
+    """
+    mass = float(arm.get_ff_scalar(_FF_ITEM_PAYLOAD_MASS, 0).value)
+    com = [float(arm.get_ff_scalar(_FF_ITEM_PAYLOAD_COM, k).value) for k in range(3)]
+    return mass, com
+
+
+def apply_payload(arm, mass: float, com=(0.0, 0.0, 0.0)):
+    """设末端载荷，并**读回**实际生效值。
+
+    ⛔ **只写 RAM**（不调 `save_params()` —— 那是整扇区擦写、不可逆）。
+
+    ⚠⚠ SDK 的 `set_payload` docstring 明说：**固件会静默钳制**
+    （`mass` → `[0, 20]`、`com` 逐轴 → `[-1, 1]`，`params.c:190/195`），
+    并且**照样回 ACK**。所以"调用了没报错"**不等于**"值生效了" ——
+    必须读回。本函数把读回值返回给调用方去显示。
+    """
+    arm.set_payload(float(mass), [float(v) for v in com])
+    return read_payload(arm)
 
 
 def hold_at_current(arm) -> None:

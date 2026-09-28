@@ -95,6 +95,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.page_link.connect_clicked.connect(self._connect)
         self.page_link.teleop_toggled.connect(self._toggle_teleop)
         self.page_link.settings_changed.connect(self._save)
+        self.page_teleop.payload_applied.connect(self._apply_payload)
 
         self._relock()
         self._log("就绪。⚠ 一个 CDC 口只允许一个进程。")
@@ -144,6 +145,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._log("启动遥操" if on else "停止遥操（受控接管 movej）")
         self.worker.set_teleop(on)
+
+    def _apply_payload(self, mass, com) -> None:
+        if self.worker is None:
+            self._log("⚠ 未连接，载荷未设置")
+            return
+        self._log(f"设置末端载荷：{mass:.3f} kg，质心 {[round(v, 4) for v in com]} m …")
+        self.worker.set_payload(mass, com)
 
     def _estop(self) -> None:
         """⛔ **不经 worker 队列**（§7.4）—— worker 可能正卡在收尾 `movej` 里。"""

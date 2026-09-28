@@ -368,3 +368,44 @@ def test_prime_gives_up_loudly_when_it_never_settles():
         servo.follow(DriftingArm(drift_steps=10 ** 9), lambda: None,
                      should_stop=lambda: False, engage_sec=0.0,
                      hz=100.0, )
+
+
+# ────────────────────────── 末端载荷（夹爪）──────────────────────────
+
+class PayloadArm(FakeArm):
+    """模拟固件的**静默钳制**：mass→[0,20]、com 逐轴→[-1,1]，而且**照样回 ACK**。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.p_mass = 0.0
+        self.p_com = [0.0, 0.0, 0.0]
+
+    def set_payload(self, mass, com=(0.0, 0.0, 0.0)):
+        self.p_mass = min(max(float(mass), 0.0), 20.0)          # ⚠ 静默钳，不报错
+        self.p_com = [min(max(float(v), -1.0), 1.0) for v in com]
+
+    def get_ff_scalar(self, item, sub=0):
+        if item == 4:
+            return _Msg(self.p_mass)
+        if item == 5:
+            return _Msg(self.p_com[sub])
+        raise AssertionError(f"意外的 item {item}")
+
+
+def test_apply_payload_reads_back_what_actually_landed():
+    """⚠ 固件**静默钳制**且照样回 ACK ⇒ 必须**读回**才知道写进去了什么。
+
+    判别力：`apply_payload` 若返回输入值而不是读回值，本用例会红。
+    """
+    arm = PayloadArm()
+    m, c = servo.apply_payload(arm, 0.6, (0.03, 0.0, 0.0))
+    assert (m, c) == (0.6, [0.03, 0.0, 0.0])
+
+    m2, c2 = servo.apply_payload(arm, -5.0, (2.0, 0.0, 0.0))     # 全越界
+    assert m2 == 0.0, "负质量被固件钳成 0，读回必须反映这一点"
+    assert c2[0] == 1.0, "质心被钳到 [-1,1]"
+
+
+def test_default_payload_is_the_gripper_the_user_gave():
+    assert servo.DEFAULT_PAYLOAD_MASS == 0.6            # 600 g
+    assert servo.DEFAULT_PAYLOAD_COM == (0.03, 0.0, 0.0)  # 质心 3 cm

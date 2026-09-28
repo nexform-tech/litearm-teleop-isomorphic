@@ -112,6 +112,9 @@ class Snapshot:
     frame_age: Optional[float] = None   # 从臂：最新一帧有多老（s）
     watchdog_trips: int = 0
     rejects: int = 0
+    # 末端载荷（夹爪）—— 单位为 kg / m（m 在 ee_link 系）
+    payload_mass: float = 0.0
+    payload_com: List[float] = field(default_factory=list)
     error: str = ""
 
 
@@ -152,6 +155,7 @@ class ArmWorker:
         self._frames_received = 0
         self._watchdog_trips = 0
         self._estop_outcome: Optional[tuple] = None
+        self._payload_t = 0.0
 
     # ────────────────────────── 生命周期 ──────────────────────────
     def start(self) -> None:
@@ -177,6 +181,42 @@ class ArmWorker:
         def _do() -> None:
             self._teleop_want = bool(on)
         self.post(_do)
+
+    def set_payload(self, mass: float, com) -> None:
+        """设末端载荷（夹爪）—— 排到 worker 线程上执行。
+
+        ⚠ 固件会**静默钳制**（mass→[0,20]、com→[-1,1]）且照样回 ACK ⇒
+        本方法**回读**并把真值记进快照，界面显示的是**读回值**而不是输入值。
+        """
+        def _do() -> None:
+            if self._arm is None:
+                self._log("⚠ 未连接，载荷未设置")
+                return
+            try:
+                m, c = servo.apply_payload(self._arm, mass, com)
+            except Exception as e:                       # noqa: BLE001
+                self._log(f"⛔ 设载荷失败: {e}")
+                return
+            with self._lock:
+                self._snap.payload_mass = m
+                self._snap.payload_com = list(c)
+            clamped = (abs(m - float(mass)) > 1e-9
+                       or any(abs(a - float(b)) > 1e-9 for a, b in zip(c, com)))
+            self._log(f"载荷已设：{m:.3f} kg，质心 {[round(v, 4) for v in c]} m"
+                      + ("   ⚠ **被固件钳过**（给的值超出 [0,20]/[-1,1]）" if clamped else ""))
+        self.post(_do)
+
+    def refresh_payload(self) -> None:
+        """读回载荷到快照。**只许在非跟随路径上调** —— 它是串口往返，会拖累伺服环。"""
+        if self._arm is None:
+            return
+        try:
+            m, c = servo.read_payload(self._arm)
+        except Exception:                                # noqa: BLE001
+            return
+        with self._lock:
+            self._snap.payload_mass = m
+            self._snap.payload_com = list(c)
 
     def snapshot(self) -> Snapshot:
         with self._lock:
@@ -285,12 +325,18 @@ class ArmWorker:
             if st is None or not st.enabled or st.faulted or st.joint_fault:
                 raise RuntimeError(f"起始状态不干净: {st and st.fault_detail}")
             self._log("已使能")
+            self.refresh_payload()                       # 读回当前载荷（含出厂默认）
 
             while not self._stop.is_set():
                 if self._teleop_want:
                     self._run_teleop()
                 else:
                     self._drain(0.1)
+                    # ⚠ 只在空闲时刷：读载荷是串口往返，**绝不能**塞进伺服环
+                    now = time.monotonic()
+                    if now - self._payload_t > 2.0:
+                        self._payload_t = now
+                        self.refresh_payload()
         except Exception as e:                           # noqa: BLE001
             with self._lock:
                 self._snap.error = str(e)
