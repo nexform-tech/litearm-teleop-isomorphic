@@ -28,7 +28,13 @@ def main(argv=None) -> int:
         python -m liteteleop --role slave  --cdc /dev/ttyACM1 --peer 127.0.0.1
     """
     import argparse
+    import logging
     _pin_sdk()
+    # ⚠ 必须配 handler：界面里那份 `_log` 走 `log.info`，而**没配 handler 就什么都不落盘**
+    #    —— 只有 warning 级以上才进文件。真机排查时日志文件是唯一的一手记录（界面关了就没了）。
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname).1s %(name)s: %(message)s",
+                        stream=sys.stderr)
     ap = argparse.ArgumentParser(prog="liteteleop", description="同构遥操上位机")
     ap.add_argument("--role", choices=["master", "slave"], default=None,
                     help="主臂=监听 / 从臂=连接")
