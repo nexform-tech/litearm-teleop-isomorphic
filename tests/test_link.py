@@ -97,23 +97,35 @@ def test_latest_slot_keeps_only_newest():
     assert slot.dropped == 1, "被覆盖的那帧要计入 dropped（不静默）"
 
 
-def test_latest_slot_take_clears():
-    slot = link.LatestSlot()
-    assert slot.take() == (None, 0.0), "空槽取回 (None, 0.0)"
-    slot.put(b"x", now=5.0)
-    assert slot.take() == (b"x", 5.0)
-    assert slot.take() == (None, 0.0), "取走后槽必须清空"
+def test_latest_slot_take_keeps_timestamp():
+    """⚠ `take()` **只清 payload，不动时间戳**。
 
-
-def test_latest_slot_age_is_local_and_zero_when_never_received():
-    """⚠ `peek_age` 是**本机**时间差，与帧里的 `ts`（主臂时钟）无关（spec §4.2）。
-
-    从未收到过时返回 0.0 —— **不是** `now`（那会让 watchdog 以为"刚收到"）。
+    早先版本把时间戳清成 0.0，而 0.0 又是"从未收到"的哨兵 ⇒ 「先取帧、再问帧龄」
+    会被读成"从未收到"，把一次正常读序变成链路死掉 ⇒ 转 HOLDING ⇒ 阻塞式重对齐。
     """
     slot = link.LatestSlot()
-    assert slot.peek_age(now=100.0) == 0.0, "从未收到 ⇒ 0.0"
+    assert slot.take() == (None, None), "空槽：payload 与时间戳都为 None"
+    slot.put(b"x", now=5.0)
+    assert slot.take() == (b"x", 5.0)
+    assert slot.take() == (None, 5.0), "payload 清了，但时间戳必须还在"
+    assert slot.peek_age(now=5.5) == pytest.approx(0.5), "取走之后帧龄必须照常可算"
+
+
+def test_latest_slot_age_none_when_never_received():
+    """从未收到过返回 **None**，不是 0.0 —— 0.0 是"刚刚收到"这个合法年龄。"""
+    slot = link.LatestSlot()
+    assert slot.ever_received is False
+    assert slot.peek_age(now=100.0) is None, "从未收到 ⇒ None（不是 0.0，也不是 100.0）"
     slot.put(b"x", now=10.0)
+    assert slot.ever_received is True
     assert slot.peek_age(now=10.25) == pytest.approx(0.25)
+
+
+def test_latest_slot_age_never_negative():
+    """帧龄夹到 ≥ 0：伺服线程先读 `now`、随后一帧带更大 `now` 落下时不得为负。"""
+    slot = link.LatestSlot()
+    slot.put(b"x", now=10.0)
+    assert slot.peek_age(now=9.5) == 0.0, "负龄必须夹到 0（否则一拍就被误判超时）"
 
 
 @pytest.mark.slow

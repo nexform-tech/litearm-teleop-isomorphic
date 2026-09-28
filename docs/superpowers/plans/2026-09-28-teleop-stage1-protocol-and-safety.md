@@ -46,6 +46,12 @@ PY
 **为什么写这条**：2026-09-28 我用 `\n{3,}\n\n` 批量折叠空行（为了过 MD012），**连围栏内的代码一起折了**，
 把 `@dataclass(frozen=True)` 和它的 `class Frame:` 之间插进了 2 个空行 —— 装饰器语法直接坏掉。
 而当时的自检只数空行（"残留 0 处"），**对"代码还能不能编译"零判别力**，于是静默通过。
+**⛔ 编辑本文档的硬规则：不要用双向切片拼字符串。**
+2026-09-28 两次事故都是它：锚点选错 ⇒ **静默删掉 155 行**（Task 5 的 Step 2~4 与整个实现块，
+编译检查抓不到）；`j` 落在 `i` **之前** ⇒ **整段被重复**（`## 阶段一验收清单` 出现两次）。
+⇒ 要用就**先断言 `j > i`**，改完**必须核对 Step 清单连续 + 行数 + 无重复标题**。
+更稳的做法：一次只做一处 `str.replace(old, new, 1)`，且 `old` 带足上下文保证唯一。
+
 **⇒ 判据要挑真正会坏的那个性质：含代码的文档，判据是「编译得过」，不是「格式看着对」。**
 
 **⚠ 还差一条 —— 编译检查抓不到「整块内容凭空消失」。** 2026-09-28 同一轮里，一次编辑把 Task 5 的
@@ -2216,6 +2222,38 @@ git commit -m "docs: add teleop known-traps section to readme"
 ```
 
 ---
+
+## ⚠ 交付后评审订正（2026-09-28）
+
+Task 1/3/4/5/6/7 交付后做了一轮最终审查，抓到的问题与处置。**以下三处的代码在评审后已改，
+与本文档 Task 5/6 的代码块不再逐字一致 —— 以 `liteteleop/` 下的文件为准。**
+
+| # | 问题 | 处置 |
+| --- | --- | --- |
+| 1 | `LatestSlot` 用 `0.0` 当"从未收到"的哨兵，而 `take()` 又把时间戳清成 `0.0` ⇒ 「先取帧、再问帧龄」被读成**从未收到** ⇒ 立刻 `HOLDING` ⇒ 触发**阻塞式重对齐**（单次读序就能让从臂中途停摆）。负龄也会误判超时 | **已改**：`_last_recv_ts is None` 才是"从未收到"；`take()` **只清 payload、不动时间戳**；`peek_age` 返回 `None`／夹到 ≥0；加 `ever_received` |
+| 2 | 「连续 5 拍」数的是 **tick 数不是帧数** —— watchdog(200ms) 比 tick(10ms) 长 20 倍 ⇒ 同一帧连续 20 拍都"新鲜"，一帧 50ms 就满足 ⇒ **防抖根本不存在**，链路每 250ms 一帧时会约 4 次/秒反复触发阻塞重对齐 | **已改**：`tick(..., frame_id=)` 数**不同的帧**，`frame_id` 取线协议的 `Frame.seq`；phase 2 **必须把 `seq` 传进来** |
+| 3 | `align_failed()` 无条件置位（与 `align_done()` 不对称）⇒ 从 `FOLLOWING`/`HOLDING` 调会把状态**拽回** `ALIGN_FAST`；**且它清 `_stop_pending`** ⇒ 「刚点停止 → 那条 `movej` 失败」这条路径会**把停止命令吞掉** | **已改**：加状态守卫；**不再动 `_stop_pending`**；加 `_align_failed` 让"失败后不许重试"可表达 |
+| 4 | `wants_movej()` 一个谓词盖住**两条不同的命令**（对齐 `movej` 目标=主臂快照/speed=align_speed；收尾 `movej` 目标=本机实测/speed=0.3） | **已改**：拆成 `wants_align_movej()` / `wants_stop_movej()` |
+| 5 | 「非有限目标 ⇒ 拒算 + 跳过本拍」不是完整契约：跳过也跳过 `watchdog_kick` ⇒ 固件 fail-soft ⇒ **臂缓慢下垂** | **已改**：专用异常 `NonFiniteTarget`（与 `LimitsError` 分开，否则接线错误会被当例行跳过吞掉）；**义务写进 spec §7.1**；升级 `HOLDING` 的接法见下方 phase-2 清单 |
+| 6 | 零宽度轴的不变量只在工厂里，`Limits` 类型本身接受 `lo == hi`（本仓自己的测试就这么构造过） | **已改**：不变量进 `Limits.__post_init__`；那个测试改用 J4 的**真实非对称**限位 `[-3.0715, +0.0175]` |
+| 7 | `test_slew_speed_limited` **没有判别力**：删掉 `v = clamp(v, ±v_limit)` 后 30/30 仍绿。实测该行是承重的 —— 起点 `dq=3.0`、`speed_limit=0.57` 时原版夹到 0.57，删掉后到 2.76 ⇒ `kd·\|dq\| = 30.4 Nm` vs `tau_max = 21 Nm`（**145%**，预算是 30%）。runtime 调小 `speed_limit_j`/`kd_budget`（spec §8 的界面字段）时正是它生效 | **已补**：新增起点越界的用例 |
+| 8 | Task 2 的 spike（**未执行**）有三处缺陷 —— 见下方单列 | **已改** |
+
+**仍未处置（本轮只记录，未改）**：`decode(expect_n=None)` 的宽松默认；`wire.encode` 对越界/非 float 抛 `OverflowError`/`TypeError` 而非
+ `WireError`；`Connector.received` 在回调**之前**自增（回调坏掉时界面显示"收帧正常"而臂不动）；`Listener.__init__` 失败路径无清理；`resolve` 与 spec 的 `MAX_JOINTS`
+ 1..255 不合（实现取 32，更安全，但 spec 自称权威）；五个方法收 `now` 却不用。
+
+## ⚠ Task 2 的 spike 缺陷（评审发现，**上真机前必须改**）
+
+Task 2 是决定 §5.1 的 `dq` 公式存废的闸门，所以一个**写错的闸门比没有闸门更贵**：
+
+1. **spike 内联的 `_slew` 与出货的 `slew_target` 不是同一个函数** —— 前者 `v_limit = max(1e-4, speed_limit)` 取**标量**，后者逐轴取 `speed_limit[i]`。用
+   spike 的调用约定去调出货版会 `TypeError`；更要紧的是**spike 报的数字出自另一个函数**。⇒ 改成 `import liteteleop.safety as safety` 直接用出货版（Task 5 已交付，spike
+   没有理由再内联）。
+2. **S3 只实现了 spec 四条判据里的两条**，且**永远碰不到承重轴**：只读 `st.q` 不读 `st.tau` ⇒ 判据③（`kd·dq_cmd ≤ kd_budget·tau_max`）无法评估；判据④（`\|dq_cmd\| ≤
+   speed_limit_j`）没查；驱动的是**单轴 J2**、上限 1.06 rad/s，而 J2 的设计上限是 2.13 ⇒ 只到 **37%**。§5.1 整个论证的承重轴是 **J4（0.573 rad/s）**，S3
+   按原样跑**永远观察不到它**。⇒ 改：读 `st.tau`、逐轴用 `speed_limit_from_kd` 算出的真实上限、**把 J4 作为驱动轴**、补齐四条判据。
+3. **变异表缺一条**：见上表 #7。
 
 ## 阶段一验收清单
 

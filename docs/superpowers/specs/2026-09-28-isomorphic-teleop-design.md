@@ -470,6 +470,9 @@ J3/J4 也能跑到 server 那个量级。
 | 软限位读不到（`all_joint_params()` 抛错 / 值非法） | **拒绝启动跟随**，停在 `IDLE` + 响亮报错。**不静默退化**（不学 server 的 ±9 兜底告警） |
 | 每帧目标 | `clamp(q_master, q_min, q_max)` —— **纵深**（固件自己也钳，§2.3(e)1），同时让界面能显示"被钳了" |
 | `move_js` 单帧抛异常 | 捕获 + 计数 + 循环继续；**不终止跟随**（一帧异常不该让臂停） |
+| ⚠ **目标值非有限（NaN/Inf）** | `clamp_to_limits` 抛 **`NonFiniteTarget`**（`LimitsError` 的子类，专为"本拍跳过"而设）⇒ 本拍**不下发** + 计数。⛔ **但"跳过下发"不是完整契约**：它也跳过了 `watchdog_kick` ⇒ 固件 100 ms 后 fail-soft（0.6× 刚度 + `τ=0`）⇒ **臂缓慢下垂**，正是安全层要防的那件事。⇒ **连续 N 拍（默认 5）之后必须主动升级 `HOLDING`**，不能只计数 |
+| ⚠ **陈旧数据不许下发** | `may_dispatch` 只读状态、**不自带新鲜度检查** ⇒ phase 2 **每拍必须先 `tick(now, frame_age, frame_id)` 再 poll**；`frame_id` 取线协议的 `Frame.seq`，恢复判据数的是**不同的帧**而不是 tick 数 |
+| 首帧诊断 | 「启动后 N 秒未收首帧」与稳态 watchdog 是**两件事**（后者只在收到首帧后才生效）。载体 = `LatestSlot.ever_received` / `peek_age() is None` |
 | ⚠ `move_js` **单次** ACK 超时 | **当拍即报警**，不是「计数到 5 次再说」。理由：`_cmd` 超时是 **1.2 s**，而固件看门狗是 **0.1 s** ⇒ **一次超时就够让固件 fail-soft 下垂**。连续 2 次即转 `HOLDING` |
 | watchdog | §5.2 |
 | 启动遥操前 | 断言 `enabled`、`!faulted`、`joint_fault == 0` |

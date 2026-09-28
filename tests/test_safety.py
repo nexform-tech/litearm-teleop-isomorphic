@@ -153,9 +153,13 @@ def test_saturate_dq_zeroes_clamped_axes():
 
 def test_saturate_dq_in_j4_upper_limit_case():
     """⚠ J4 上端只有 +0.0175 rad —— 主臂一拖过零就吃到，不是边角情况。"""
-    lim = safety.read_limits_ok([-3.0] * 7, [3.0] * 7, 7)
-    lim = safety.Limits(lo=lim.lo[:3] + (0.0175,) + lim.lo[4:],
-                        hi=lim.hi[:3] + (0.0175,) + lim.hi[4:])
+    # ⚠ 用 J4 的**真实**软限位（`e2e_movejs_real.py` 的 REAL_MIN/REAL_MAX）：
+    # 下 -3.0715、上只有 +0.0175 —— 是**非对称**的紧上端，不是一个零宽度的轴。
+    # （早先这里把 lo/hi 都写成 0.0175，等于构造了一个非法的 `Limits`；
+    #   零宽度现在被类型本身拒绝，因为这测试原先把"工厂是唯一守卫"当成了前提。）
+    lo = (-3.0, -3.0, -3.0, -3.0715, -3.0, -3.0, -3.0)
+    hi = (3.0, 3.0, 3.0, 0.0175, 3.0, 3.0, 3.0)
+    lim = safety.read_limits_ok(lo, hi, 7)
     q, sat = safety.clamp_to_limits([0.0, 0.0, 0.0, 0.20, 0.0, 0.0, 0.0], lim)
     assert sat[3] is True, "J4 超出 0.0175 应被判被钳"
     dq = safety.saturate_dq([1.0] * 7, sat)
@@ -311,3 +315,105 @@ def test_state_missing_q_blocks_dispatch():
     sm.align_done(now=1.0)
     assert sm.may_dispatch(now=1.0, have_slave_q=True) is True
     assert sm.may_dispatch(now=1.0, have_slave_q=False) is False
+
+
+# ── 评审订正（2026-09-28）：四条会造成具体臂行为错误的缺陷 ──────────────────
+
+def test_align_failed_does_not_swallow_stop_command():
+    """⛔ 真缺陷：`align_failed()` 早先会把已排队的收尾命令清掉。
+
+    路径：「用户点停止（已排队收尾 `movej`）→ 恰好那条 `movej` 失败」。
+    早先版本的结果：收尾命令被吞、状态留在 `ALIGN_FAST` 而不是 `IDLE`。
+    """
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.user_stop(now=1.0)
+    assert sm.state == safety.IDLE
+    assert sm.wants_stop_command() is True
+    sm.align_failed(now=1.1)                       # 从 IDLE 调（非 ALIGN_FAST）
+    assert sm.state == safety.IDLE, "有状态守卫 ⇒ 不该被拽去 ALIGN_FAST"
+    assert sm.wants_stop_command() is True, "⛔ 收尾命令绝不能被吞掉"
+
+
+def test_align_failed_guarded_to_align_fast():
+    """`align_failed()` 只在 `ALIGN_FAST` 生效（与 `align_done()` 对称）。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    assert sm.state == safety.FOLLOWING
+    sm.align_failed(now=2.0)
+    assert sm.state == safety.FOLLOWING, "从 FOLLOWING 调不许把状态拽回对齐"
+
+
+def test_align_failed_blocks_retry():
+    """失败后不许重试 —— 否则 phase 2 的 `while wants_align_movej()` 会变成
+    每 3 秒一次阻塞 `movej` 的忙重试环。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    assert sm.wants_align_movej() is True, "还没失败 ⇒ 该发对齐命令"
+    sm.align_failed(now=1.0)
+    assert sm.state == safety.ALIGN_FAST
+    assert sm.wants_align_movej() is False, "失败后不许重试"
+    sm.start(now=2.0)                              # 用户重新启动 ⇒ 允许再来
+    assert sm.wants_align_movej() is True
+
+
+def test_recover_needs_distinct_frames():
+    """⛔ 真缺陷：恢复必须数**不同的帧**，不是 tick 数。
+
+    watchdog(200ms) 比 tick(10ms) 长 20 倍 ⇒ 同一帧能被连续 20 拍判为"新鲜"，
+    早先版本下 `recover_frames=5` 只要一帧 50ms 就满足，"防抖"根本不存在：
+    链路每 250ms 一帧时会以约 4 次/秒的节奏反复触发**阻塞式**重对齐。
+    """
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    sm.tick(now=1.5, frame_age=0.5)                # 断链 ⇒ HOLDING
+    assert sm.state == safety.HOLDING
+    for k in range(20):                            # 20 拍都是**同一帧** seq=7
+        sm.tick(now=2.0 + 0.01 * k, frame_age=0.01, frame_id=7)
+    assert sm.state == safety.HOLDING, "同一帧重复 20 拍不许触发恢复"
+    for k in range(5):                             # 5 个**不同帧**
+        sm.tick(now=3.0 + 0.01 * k, frame_age=0.01, frame_id=100 + k)
+    assert sm.state == safety.ALIGN_FAST, "5 个不同帧才恢复"
+
+
+def test_tick_none_age_means_never_received():
+    """`frame_age=None`（从未收到）必须判成不新鲜 —— 与 `LatestSlot.peek_age` 的契约一致。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    assert sm.tick(now=1.1, frame_age=None) is safety.HOLDING
+
+
+def test_wants_align_and_stop_movej_are_distinct():
+    """对齐 `movej` 与收尾 `movej` 是**两条不同的命令**（目标与速度都不同），
+    早先合成一个 `wants_movej()` 不提供安全性，反而招来"发错目标"。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    assert (sm.wants_align_movej(), sm.wants_stop_movej()) == (True, False)
+    sm.align_done(now=1.0)
+    assert (sm.wants_align_movej(), sm.wants_stop_movej()) == (False, False)
+    sm.user_stop(now=2.0)
+    assert (sm.wants_align_movej(), sm.wants_stop_movej()) == (False, True)
+
+
+def test_non_finite_target_has_its_own_type():
+    """⚠ 「本拍该跳过」与「你的接线坏了」必须能被 phase 2 分开 —— 否则一个真实的
+    接线错误会被当成一次例行的"跳过这一帧"吞掉。"""
+    lim = safety.read_limits_ok([-1.0] * 7, [1.0] * 7, 7)
+    with pytest.raises(safety.NonFiniteTarget):
+        safety.clamp_to_limits([0.0, float("nan")] + [0.0] * 5, lim)
+    with pytest.raises(safety.NonFiniteTarget):
+        safety.clamp_to_limits([0.0, float("inf")] + [0.0] * 5, lim)
+    assert issubclass(safety.NonFiniteTarget, safety.LimitsError), "仍是它的子类，便于粗粒度捕获"
+    # 长度不符是**配置/接线**错误，不是"本拍跳过"
+    with pytest.raises(safety.LimitsError) as e:
+        safety.clamp_to_limits([0.0] * 6, lim)
+    assert not isinstance(e.value, safety.NonFiniteTarget)
+
+
+def test_limits_reject_zero_width_in_the_type_itself():
+    """零宽度不变量放在**类型**里，不只是工厂里（phase 2 会长期持有 `Limits` 对象）。"""
+    with pytest.raises(safety.LimitsError, match="零宽度或反了"):
+        safety.Limits(lo=(0.0, 1.0), hi=(0.0, 2.0))

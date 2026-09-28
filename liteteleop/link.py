@@ -124,12 +124,18 @@ class LatestSlot:
 
     只保留**最新**一帧：迟到帧直接覆盖，不排队。遥操只要最新姿态，
     积压帧会让从臂去追一条过期的轨迹。
+
+    ⚠ **"从未收到"与"刚收到"必须能区分。** 早先版本用 `0.0` 当"从未收到"的哨兵，
+    于是 `take()` 把时间戳清成 `0.0` 之后，`peek_age()` 会把"刚取走一帧"报成"从未收到"
+    ⇒ 调用方（先取帧、再问帧龄）会立刻被判成链路死掉并转 `HOLDING`，
+    触发一次阻塞式重对齐 —— 单次读序就能让从臂**中途停摆**。
+    现在：`_last_recv_ts is None` 才是"从未收到"，`take()` **只清 payload、不动时间戳**。
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._payload: Optional[bytes] = None
-        self._recv_ts = 0.0
+        self._last_recv_ts: Optional[float] = None      # None = 从未收到
         self.dropped = 0
 
     def put(self, payload: bytes, now: float) -> None:
@@ -137,19 +143,36 @@ class LatestSlot:
             if self._payload is not None:
                 self.dropped += 1
             self._payload = payload
-            self._recv_ts = now
+            self._last_recv_ts = now
 
     def take(self):
-        """取走最新一帧（`(payload_or_None, recv_ts)`）。取走后槽清空。"""
-        with self._lock:
-            p, t = self._payload, self._recv_ts
-            self._payload, self._recv_ts = None, 0.0
-        return p, t
+        """取走最新 payload，返回 `(payload_or_None, last_recv_ts_or_None)`。
 
-    def peek_age(self, now: float) -> float:
-        """距最近一帧的**本地**时间（秒）。0.0 = 从未收到过。
-
-        ⚠ 这是**本机**时间差，与帧里的 `ts`（主臂时钟）无关 —— 跨机两端不同源。
+        ⚠ **时间戳保持不变** —— 它是"上次收到"的事实，取走 payload 不该抹掉它。
         """
         with self._lock:
-            return 0.0 if self._recv_ts == 0.0 else now - self._recv_ts
+            p = self._payload
+            self._payload = None
+            return p, self._last_recv_ts
+
+    @property
+    def ever_received(self) -> bool:
+        """是否**收到过**任何一帧。spec §5.2 的「启动后 N 秒未收首帧」诊断要用它 ——
+        它与「稳态 watchdog 超时」是**两件事**（后者只在收到首帧后才生效）。"""
+        with self._lock:
+            return self._last_recv_ts is not None
+
+    def peek_age(self, now: float) -> Optional[float]:
+        """距最近一帧的**本地**秒数；**从未收到过返回 `None`**。
+
+        ⚠ 返回 `None`（而不是 `0.0`）是刻意的：`0.0` 是"刚刚收到"这个**合法**年龄，
+        拿它当"从未收到"会让上面的诊断完全失效。
+        ⚠ 结果**夹到 ≥ 0**：伺服线程先读 `now`、随后一帧带着更大的 `now` 落进来的话，
+        时间差会是负数 —— 差一点就够把一拍误判成 watchdog 超时。
+        ⚠ 这是**本机**时间差，与帧里的 `ts`（主臂时钟）无关 —— 跨机两端不同源（spec §4.2）。
+        """
+        with self._lock:
+            t = self._last_recv_ts
+        if t is None:
+            return None
+        return max(0.0, now - t)
