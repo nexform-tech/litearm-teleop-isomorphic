@@ -173,6 +173,50 @@ def test_mismatch_window_excludes_clamped_openness():
     assert not w._mismatch
 
 
+# ════════════════════ 失败必须可见（不能静默死掉）════════════════════
+
+def test_exception_inside_the_loop_is_recorded():
+    """⚠⚠ 环里抛异常时，`snapshot().error` **必须**有内容。
+
+    否则界面只会显示「未启动」，用户看不到任何原因 —— 正是本仓哲学反对的
+    「连上了但界面不动」。`error` 也是**错误恢复**的触发条件
+    （`main_window._on_grip_state` 靠它丢掉 worker 让用户能重试）。
+
+    判别力：把 `_run_teleop` 的 `except` 里那句 `self._snap.error = str(e)`
+    删掉时本用例必红。
+    """
+    class _BadSend(FakeGrip):
+        def send_mit_frame(self, *a, **k):
+            raise RuntimeError("CAN 发送失败")
+
+    g = _BadSend()
+    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.35)
+        w.set_teleop(True)
+        time.sleep(0.4)
+        err = w.snapshot().error
+        assert "CAN 发送失败" in err, f"环里的异常没被记下来，error={err!r}"
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_uncalibrated_error_is_recorded_and_loop_never_started():
+    """未标定 ⇒ 记 error，且**主端 Listener 都不该建**（`_run` 在建之前就抛了）。"""
+    g = FakeGrip(calibrated=False)
+    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.35)
+        assert "未标定" in w.snapshot().error
+        assert w._pub is None, "拒绝启动时不该已经占住端口"
+    finally:
+        w.stop(timeout=5.0)
+
+
 # ════════════════════ 两端环（真 zenoh 回环）════════════════════
 
 def _pair(port: int, rate_hz: float = 100.0):
