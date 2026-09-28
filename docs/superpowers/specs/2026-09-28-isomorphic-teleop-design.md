@@ -228,7 +228,17 @@ tau_u[i] = ht_tau0[i] + alpha * (ht_tauf[i] - ht_tau0[i]);  /* 终点 = dyn_grav
 **决策**：动作类命令（`enable`/`movej`/`move_js`/`zero_g_*`/收尾）**只在 `ArmWorker` 上**；`get_state(refresh=False)` 只读缓存不取帧，伺服环读它安全。**唯二例外**是
  §7.4 的急停旁路与只读查询 —— SDK 明文允许它们不排队。
 
-**Zenoh 回调只写槽**:`move_js` 是阻塞调用（每帧等 ACK），不能放进回调线程；回调只做"赋值给 latest 槽"，避免 Zenoh 线程被伺服循环拖住。
+**Zenoh 回调只写槽**:`move_js` 是阻塞调用（每帧等 ACK），不能放进回调线程；回调只做「赋值给 latest 槽」，避免 Zenoh 线程被伺服循环拖住。
+
+**状态帧另走一个钩子推给 GUI**：`ALIGN_FAST` 与收尾 `movej` 都会**阻塞 `ArmWorker`**（最长
+`move_timeout`），若界面只能经 worker 取状态，那几秒界面就是死的 —— 而「对齐中」正是操作者最需要
+看从臂状态的时刻。做法**照抄 litetool**（`litearm-tool-stm32/litetool/sdk_worker.py::_attach_state_hook`）：
+把 `arm._a._on_status` 包一层，**在 SDK 自己的读线程上**把每帧解码结果推给 GUI。
+
+- 这是本仓对 SDK 的**唯一私有耦合**；挂不上时**抛错而不是静默降级**
+  （照抄 litetool 的 `StateHookMissing` 语义：宁可启动即报，也不要「连上了但界面不动」），
+  并由 `test_arm_worker.py` 钉住这个缝隙存在。
+- `get_state(refresh=False)` 读的就是这个缓存 ⇒ 推给 GUI 的值与伺服环用的是**同一帧**，不会出现两份真相。
 
 ### 3.2 数据流
 
@@ -356,14 +366,30 @@ J3/J4 也能跑到 server 那个量级。
 | --- | --- | --- |
 | `align_speed` | 0.15 | `ALIGN_FAST` 的 `movej(speed=)`（0..1 的轨迹倍率，**与 server 同名同义**） |
 | `speed_limit_j` | 见上表 | `FOLLOWING` 的逐轴速度上限；上限是 `kd_budget · tau_max_j / kd_j` |
-| `accel_limit_j` | 待定，初值取 server 的 `[14,22,24,24,45,40,60]` | 逐轴加速度上限（rad/s²） |
+| `accel_limit_j` | **`[14, 22, 24, 24, 45, 40, 60]`（server 原值，照用）** | 逐轴加速度上限（rad/s²） |
 | `kd_budget` | 0.30 | 速度前馈占 `tau_max` 的允许比例 ⇒ `speed_limit_j` 上限的由来 |
+
+> **为什么 `accel_limit_j` 照用 server 原值就安全**：`slew_target` 里有 `v = clamp(v, -v_limit, v_limit)`
+> （`joint_follow.py:81`）⇒ **`|dq_cmd|` 恒 ≤ `speed_limit_j`**。`accel_limit_j` 只决定 `dq_cmd`
+> **爬到上限有多快**，不改它的天花板 ⇒ **kd 预算只约束 `speed_limit_j`，与 `accel_limit_j` 无关**。
+> 所以照抄 server 的加速度值是安全的（这一点记在 §11 S3 里一并实测确认）。
 
 - **收敛判据用实测 q**（`get_state().q`），不是指令 q —— 只有实测到位才算对齐。
 - **`ALIGN_FAST → FOLLOWING` 无阶跃**：`_do_align` 完成后**照抄 server 的补丁**
   （`teleop_manager.py:307-313`）—— 把 `q_cmd`/`dq_cmd` **同步到对齐后的位置**，
   于是 `slew_target` 从当前位姿起步（`joint_follow.start()` 同样把 `q_cmd` 初始化成实测值，
   `joint_follow.py:237-245`）。**这是移植既有补丁，不是重新设计。**
+- **`ALIGN_FAST` 必须显著提示操作者「对齐中，请勿移动主臂」**。这不是礼貌性提示，是**设计前提**：
+  该阶段的 `movej` **是阻塞的**（最长 `move_timeout` = 3 s），**伺服环在这期间不运行**，
+  从臂完全不跟随。操作者若不知道，几乎必然在这几秒里动主臂。
+- **交班时按漂移出告警（不阻断）**：`movej` 到位后与**当前** `q_master` 的差若 > 阈值
+  （默认 0.1 rad）⇒ 日志 + 界面显著告警「主臂在对齐期间移动了 X rad，跟随即将以
+  `speed_limit_j` 起步（不再是慢速）」。
+  > ⚠ **本设计刻意不加"漂移超限就重跑一次 `ALIGN_FAST`"的循环** —— 我一开始想加，但那是
+  > server 没有的行为，而且**没有安全理由**：交班后的追赶由 `slew_target` 限速+限加速完成，
+  > 与正常 `FOLLOWING` 中操作者快拖时**没有区别**，只慢不快。加循环只会换来一个
+  > 「操作者一直动 ⇒ 永远收敛不了」的活锁，和 server 刻意回避的东西。**代价只是"慢速"的
+  > 承诺没兑现，说清楚即可，不必改行为。**
 - **`ALIGN_FAST` 失败处理**：`movej` 抛 `MotionTimeoutError` / 被拒 ⇒ 停在 `ALIGN_FAST` + 告警，
   **不自动进 `FOLLOWING`**。界面显示「对齐中，请勿移动主臂」+ 已用时。
   > server 那一版是「对齐 `movej` 失败仅告警、继续进 `joint_follow`」（`teleop_manager.py`
@@ -493,7 +519,7 @@ J3/J4 也能跑到 server 那个量级。
 | --- | --- |
 | **链路** | 角色单选、IP/端口、[连接臂]/[启动遥操]/[停止]、固件版本、许可状态、连接灯；**主臂端显示 Zenoh `matching_status` 的订阅者数**（「发了没人在收」是现场第一类排查） |
 | **关节** | 7 轴表 `J \| q \| dq \| tau \| t_mos \| t_coil \| err`；`err != 0` 的轴高亮 |
-| **遥操** | 状态机状态；对齐进度条 + 剩余最大误差 + 已用时；**主臂 q vs 从臂 q 对照表 + 逐轴跟踪误差**；收/发频率、本机延迟、丢帧数、ACK 超时计数；参数（`align_speed` / 逐轴 `speed_limit_j` / `accel_limit_j` / `kd_budget` / `watchdog_ms`） |
+| **遥操** | 状态机状态；**`ALIGN_FAST` 期间显著显示「对齐中，请勿移动主臂」+ 已用时**；主臂 q vs 从臂 q 对照表 + 逐轴跟踪误差；收/发频率、本机延迟、丢帧数、ACK 超时计数；**交班漂移告警**（§5.1）；参数（`align_speed` / 逐轴 `speed_limit_j` / `accel_limit_j` / `kd_budget` / `watchdog_ms`） |
 
 **温度只显示数值，界面不实现阈值判据**：固件的温度锁存已经反映在 `t_mos/t_coil` + `err` + `joint_fault` 上，界面另发明一套阈值就是在制造第二份真相。唯一的颜色判据是 `err != 0`。
 
@@ -585,7 +611,7 @@ J3/J4 也能跑到 server 那个量级。
 | --- | --- | --- | --- |
 | **S1** | `dq=0` 冻结 + 低速跟随 —— **不重做，只做回归** | 在**本仓要用的那块 7J 固件**上重跑 `litearm-server/scripts/e2e_movejs_real.py`，全绿 | ⚠ **已验过**（2026-09-20），但可能是在别的固件版本上；本仓依赖它，须在目标固件上复跑 |
 | **S2** | `dq` **幅值** → 实测走位速率，覆盖到中速 | `dq=0.3` ⇒ 实测 ≈0.3 rad/s（±20%）；`dq=1.0` ⇒ ≈1.0；`dq` ≥ `speed_limit` 后饱和 | 低速段已验，中速段未 |
-| **S3** | ⭐ **`slew_target` 的输出速度作速度前馈**在遥操速度量级下的行为（本仓 `kd` 是 server `B` 的 11 倍） | 跑 `FOLLOWING`：① 实测跟踪误差 rms **≤ 0.05 rad**；② **无自激/抖动**（`dq` 谱无新增高频峰）；③ 逐轴 `speed_limit_j` 下的 `kd·dq_cmd` 实测不超 `kd_budget·tau_max` | ⛔ **本仓特有** —— server 的经验在 `B=1.0` 上，不能直接外推 |
+| **S3** | ⭐ **`slew_target` 的输出速度作速度前馈**在遥操速度量级下的行为（本仓 `kd` 是 server `B` 的 11 倍） | 跑 `FOLLOWING`：① 实测跟踪误差 rms **≤ 0.05 rad**；② **无自激/抖动**（`dq` 谱无新增高频峰）；③ 逐轴 `speed_limit_j` 下的 `kd·dq_cmd` 实测不超 `kd_budget·tau_max`；④ **顺带确认 `\|dq_cmd\|` 恒 ≤ `speed_limit_j`**（即 §5.1 那条「`accel_limit` 不抬高天花板」的推理） | ⛔ **本仓特有** —— server 的经验在 `B=1.0` 上，不能直接外推 |
 | **S4** | 100 Hz `move_js` 连续 30 s 的 **ACK 返回率** | ACK 成功率 ≥ 99.9%，实测下发频率 ≥ 95 Hz，且**无 1.2 s 级卡顿**（`_cmd` 超时上界） | 未验 |
 | **S5** | 收尾：`movej(q_now)` **vs** 只停发的 **A/B 对照** | 录 30 s 的 `q` 漂移。预期：只停发 ⇒ 垂到 `G/(0.6·mit_kp)` 量级的偏移；`movej(q_now)` ⇒ 漂移显著更小 | 未验，**必须两组都做** |
 
@@ -627,7 +653,7 @@ litearm-teleop-isomorphic/
 | `test_wire.py` | **黄金字节**钉死小端布局（**不用往返测试 —— 往返对字节序无判别力**）；`version` 不符 ⇒ 拒收；`n` 不符 / 短帧 ⇒ 拒收；n = 1 与 n = 7 都覆盖 |
 | `test_link.py` | **真起两个 zenoh session 走回环**（非 mock）：100 帧逐字节全等；100 Hz 持续 2 s 零丢包；**子进程**验证"显式 `close()` ⇒ 能退出 / 不 close ⇒ 挂死"（后者用超时断言，标记为慢测） |
 | `test_safety.py` | **`slew_target` 移植**（纯函数，逐条可判别）：与 pylitearm 原版**对拍同一组输入逐拍全等**；限速/限加速生效；**制动距离减速不超冲**；到目标即停；**被钳位的轴 `dq` 必为 0**；**`speed_limit_j` 闸门**（kd 预算越界 ⇒ 拒启动）；软限位读不到 ⇒ **拒启动**；watchdog 判定；状态机**全部迁移**（含 `HOLDING` 2 s 升级、回 `ALIGN_FAST` 的 5 拍条件、`ALIGN_FAST` `movej` 失败)；收敛/到位判据用**实测 q** |
-| `test_arm_worker.py` | `FakeArm` 驱动：100 Hz 节拍；ACK 连续超时 ⇒ 转 `HOLDING` 且**不终止循环**；**停止序列顺序 + < 100 ms 时限**（假时钟，可判别）；**`connect()` 后 `arm.move_timeout == 3.0`**（防将来 SDK 在 `connect()` 里重置）；**worker 被卡在 `movej` 期间，急停旁路仍能成功发出**（§7.4） |
+| `test_arm_worker.py` | `FakeArm` 驱动：100 Hz 节拍；ACK 连续超时 ⇒ 转 `HOLDING` 且**不终止循环**；**停止序列顺序 + < 100 ms 时限**（假时钟，可判别）；**`connect()` 后 `arm.move_timeout == 3.0`**（防将来 SDK 在 `connect()` 里重置）；**worker 被卡在 `movej` 期间，急停旁路仍能成功发出**（§7.4）；**状态钩子存在**（`_a._on_status` 挂得上，挂不上即抛，照抄 litetool 的 `StateHookMissing`）；**交班漂移告警**（超阈值出告警、**且不重跑 `ALIGN_FAST`**） |
 | `test_gui_smoke.py` | `QT_QPA_PLATFORM=offscreen` 起窗口；角色切换；闸门锁定/解锁 |
 
 **离线的两道闸门（编译 / 对拍）在本仓全部可跑**：`test_link.py` 起的是真 zenoh，不是打桩。
