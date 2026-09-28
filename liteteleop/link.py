@@ -1,9 +1,9 @@
-"""Zenoh **纯点对点**链路。
+"""Zenoh **纯点对点**链路（见 spec §2.1 / §4.1）。
 
 两端都 `mode="peer"`，关掉 multicast/gossip 发现 —— **不用广播**，只走显式
 `listen`/`connect` 端点。主臂监听端口，从臂连过去。
 
-⚠ **进程退出前必须 `close()`**，否则**永久挂死**（实测：不 close 时
+⚠ **进程退出前必须 `close()`**，否则**永久挂死**（spec §2.1 `[实测]`：不 close 时
 解释器退不出去，`timeout` 才能杀掉）。
 ⚠ key 与 litearm-server 的 `litearm/v4/{arm_id}/teleop` **不可混用**：那边是 `>15d` 120 B，
 本文是 70 B，共用 key 会让两端把对方的帧静默解错。
@@ -92,7 +92,7 @@ class Connector(_Endpoint):
     """从臂端：连到主臂的 IP:端口，订阅其流。
 
     `on_frame` 在 **zenoh 自己的线程**上被调用 ⇒ **只许写一个 latest 槽**，
-    不许在里面做阻塞操作（`move_js` 每帧等 ACK，放进去会把 zenoh 线程拖死）。
+    不许在里面做阻塞操作（`move_js` 每帧等 ACK，放进去会把 zenoh 线程拖死）。见 spec §3.2。
     """
 
     def __init__(self, host: str, port: int, key: str = DEFAULT_KEY,
@@ -120,7 +120,7 @@ class Connector(_Endpoint):
 
 
 class LatestSlot:
-    """latest-wins 槽 —— zenoh 回调与伺服环之间的唯一交接面。
+    """latest-wins 槽 —— zenoh 回调与伺服环之间的唯一交接面（spec §3.2）。
 
     只保留**最新**一帧：迟到帧直接覆盖，不排队。遥操只要最新姿态，
     积压帧会让从臂去追一条过期的轨迹。
