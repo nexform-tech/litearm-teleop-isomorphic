@@ -60,7 +60,8 @@ log = logging.getLogger("liteteleop.servo")
 __all__ = [
     "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
     "align_to_master", "DEFAULT_PAYLOAD_MASS", "DEFAULT_PAYLOAD_COM",
-    "read_payload", "apply_payload", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
+    "read_payload", "apply_payload", "speed_limit_from_kd",
+    "DEFAULT_KD_BUDGET", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
     "measure_move_js_cost",
 ]
@@ -105,11 +106,60 @@ DEFAULT_PAYLOAD_COM = (0.0, 0.0, 0.03)
 _FF_ITEM_PAYLOAD_MASS = 4
 _FF_ITEM_PAYLOAD_COM = 5
 
+#: 速度前馈能吃掉多少力矩预算。`speed_limit_i ≤ budget · tau_max_i / kd_eff_i`。
+DEFAULT_KD_BUDGET = 0.30
+
+#: `kd_extra` 在 0x26 **向量表**（`FF_VEC_ITEMS[15]`）—— ⚠ **不是** 0x28 标量表，
+#: `get_ff_scalar(15, ·)` 取到的是 `zg_engage_kp`（见 spec §10 陷阱 #8）。
+_FF_VEC_KD_EXTRA = 15
+
 #: 连续被固件拒帧到这个次数 ⇒ 视作"链路/状态坏了"，抛出而不是继续硬撑。
 #: 理由：`move_js` 被拒 ⇒ **没有 kick 看门狗** ⇒ 0.1 s 后固件 fail-soft ⇒ **臂会垂**。
 #: 零星一两次没关系（下一拍就恢复），连续不停就是真问题，必须让人知道。
 _REJECT_ESCALATE = 20
 
+
+
+def effective_kd(arm):
+    """读**有效阻尼** `kd_eff = mit_kd + kd_extra`（逐轴）。
+
+    ⚠ 这是 `move_js` 路线**最要紧的一个数**：`move_js` 的 `dq` 会进电机速度前馈
+    （`τ += kd_eff·dq`），而 `kd_eff` 是**固件出厂值**（本机 J1~J4 = 5+6 = **11**、
+    腕部 = 2.5+0 = 2.5）。litearm-server 的 B=0.5 是随帧下发的，**不是这个数**。
+    """
+    jp = arm.params.all_joint_params()
+    kd = [float(p.kd) for p in jp]
+    extra = [float(x) for x in arm.get_ff_vec(_FF_VEC_KD_EXTRA).value]
+    return [a + b for a, b in zip(kd, extra)], [float(p.tau_max) for p in jp]
+
+
+def speed_limit_from_kd(kd, tau_max, kd_budget: float = DEFAULT_KD_BUDGET):
+    """按 kd 预算把力矩上限折算成**速度上限**：`speed_limit_i = budget·tau_max_i/kd_i`。
+
+    ## 为什么 `move_js` 路线**必须**做这一步
+
+    `move_js` 的 `dq` **是双角色**：既限 `q_ref` 的走位速率，**又直接进电机速度前馈**
+    （`τ += kd_eff·dq`）。而 `kd_eff` 是固件出厂值（J1~J4 = **11**）。
+
+    拿 litearm-server 的配置值 `speed_limit = [2.8, 3.4, 5, 5, 10, 8, 13]` 直接用的后果：
+
+        J4: kd_eff·dq = 11 × 5.0 = **55 Nm**，而 J4 的 tau_max 只有 **21**
+
+    ⇒ 前馈一项就把力矩预算**顶满** ⇒ `τ` 被钳 ⇒ **非线性** ⇒ **抖**（真机现象）。
+
+    litearm-server 不会遇到：它的 `B = 0.5` 走 `send_mit` **随帧下发**，
+    `B·dq = 0.5 × 5 = 2.5 Nm`，微不足道 —— **那份配置是配 `B=0.5` 的**。
+
+    ⇒ 逐轴取 `min(配置值, 预算值)`。@30%：J1/J2 2.13、**J3 0.63、J4 0.57**、J5~J7 1.20。
+    """
+    if len(kd) != len(tau_max) or not kd:
+        raise ValueError("kd/tau_max 长度不符或为空")
+    out = []
+    for i, (k, tm) in enumerate(zip(kd, tau_max)):
+        if k <= 0.0 or tm <= 0.0:
+            raise ValueError(f"第 {i} 轴 kd/tau_max 非法: kd={k} tau_max={tm}")
+        out.append(kd_budget * tm / k)
+    return out
 
 
 def read_payload(arm):

@@ -214,15 +214,30 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
                         lambda *a, **k: _FakeEndpoint())
     monkeypatch.setattr(arm_worker, "read_safe_limits", lambda arm, **k: _FakeLimits())
 
-    class _NoParamsArm(_ArmedForSlave):
+    class _NoWriteArm(_ArmedForSlave):
+        """**读**参数是允许的（要算 kd 预算），**写**不许。"""
+
+        def __init__(self):
+            self.jp = [type("P", (), {"kd": 5.0, "tau_max": 78.0})() for _ in range(7)]
+
+        @property
+        def params(self):
+            return self
+
+        def all_joint_params(self):
+            return list(self.jp)
+
+        def get_ff_vec(self, item):
+            return type("M", (), {"value": [6.0] * 7})()
+
         def __getattr__(self, name):
-            if name in ("params", "set_joint_param", "set_ff_vec", "get_ff_vec",
-                        "set_joint_limits", "set_ff_mask", "save_params"):
-                raise AssertionError(f"⛔ 从臂路径不许碰固件参数，却访问了 {name!r}")
+            if name in ("set_joint_param", "set_ff_vec", "set_joint_limits",
+                        "set_ff_mask", "save_params"):
+                raise AssertionError(f"从臂路径不许**写**固件参数，却访问了 {name!r}")
             raise AttributeError(name)
 
     w = ArmWorker(role=ROLE_SLAVE)
-    w._arm = _NoParamsArm()
+    w._arm = _NoWriteArm()
     w._run_slave()
     assert order == ["align", "follow"], f"顺序必须是 对齐 → 跟随，实际 {order}"
 

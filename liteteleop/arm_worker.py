@@ -443,6 +443,17 @@ class ArmWorker:
 
         # ⚠ **不改任何固件参数**（用户裁决）：K/B 用固件出厂的 `mit_kp`/`mit_kd`。
         #    写 `mit_kp` 会连带改坏 `movej`（它用的就是 `mit_kp`），真机踩过两次。
+        #
+        # ⚠⚠ 但**速度上限必须按 kd 预算收紧**：`move_js` 的 `dq` 进电机速度前馈
+        #      （`τ += kd_eff·dq`，kd_eff 出厂 J1~J4 = 11），照抄 server 那份配 B=0.5 的
+        #      `speed_limit` 会让 J4 的 `kd·dq` = 55 Nm 顶满 tau_max=21 ⇒ **抖**。
+        kd, tau_max = servo.effective_kd(arm)
+        sl_budget = servo.speed_limit_from_kd(kd, tau_max)
+        sl = [min(a, b) for a, b in zip(servo.DEFAULT_SPEED_LIMIT, sl_budget)]
+        self._log(f"kd_eff={[round(x, 1) for x in kd]}  tau_max={[round(x, 1) for x in tau_max]}")
+        self._log(f"speed_limit 配置={servo.DEFAULT_SPEED_LIMIT}")
+        self._log(f"speed_limit 预算={[round(x, 3) for x in sl_budget]}"
+                  f"  ⇒ 实取={[round(x, 3) for x in sl]}")
         self._log("不改刚度：用固件出厂值（move_js 没有随帧下发 K/B 的通道）")
 
         def provider():
@@ -468,7 +479,8 @@ class ArmWorker:
             self._drain(0.0)
             return False
 
-        servo.follow(arm, provider, should_stop=should_stop, hz=SLAVE_HZ)
+        servo.follow(arm, provider, should_stop=should_stop, hz=SLAVE_HZ,
+                     speed_limit=sl)
 
     def _peer_host(self) -> str:
         peer = (self.peer or "").strip()
