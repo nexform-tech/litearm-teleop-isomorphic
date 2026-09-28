@@ -272,6 +272,47 @@ def test_slave_without_first_frame_sends_measured_position_not_zero():
         s.stop(timeout=5.0)
 
 
+def test_teleop_can_be_restarted_repeatedly():
+    """⚠⚠ 「停止 → 再启动」必须还能用，而且要**每轮都通**。
+
+    这里钉住两个实测过的真 bug（2026-09-28，都是本仓自己踩的）：
+
+    1. 主端 `Listener` 若每轮遥操拆了重建：遥操停下后端口不释放 ⇒ 第二次启动
+       必定 `Can not create a new TCP listener bound to ...: Address already in use`，
+       而且端口要等**进程退出**才回来（表现：**只能启动一次**）。
+    2. 就算补上关闭，**同一端口上拆了重建**会让订阅↔发布匹配**间歇性**建立不起来
+       —— 实测 12 轮里 5 轮 `matching=False`（主端照发、从端一帧收不到）。
+
+    判别力：把 `_run` 里那句常驻 `link.Listener` 挪回 `_master_loop` 时，
+    本用例会在第 2 轮就红（报错或 `matching` 为假）。
+    """
+    port = _free_port()
+    m, s, mg, sg = _pair(port, rate_hz=100.0)
+    try:
+        m.start()
+        time.sleep(0.3)
+        s.start()
+        time.sleep(0.3)
+        prev_m, prev_s = 0, 0
+        for i in range(4):
+            m.set_teleop(True)
+            s.set_teleop(True)
+            time.sleep(0.5)
+            snap_m, snap_s = m.snapshot(), s.snapshot()
+            assert not snap_m.error, f"第{i + 1}轮主端报错: {snap_m.error}"
+            assert not snap_s.error, f"第{i + 1}轮从端报错: {snap_s.error}"
+            assert snap_m.matching is True, f"第{i + 1}轮主端没有订阅者（匹配失败）"
+            assert snap_m.frames_sent > prev_m, f"第{i + 1}轮主端没发出新帧"
+            assert snap_s.frames_received > prev_s, f"第{i + 1}轮从端没收到新帧"
+            prev_m, prev_s = snap_m.frames_sent, snap_s.frames_received
+            m.set_teleop(False)
+            s.set_teleop(False)
+            time.sleep(0.3)
+    finally:
+        s.stop(timeout=5.0)
+        m.stop(timeout=5.0)
+
+
 def test_align_moves_slave_toward_master_first_frame():
     """对齐：先 `goto_rad` 到首帧位置，再进高频跟随。"""
     port = _free_port()

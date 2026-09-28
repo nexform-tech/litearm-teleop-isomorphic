@@ -312,6 +312,20 @@ class GripWorker:
             self._log(f"夹爪已就绪：{self.gcan}  travel={travel_mm_of(self._cfg):.2f} mm  "
                       f"close_sign={float(self._cfg.close_sign):+.0f} rad_to_mm="
                       f"{float(self._cfg.rad_to_mm):.2f}")
+            if self.role == ROLE_MASTER:
+                # ⚠⚠ **主端的 Listener 建一次、活一个进程** —— 不能每轮遥操拆了重建。
+                #
+                # 实测（2026-09-28）：若在 `_master_loop` 里每轮新建，
+                #   ① 遥操停下后端口不释放（`_run_teleop` 停时没人关）⇒ 第二次启动必定
+                #      `Can not create a new TCP listener bound to ...: Address already in use`；
+                #   ② 就算补上关闭，**同一端口上拆了重建**会让订阅↔发布的匹配**间歇性**
+                #      建立不起来：12 轮重启里 5 轮 `matching=False`（从端一帧收不到，
+                #      而主端照发 ⇒ 界面上显示「⚠ 未匹配（发了没人在收）」）。
+                #      改成常驻后同样 12 轮：**0 轮失败**。
+                # 这也与参考实现同形 —— litearm-device 的主端就是发在**常驻** transport 上。
+                self._pub = link.Listener(self.gport, self._topic)
+                self._log(f"主端夹爪：已监听 {self._topic} @ 端口 {self.gport}"
+                          "（常驻，跨遥操会话不重建）")
             while not self._stop.is_set():
                 if self._want:
                     self._run_teleop()
@@ -338,6 +352,28 @@ class GripWorker:
         finally:
             self._want = False
             self._handoff()
+            # ⚠⚠ **这一步不能省，也不能只放在 `_teardown` 里。**
+            #    从端的订阅是每会话建的，不关就会占着连接/端口。
+            self._close_sub()
+
+    def _close_sub(self) -> None:
+        """关掉**本次遥操**的订阅端点。
+
+        ⚠ `_sub` 是**每次遥操会话**建的（从端才有），所以每次停下都必须关 ——
+        否则它一直被引用着，端口/连接不释放。
+        参考实现的 slave 也是每次 `enter()` 建、`exit()` 关
+        （`litearm_device` 的 `GripTeleopController._close_sub_tp`）。
+
+        ⚠⚠ **`_pub` 不在这里关** —— 主端的 Listener 是**常驻**的（见 `_run`），
+        由 `_teardown` 在进程退出时统一关。这是实测结论，不是随手写的：
+        每轮拆了重建会让匹配间歇性失败。
+        """
+        ep, self._sub = self._sub, None
+        if ep is not None:
+            try:
+                ep.close()                       # ⛔ 不 close ⇒ 进程永久挂死（link.py:6-7）
+            except Exception:                    # noqa: BLE001
+                log.exception("close zenoh 订阅端点失败")
 
     def _handoff(self) -> None:
         """遥操停下时的交接：**发一帧持位帧**，绝不失能。"""
@@ -368,7 +404,7 @@ class GripWorker:
         ⚠ 零力矩帧的 `q` 传 `0.0`：`kp=kd=0` 时 `q` 不参与力矩计算。
         """
         g = self._grip
-        self._pub = link.Listener(self.gport, self._topic)
+        # ⚠ `self._pub` 已在 `_run` 里建好（常驻，跨遥操会话不重建）—— 这里只用，不建。
         self._log(f"主端夹爪：零重力拖动 · 发布 {self._topic} @ 端口 {self.gport} "
                   f"· {self.rate_hz:.0f} Hz")
         self._hz_reset()
@@ -536,13 +572,13 @@ class GripWorker:
     def _teardown(self) -> None:
         """收尾顺序（spec §8 rule 5）：交接持位 → 关 zenoh → 断 CAN（**不失能**）。"""
         self._want = False
-        for ep in (self._pub, self._sub):
-            if ep is not None:
-                try:
-                    ep.close()                   # ⛔ 不 close ⇒ 进程永久挂死
-                except Exception:                # noqa: BLE001
-                    log.exception("close zenoh 端点失败")
-        self._pub = self._sub = None
+        self._close_sub()
+        pub, self._pub = self._pub, None      # 常驻的发布端在这里统一关
+        if pub is not None:
+            try:
+                pub.close()                   # ⛔ 不 close ⇒ 进程永久挂死（link.py:6-7）
+            except Exception:                  # noqa: BLE001
+                log.exception("close zenoh 发布端点失败")
         if self._grip is not None:
             try:
                 # ⚠ 构造时传了 disable_on_disconnect=False ⇒ 这一步**不失能**
