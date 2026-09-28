@@ -105,7 +105,7 @@ wc -l docs/superpowers/plans/2026-09-28-teleop-stage1-protocol-and-safety.md   #
 - Create: `tests/__init__.py`（空文件，让 pytest 稳定发现）
 - Create: `pyproject.toml`（**本仓当前没有此文件**，本步新建）
 
-- [ ] **Step 1: 确认在正确的分支上**
+- [x] **Step 1: 确认在正确的分支上**
 
 > ⚠ 分支 `feat/teleop-stage1-protocol` **由控制器（主会话）预先建好**，执行者**不要再建** ——
 > `git switch -c` 会报 `already exists`。
@@ -117,7 +117,7 @@ git branch --show-current
 
 Expected: 输出 `feat/teleop-stage1-protocol`。若不是 ⇒ **停下来报 BLOCKED**，别自己切分支。
 
-- [ ] **Step 2: 建包骨架**
+- [x] **Step 2: 建包骨架**
 
 ```bash
 mkdir -p liteteleop tests scripts
@@ -159,7 +159,7 @@ markers = ["slow: 慢测（起子进程 / 数十秒），用 -m \"not slow\" 跳
 > **这个字段永不手工改**。
 > ⚠ `markers` 与 `testpaths` 在这里一次配好，Task 4 只做确认、不再改此文件。
 
-- [ ] **Step 3: 确认 pytest 能发现空套件**
+- [x] **Step 3: 确认 pytest 能发现空套件**
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
@@ -168,7 +168,7 @@ python3 -m pytest tests -q
 
 Expected: `no tests ran`（退出码 5）—— 这是**预期的**，说明 pytest 能跑；套件为空是正常的。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add liteteleop/__init__.py tests/__init__.py
@@ -671,7 +671,7 @@ git commit -m "test: add move_js real-machine spike and its findings"
 **为什么测试用黄金字节而不是往返**：往返测试（`decode(encode(x)) == x`）**对字节序没有判别力** —— 两端都用大端也全绿。而线协议跨语言、跨机器，字节序错了就是全错。所以测试里**硬编码** `struct`
  格式串与期望的十六进制串；实现若换字节序/换字段顺序，测试立刻红。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_wire.py`：
 
@@ -760,7 +760,7 @@ def test_bad_n_in_frame():
         wire.decode(bytes([1, 200]) + b"\x00" * 8, expect_n=None)
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
@@ -771,7 +771,7 @@ Expected: **collection error** —— 模块尚不存在。实测文案随 pytes
 （`ModuleNotFoundError: No module named ...` 或 `ImportError: cannot import name 'wire' from 'liteteleop'`）
 ⇒ **两者都算通过**；判据是「收集期就失败」，不是那条具体文案。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `liteteleop/wire.py`：
 
@@ -876,7 +876,7 @@ def decode(payload: bytes, expect_n: int | None = None) -> Frame:
     return Frame(q=q, dq=dq, ts=ts, seq=seq)
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 python3 -m pytest tests/test_wire.py -q
@@ -884,7 +884,7 @@ python3 -m pytest tests/test_wire.py -q
 
 Expected: 全绿（`passed`，无 `failed`/`error`）
 
-- [ ] **Step 5: 反向验证判据有判别力（临时把实现改坏，确认测试会红）**
+- [x] **Step 5: 反向验证判据有判别力（临时把实现改坏，确认测试会红）**
 
 ```bash
 # 把字节序从 '<' 改成 '>'，测试必须红 —— 这正是往返测试抓不到的那个错
@@ -903,7 +903,7 @@ python3 -m pytest tests/test_wire.py -q
 Expected: 第一次 **FAILED**（黄金字节与变长测试都红），第二次全绿。
 **这一步不能省** —— 它证明这组判据真的在测字节序，而不是自我印证。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add liteteleop/wire.py tests/test_wire.py
@@ -925,7 +925,7 @@ spec §2.1 实测过的配置：关 `scouting/multicast/enabled` + `scouting/gos
 `connect/endpoints` ⇒ 100 Hz 零丢包、回环延迟 p50 0.091 ms。
 ⚠ **不调 `close()` 就退出的进程永久挂死**（实测）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `tests/test_link.py`：
 
@@ -1077,7 +1077,7 @@ def test_close_is_mandatory_for_exit():
                        capture_output=True, text=True, timeout=20)
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
@@ -1088,7 +1088,7 @@ Expected: **collection error** —— 模块尚不存在。实测文案随 pytes
 （`ModuleNotFoundError: No module named ...` 或 `ImportError: cannot import name 'link' from 'liteteleop'`）
 ⇒ **两者都算通过**；判据是「收集期就失败」，不是那条具体文案。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `liteteleop/link.py`：
 
@@ -1250,7 +1250,7 @@ class LatestSlot:
             return 0.0 if self._recv_ts == 0.0 else now - self._recv_ts
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 `slow` marker 已在 Task 1 的 `pyproject.toml` 里注册好（本步只确认，别再改那个文件）：
 
@@ -1268,7 +1268,7 @@ Expected: 第一条全绿；第二条 `1 passed`（子进程测试，约 20~40 s
 > 若第二条红：说明「不 close 会挂死」这条已不再成立（zenoh 改了行为）。**不要删测试** ——
 > 它是那条纪律的唯一守卫；改成断言新行为并在此处留下说明。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add liteteleop/link.py tests/test_link.py
@@ -1288,7 +1288,7 @@ git commit -m "feat: add zenoh point-to-point link layer with close discipline"
 > 且它是**从既有验证实现逐字移植**的（`pylitearm/src/pylitearm/control/joint_follow.py:45-88`）。
 > ⛔ **不要"改进"它** —— 任何偏离都必须先报用户裁决。移植已知边界见 Step 6。
 
-- [ ] **Step 1: 写全部纯逻辑测试（含**与 pylitearm 原版逐拍全等**的对拍）**
+- [x] **Step 1: 写全部纯逻辑测试（含**与 pylitearm 原版逐拍全等**的对拍）**
 
 `tests/test_safety.py`：
 
@@ -1493,7 +1493,7 @@ def test_speed_limit_rejects_bad_kd():
         safety.speed_limit_from_kd([0.0] * 7, [1.0] * 7)
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
@@ -1502,7 +1502,7 @@ python3 -m pytest tests/test_safety.py -q
 
 Expected: **collection error** —— 模块尚不存在（文案随 pytest 版本而异，两种都算通过）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `liteteleop/safety.py`：
 
@@ -1736,7 +1736,7 @@ def slew_target(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
     return q_cmd, dq_cmd
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 python3 -m pytest tests/test_safety.py -q
@@ -1744,14 +1744,14 @@ python3 -m pytest tests/test_safety.py -q
 
 Expected: 全绿（`passed`，无 `failed`/`error`）
 
-- [ ] **Step 4.5: 记下 phase 2 的接法（不在本任务实现，但必须留痕）**
+- [x] **Step 4.5: 记下 phase 2 的接法（不在本任务实现，但必须留痕）**
 
 `clamp_to_limits` 对**非有限的目标值**（NaN/Inf）**拒算**并抛 `LimitsError` —— 这是刻意的：
 NaN 与任何边界比较都是 `False`，放行就等于**悄悄**把一个 NaN 目标发给从臂（静默失败）。
 ⇒ phase 2 的伺服环必须**逐帧捕获 `LimitsError`**，按 spec §7.1 处理：**本拍不下发 + 计数 +
 按"状态缺失"报警**，绝不让它冒泡把伺服循环打断。
 
-- [ ] **Step 5: 确认判据的判别力 —— 并**如实记下哪条其实没有****
+- [x] **Step 5: 确认判据的判别力 —— 并**如实记下哪条其实没有****
 
 > ⚠ **本节第一版把判别力说错了两次**（一次靠推断没实测、一次张冠李戴）。
 > 下面每个数字都是**量化过的**，不是推断。**别凭感觉写"这条会红"。**
@@ -1804,7 +1804,7 @@ python3 -m pytest tests/test_safety.py -q
 **⇒ "逐字移植"的守卫是 parity 那一条，不是这一堆。** 别用后三条的绿去论证移植正确；
 它们绿是因为它们测的是别的东西。
 
-- [ ] **Step 6: 记录移植已知边界**
+- [x] **Step 6: 记录移植已知边界**
 
 在 `safety.py` 的 `slew_target` docstring 末尾追加（**不改逻辑**）：
 
@@ -1816,7 +1816,7 @@ python3 -m pytest tests/test_safety.py -q
     **忠实移植优先**；若真机 S3 观察到自激，这是嫌疑点之一（见 spec §11 S3）。
 ```
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add liteteleop/safety.py tests/test_safety.py
@@ -1845,7 +1845,7 @@ git commit -m "feat: port slew_target from pylitearm with parity tests"
      └────────── 用户点「停止」 ──── movej(q_now) ◀────┘
 ```
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/test_safety.py`：
 
@@ -1965,7 +1965,7 @@ def test_state_missing_q_blocks_dispatch():
     assert sm.may_dispatch(now=1.0, have_slave_q=False) is False
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
@@ -1974,7 +1974,7 @@ python3 -m pytest tests/test_safety.py -q
 
 Expected: `AttributeError: module 'liteteleop.safety' has no attribute 'TeleopState'`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 **先把文件顶部的 `__all__` 换成下面这一份**（否则 `import *` 拿不到状态机）：
 
@@ -2142,7 +2142,7 @@ class TeleopState:
         return self.state == ALIGN_FAST or self._stop_pending
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 python3 -m pytest tests/test_safety.py -q
@@ -2150,7 +2150,7 @@ python3 -m pytest tests/test_safety.py -q
 
 Expected: 全绿（`passed`，无 `failed`/`error`）
 
-- [ ] **Step 5: 跑全套**
+- [x] **Step 5: 跑全套**
 
 ```bash
 python3 -m pytest tests -q -m "not slow"
@@ -2158,7 +2158,7 @@ python3 -m pytest tests -q -m "not slow"
 
 Expected: 全绿（wire + link + safety，无 `failed`/`error`）
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add liteteleop/safety.py tests/test_safety.py
@@ -2174,7 +2174,7 @@ git commit -m "feat: add teleop state machine and watchdog to safety layer"
 - Create: `README.md` 的陷阱章节（**只追加，不重写既有内容**）
 - Modify: `pyproject.toml`（若缺 `zenoh` 依赖则补）
 
-- [ ] **Step 1: 把 spec §10 的陷阱登记搬进 README**
+- [x] **Step 1: 把 spec §10 的陷阱登记搬进 README**
 
 在 `README.md` 末尾追加一节（内容逐条抄 spec §10 的表格，**不要重新措辞** —— 两份说法会分叉）：
 
@@ -2187,7 +2187,7 @@ git commit -m "feat: add teleop state machine and watchdog to safety layer"
 <table: 逐条抄 spec §10>
 ```
 
-- [ ] **Step 2: 补依赖**
+- [x] **Step 2: 补依赖**
 
 确认 `pyproject.toml` 里有 `zenoh>=1.6`。缺则补，**不要重排既有内容**：
 
@@ -2196,7 +2196,7 @@ cd /home/llx/litearm-teleop-isomorphic
 grep -n "zenoh" pyproject.toml || echo "⚠ 缺 zenoh 依赖，需手工加进 dependencies"
 ```
 
-- [ ] **Step 3: 全量验收**
+- [x] **Step 3: 全量验收**
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
@@ -2208,7 +2208,7 @@ git log --oneline main..HEAD | cat
 
 Expected: 全绿；`git status` 干净；提交列表见下。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add README.md pyproject.toml
@@ -2219,17 +2219,39 @@ git commit -m "docs: add teleop known-traps section to readme"
 
 ## 阶段一验收清单
 
-- [ ] `python3 -m pytest tests -q` 全绿（含 `slow`）
-- [ ] `wire.py` 的字节序有**判别力**证据：改 `>` 后测试变红（Task 3 Step 5 的输出）
-- [ ] `slew_target` 有**逐拍全等**对拍证据；**变异 A（去制动距离）打红 parity 与
+- [x] `python3 -m pytest tests -q` 全绿（含 `slow`）
+- [x] `wire.py` 的字节序有**判别力**证据：改 `>` 后测试变红（Task 3 Step 5 的输出）
+- [x] `slew_target` 有**逐拍全等**对拍证据；**变异 A（去制动距离）打红 parity 与
       `brakes_before_target` 两条**（Task 5 Step 5 的输出）；并已知**变异 B 本套件抓不到**，
       该覆盖边界已记入计划 —— **"逐字移植"的守卫是 parity 那一条，不是那一堆**
-- [ ] 真机 spike S1~S5 的**原始输出**在 `docs/spike-2026-09-28-move-js.md` 里，**板卡与固件版本串已写明**
-- [ ] Step 5 的来源升级**只动了 §2.3(a) 那条**；§2.3(b) 刚度表与 §5.3 主臂收尾**仍标 `[源码]`**，
+- [x] 真机 spike S1~S5 的**原始输出**在 `docs/spike-2026-09-28-move-js.md` 里，**板卡与固件版本串已写明**
+- [x] Step 5 的来源升级**只动了 §2.3(a) 那条**；§2.3(b) 刚度表与 §5.3 主臂收尾**仍标 `[源码]`**，
       并在 spec 里显式记了一笔"留待另一次真机验证"（**没测的不许升**）
-- [ ] 若 S3 未过 ⇒ **已停下来报用户**，未继续实现
-- [ ] `git log main..HEAD` 的提交信息全为 Conventional Commits，**无 `claude` 字样**
-- [ ] **未 push、未开 PR**
+- [x] 若 S3 未过 ⇒ **已停下来报用户**，未继续实现
+- [x] `git log main..HEAD` 的提交信息全为 Conventional Commits，**无 `claude` 字样**
+- [x] **未 push、未开 PR**
+
+## ⚠ 阶段二必须处理的 4 条（本阶段实现的自查发现，**别丢**）
+
+这四条都是 Task 5/6 交付后由实现者自查发现的，**属于 phase 2 的接法**，不是本阶段的缺陷；
+但**没有载体就会静默失效**，所以记在这里：
+
+1. **`may_dispatch(now, have_slave_q)` 忽略 `now`** —— 它不是自足的：只读 `self.state`，
+   陈旧性完全依赖 `tick()` 已经把 `FOLLOWING` 降级。⇒ phase 2 的伺服环**必须"先 tick 再 poll"、
+   每一拍都如此**；只 poll 不 tick 就会用陈旧数据下发。**这条不变量需要具名载体**（例如把
+   `may_dispatch` 改成要求传入"本拍已 tick 过"的凭据），不能只写在文档里。
+2. **`_good_frames` 数的是"看到新鲜帧的 tick 数"，不是"不同的帧数"** —— tick 快于帧率时同一帧会被
+   重复计数 ⇒ `recover_frames=5` 实际含义是"连续 5 个 tick 周期内帧龄都小于 watchdog"，
+   **恢复延迟与 phase 2 的 tick 频率相关**，不是固定 5 帧。文档措辞（「连续收帧 5 拍」）本身如此，
+   但真实延迟会随 tick 率变。
+3. **`align_failed()` 没有状态守卫**（与对称的 `align_done()` 不同，后者被 `state == ALIGN_FAST` 门控）
+   —— 从 `FOLLOWING`/`HOLDING` 调用会**把状态拽回 `ALIGN_FAST`**。按 spec 的用法（只在 align 的
+   `movej` 失败时调，那时必在 `ALIGN_FAST`）是良性的；但 phase 2 若从任何状态触发的超时路径里调它，
+   这个不对称就变成真实的跳变。⇒ **要么加守卫，要么在 phase 2 明确只从 `ALIGN_FAST` 调，并写测试钉住。**
+4. **`user_stop()` 之后 `IDLE` 里 `_stop_pending = True`** ⇒ `wants_movej()` 在 `IDLE` 也为真
+   （那正是收尾的 `movej`，刻意如此）。但 `tick()` **永不在 `IDLE` 清 `_stop_pending`**，
+   只有 `start()` 与 `consume_stop_command()` 会 ⇒ **phase 2 若忘了 `consume_stop_command()`，
+   会每拍重发一次收尾 `movej`。**
 
 ## 阶段二（不在本计划内，列此备查）
 
