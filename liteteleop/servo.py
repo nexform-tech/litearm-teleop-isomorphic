@@ -258,16 +258,20 @@ def _q_dq_meas(arm):
     return list(st.q), list(st.dq)
 
 
-def _read_tau_max(arm) -> List[float]:
-    """逐轴力矩上限。⚠ `all_joint_params()` 实测 **23 ms**（7 轴逐个读）⇒ **只许启动时读一次**。"""
-    return [float(p.tau_max) for p in arm.params.all_joint_params()]
+
+#: `joint_limit_wall.firmware_kd_extra`（`litearm.yaml:266` = 0.8）——
+#: 进墙区的那几轴把 `kd` 加上它再下发（照 litearm-server 的 `joint_follow.py:306-312`）。
+#: ⚠ 这是**纯 PC 侧**的加法，固件不需要知道。
+WALL_FW_KD = 0.8
+#: 叠加后 kd 的上限（达妙 MIT kd 硬上限，与 server 同值）。
+WALL_FW_KD_CAP = 5.0
 
 
-def _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max, wall=None) -> None:
+def _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall=None) -> None:
     """**照搬 `joint_follow.step()` 的最后那一步**：
 
-        τ_ff = clamp(G(q_meas), ±tau_max)          # 重力前馈
-        send_mit_all(q_cmd, dq_cmd, K, B, τ_ff)    # 弹簧-阻尼交给电机 MIT 环
+        τ_ff = clamp(G(q_meas) + wall, ±tau_max)   # ← **固件算**（本函数不发）
+        joint_follow(q_cmd, dq_cmd, K, B)          # 帧里只有这 4 组
 
     ⚠⚠ **`G(q)` 必须由 PC 侧送**：固件对 MIT 透传**永不叠加内置前馈**
     （`control_loop.c` 的 gating 注释原话：「`move_mit` / `move_js+tau_ff` 永不叠加内置」）
@@ -286,11 +290,19 @@ def _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max, wall=None) -> None:
     ⚠ 代价：`get_gravity` 是一次往返（实测 **3.333 ms** = 一个固件 tick），
     `send_mit_all` 又一次 ⇒ **每拍 2 次往返 ⇒ ~150 Hz**。这是 MIT 路线的固有开销。
     """
-    q_meas, dq_meas = _q_dq_meas(arm)
-    g = [float(x) for x in arm.model.get_gravity(q_meas).value]
-    w = wall.tau(q_meas, dq_meas) if wall is not None else [0.0] * N_JOINTS
-    tau = [min(max(g[i] + w[i], -tau_max[i]), tau_max[i]) for i in range(N_JOINTS)]
-    arm.send_mit_all(list(q_cmd), list(dq_cmd), list(kp), list(kd), tau)
+    kd_sent = [float(x) for x in kd]
+    if wall is not None:
+        # 墙区叠加固件阻尼（照 server）：**只为在墙区的那几轴**抬高 kd。
+        # ⚠ 用**实测** q 判墙区 —— 与固件算墙力用的是同一个量。
+        q_meas, dq_meas = _q_dq_meas(arm)
+        zone = wall.wall_zone_mask(q_meas)
+        if any(zone):
+            for i in range(N_JOINTS):
+                if zone[i]:
+                    kd_sent[i] = min(kd_sent[i] + WALL_FW_KD, WALL_FW_KD_CAP)
+    # ⚠ 只发 q/dq/K/B —— **`τ_ff` 由固件算**（`G(q_meas) + wall(q_meas, dq_meas)`，
+     #   照 server 的 `compute_tau_ff`）。⇒ 每拍 **1 次往返**（原来是 2 次）。
+    arm.joint_follow(list(q_cmd), list(dq_cmd), list(kp), kd_sent)
 
 
 def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
@@ -326,13 +338,12 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         dt_nom = 1.0 / max(hz, 1.0)
         kp = [float(x) for x in (K if K is not None else SETUP_K)]
         kd = [float(x) for x in (B if B is not None else SETUP_B)]
-        tau_max = _read_tau_max(arm)
 
         # ── prime：托住实测位姿（`joint_follow.prime`）──
         q_cmd = _q_meas(arm)
         dq_cmd = [0.0] * N_JOINTS
         q_target = list(q_cmd)
-        _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max, wall)
+        _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall)
 
         # ── engage：`engage_sec` 内用**低刚度**托住（`joint_follow.engage`）──
         if engage_sec > 1e-6:
@@ -341,7 +352,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             kd_e = [ENGAGE_KD] * N_JOINTS
             t_end = time.monotonic() + engage_sec
             while time.monotonic() < t_end and not should_stop():
-                _send_mit(arm, q_ref, [0.0] * N_JOINTS, kp_e, kd_e, tau_max, wall)
+                _send_joint_follow(arm, q_ref, [0.0] * N_JOINTS, kp_e, kd_e, wall)
                 time.sleep(dt_nom)
 
         # ── start：指令/目标都初始化成【当前实测】──
@@ -373,7 +384,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             q_cmd, dq_cmd = slew_target(q_target, q_cmd, dq_cmd, sp, ac, dt_nom)
 
             try:
-                _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max, wall)
+                _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall)
             except Exception:                        # noqa: BLE001
                 # ⚠ MIT 透传**没有** `move_js` 那条「目标 ≠ 实测位姿且 `dq == 0` 就拒帧」
                 #   的限制（`move_js` 路线因此才需要「托住实测位姿」的退路）。
@@ -393,10 +404,16 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                         tuple(int(j.err) for j in _snap.joints))
                 if _cur != _prev_fw:
                     _e = max(abs(a - b) for a, b in zip(q_cmd, _snap.q))
+                    _dq = [round(float(v), 3) for v in getattr(_snap, "dq", [])]
+                    _vmax = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]
+                    _over = [f"J{i+1}:{abs(_dq[i]):.2f}>{_vmax[i] * 1.5:.2f}"
+                             for i in range(min(len(_dq), len(_vmax)))
+                             if abs(_dq[i]) > _vmax[i] * 1.5]
                     log.warning(
                         "⚠ 固件状态变化 flags=%s joint_fault=0x%X err=%s  "
-                        "最大跟踪误差=%.4f rad  q=%s",
-                        list(_cur[0]), _cur[1], list(_cur[2]), _e,
+                        "最大跟踪误差=%.4f rad  dq=%s%s  q=%s",
+                        list(_cur[0]), _cur[1], list(_cur[2]), _e, _dq,
+                        ("  ⚠ 超速轴: " + "、".join(_over)) if _over else "",
                         [round(v, 3) for v in _snap.q])
                     _prev_fw = _cur
 

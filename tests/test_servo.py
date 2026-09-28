@@ -56,8 +56,9 @@ class FakeArm:
     def get_state(self, refresh=False):
         return _Msg(_State(self.q))
 
-    def send_mit_all(self, q, dq, kp, kd, tau):
-        self.mit_calls.append((list(q), list(dq), list(kp), list(kd), list(tau)))
+    def joint_follow(self, q, dq, kp, kd):
+        """[JOINT_FOLLOW] 帧里**没有 tau** —— 前馈由固件算。"""
+        self.mit_calls.append((list(q), list(dq), list(kp), list(kd)))
 
     def movej(self, q, speed=1.0):
         self.movej_calls.append(list(q))
@@ -188,33 +189,11 @@ def test_follow_sends_the_server_gains_on_every_frame():
     arm = FakeArm()
     _run(arm, [0.1] * N_JOINTS)
     assert arm.mit_calls, "一帧都没发出去"
-    for _q, _dq, kp, kd, _tau in arm.mit_calls:
+    for _q, _dq, kp, kd in arm.mit_calls:
         assert kp == list(servo.SETUP_K), f"K 不是 server 的 {servo.SETUP_K}"
         assert kd == list(servo.SETUP_B), f"B 不是 server 的 {servo.SETUP_B}"
 
 
-def test_follow_clamps_gravity_to_tau_max():
-    """`τ_ff = clamp(G(q), ±tau_max)` —— 照搬 `joint_follow.compute_tau_ff`。
-
-    ⚠ 固件对 MIT 透传**不会**自己加 G（`control_loop.c`：「`move_mit` 永不叠加内置」）
-    ⇒ **这一项不发就是没有重力补偿，臂会垂。**
-    """
-    arm = FakeArm(tau_max=21.0)          # 假 G 恒给 100 ⇒ 必须被钳到 21
-    _run(arm, [0.0] * N_JOINTS)
-    assert arm.mit_calls, "一帧都没发出去"
-    for _q, _dq, _kp, _kd, tau in arm.mit_calls:
-        assert tau == [21.0] * N_JOINTS, f"G 没被钳到 tau_max：{tau}"
-
-
-def test_follow_reads_joint_params_once_not_per_tick():
-    """⚠ `all_joint_params()` 实测 **23 ms**（7 轴逐个读）⇒ 进循环就把环频钉死在 43 Hz。
-
-    判别力：把 `_read_tau_max` 挪进主循环，本用例会红。
-    """
-    arm = FakeArm()
-    _run(arm, [0.1] * N_JOINTS, ticks=30)
-    assert arm.joint_param_reads == 1, \
-        f"`all_joint_params` 被调了 {arm.joint_param_reads} 次，应当只有启动那一次"
 
 
 # ────────────────────────── 收尾 ──────────────────────────
@@ -353,6 +332,37 @@ def test_speed_limit_stays_within_the_firmware_velocity_envelope():
         assert sl <= vm, f"J{i+1} speed_limit={sl} 越过固件 vel_max={vm}"
 
 
+# ─────────── joint_follow 帧：只有 4 组，且墙区抬高 kd ───────────
+
+def test_joint_follow_frame_carries_no_tau():
+    """⛔ `joint_follow` 的帧里**没有 `tau`** —— 前馈由固件算（G + 墙）。
+
+    ⚠ 这是本路线与 `send_mit_all` 的**唯一实质差别**，也是"省掉一次 `get_gravity`
+    往返 ⇒ 每拍 1 次往返 ⇒ 250 Hz 可达"的来源。判据取"假臂收到的就是 4 组"：
+    谁把它改回 `send_mit_all`（5 组），本用例立刻红。
+    """
+    arm = FakeArm()
+    _run(arm, [0.1] * N_JOINTS)
+    assert arm.mit_calls, "一帧都没发"
+    for call in arm.mit_calls:
+        assert len(call) == 4, f"joint_follow 帧应是 (q,dq,kp,kd) 四组，实际 {len(call)} 组"
+
+
+def test_wall_zone_raises_kd_by_the_configured_extra():
+    """进墙区的轴：`kd` 被抬高 `WALL_FW_KD`（上限 5.0）—— 照 server 的做法。
+
+    ⚠ 这是**纯 PC 侧**的加法（固件不知道），所以它仍归本仓验。
+    判别力：把 `WALL_FW_KD` 置 0 或去掉叠加，本用例红。
+    """
+    q = [1.49] + [0.0] * (N_JOINTS - 1)          # J1 越过墙线(限位 1.5 − margin 0.02)
+    arm = FakeArm(q=q)
+    _run(arm, q, ticks=3, wall=_wall())
+    _q, _dq, _kp, kd = arm.mit_calls[-1]
+    assert kd[0] == min(servo.SETUP_B[0] + servo.WALL_FW_KD, servo.WALL_FW_KD_CAP), \
+        f"J1 在墙区, kd 应抬高到 {servo.SETUP_B[0] + servo.WALL_FW_KD}, 实际 {kd[0]}"
+    assert kd[1] == servo.SETUP_B[1], f"J2 不在墙区, kd 不该被动过, 实际 {kd[1]}"
+
+
 # ────────────── 限位内缩量：必须盖住 CDC 路线的滞后冲过 ──────────────
 
 def test_limit_margin_covers_the_worst_case_overshoot():
@@ -373,39 +383,7 @@ def test_limit_margin_covers_the_worst_case_overshoot():
 
 # ────────────────────── 限位墙（第二道位置护栏）──────────────────────
 
-def test_wall_torque_actually_reaches_the_frame():
-    """⛔ 限位墙必须**真的叠进 `τ_ff`** —— 这是"接线"的判据。
 
-    真机教训（2026-09-28）：只靠 `clamp_to_limits` 钳**目标**不够 —— 从臂追一个恰好
-    贴在边界上的目标会冲过去，越界锁存 `joint_fault` ⇒ 掉力 + `FB_STALE`。
-
-    判别力：把 `_send_mit` 里的 `g[i] + w[i]` 改回 `g[i]`，或忘传 `wall=`，本用例立刻红。
-    """
-    # J1 抬到 1.49：已越过墙线（q_max 1.5 − margin 0.02 = 1.48）⇒ 该轴应有排斥力矩
-    q = [1.49] + [0.0] * (N_JOINTS - 1)
-    arm = FakeArm(q=q, tau_max=1000.0, gravity=[0.0] * N_JOINTS)   # 重力置 0 ⇒ 只剩墙
-    _run(arm, q, ticks=3, wall=_wall())
-    assert arm.mit_calls, "一帧都没发"
-    tau = arm.mit_calls[-1][4]
-    assert tau[0] < 0.0, f"接近上限时墙力必须把关节往限位【内】推（应为负），实际 {tau[0]}"
-    for i in range(1, N_JOINTS):
-        assert tau[i] == 0.0, f"没进墙区的 J{i+1} 不该有力矩，实际 {tau[i]}"
-
-
-def test_wall_is_absent_when_not_wired():
-    """`wall=None` ⇒ 只有重力项。这是上一条的**对照组**（否则分不清力矩是谁给的）。"""
-    q = [1.49] + [0.0] * (N_JOINTS - 1)
-    arm = FakeArm(q=q, tau_max=1000.0, gravity=[0.0] * N_JOINTS)
-    _run(arm, q, ticks=3, wall=None)
-    assert arm.mit_calls[-1][4] == [0.0] * N_JOINTS, "没接墙就不该出现墙力"
-
-
-def test_wall_torque_direction_is_inward_on_the_lower_side():
-    """靠近**下限**时力为正（往限位内推）—— 方向约定照搬 server。"""
-    q = [-1.49] + [0.0] * (N_JOINTS - 1)
-    arm = FakeArm(q=q, tau_max=1000.0, gravity=[0.0] * N_JOINTS)
-    _run(arm, q, ticks=3, wall=_wall())
-    assert arm.mit_calls[-1][4][0] > 0.0, "接近下限时墙力应为正"
 
 
 # ────────────── 增益必须是 server 默认配置的那一份 ──────────────
