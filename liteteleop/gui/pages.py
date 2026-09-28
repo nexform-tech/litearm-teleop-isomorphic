@@ -328,6 +328,11 @@ class TeleopPage(QtWidgets.QWidget):
         #    而夹爪的 `GripWorker` **只能由点这个按钮来创建**
         #    （`main_window._ensure_grip_worker`）⇒ 若初始禁用、且 `apply_grip`
         #    又只按 `connected` 启停，就**永远点不了**（死锁，只能重启应用）。
+        #
+        # ⚠ 另外这条按钮**有意不接**顶栏那个「我已确认机械臂周围无障碍」的勾选：
+        #    那个勾选是臂安全的闸门（臂会自由落体），而夹爪不会。夹爪自己的保护是
+        #    行程钳位 + 主从标定一致性告警；用户裁决夹爪与臂**代码上完全分开**，
+        #    所以这里不去读臂的那份状态。**这是有意的，不是漏了。**
         self.chk_align = QtWidgets.QCheckBox("启动时对齐")
         self.chk_align.setChecked(True)
         grow2 = QtWidgets.QHBoxLayout()

@@ -231,7 +231,10 @@ class MainWindow(QtWidgets.QMainWindow):
         #    （`stop()` 是幂等的；此时那条线程早已在 `_teardown` 里收完尾。）
         if g.error and self.grip is not None:
             try:
-                self.grip.stop()
+                # ⚠ 这是个**会阻塞 Qt 主线程**的 join。用短超时把最坏冻结界在 2 s
+                #    （CAN 卡死时 `_handoff`/`disconnect` 可能慢）；超时不会丢线程
+                #    ——`stop()` 保留引用，下面用 `is_alive()` 判断能不能重建。
+                self.grip.stop(timeout=2.0)
             except Exception:                        # noqa: BLE001
                 pass
             self.page_teleop.btn_grip.setChecked(False)
@@ -287,7 +290,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.shutdown()
         if self.grip is not None:
             self._log("正在退出夹爪遥操：交接持位 → 关 zenoh → 断 CAN（**不失能**）…")
-            self.grip.stop()
+            # 同上：别用 5 s 默认值，退出路径上冻结窗口没必要
+            self.grip.stop(timeout=2.0)
         self._save()
         super().closeEvent(ev)
 

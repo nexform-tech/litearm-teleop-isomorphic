@@ -108,7 +108,13 @@ def _clamp01(x: float) -> float:
 
 
 def mm_to_openness(cfg, position_mm: float) -> float:
-    """读侧：`position_mm`（SDK 算的，**已含 `close_sign`**）→ `openness[0,1]`。"""
+    """读侧：`position_mm`（SDK 算的，**已含 `close_sign`**）→ `openness[0,1]`。
+
+    ⚠ `travel_mm <= 0` 时返回 `0.0`（= 全闭）—— 这个兜底**落在危险那一侧**，
+    只是靠 `check_ready` 在启动时就拒掉零行程、让它**不可达**。
+    真要动这里的话：要么让它抛（会打断环），要么挑一个"不动"的语义 ——
+    但它现在只是"不该发生"的护栏，不是正常路径。
+    """
     t = travel_mm_of(cfg)
     return _clamp01(float(position_mm) / t) if t > 0 else 0.0
 
