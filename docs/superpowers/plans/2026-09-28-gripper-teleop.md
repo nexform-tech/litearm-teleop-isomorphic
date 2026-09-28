@@ -40,9 +40,30 @@
 >
 > 全部经**变异测试**确认有判别力（去掉对应实现即红）。
 >
-> ### D. 仍未做
+> ### D. 独立对抗审查（第 9 轮）后的追加修复
+>
+> 一位独立审查者（不是作者）找到 7 条，其中 **1 条高危**是作者前 8 轮全漏的：
+>
+> | # | 问题 | 修法 |
+> |---|---|---|
+> | D1 | ⚠⚠ **[HIGH] 对齐路径绕过非有限值守卫**：`_wait_first_frame` 直接把 NaN 首帧喂给 `goto_rad`，SDK 把 NaN **折成端点** ⇒ 夹爪被"吸"到全闭。`align=True` 是**默认值**；旧用例除对齐那条外全用 `align=False` ⇒ 从没走到这一格 | 非有限值的帧**不算首帧**，跳过继续等；对齐结果再钳一道 |
+> | D2 | 对齐等待期**完全不发帧**（最多 5 s），与本仓"停发会掉力"的自有信念自相矛盾 | 等待期继续发持位帧 |
+> | D3 | `enable()` / `send_mit_frame()` 的返回值、状态帧的 `error_code` **全被丢弃** ⇒ 夹爪没使能时界面照样显示"跟随中"、`error` 恒空 | `enable()` 假值即 raise；`send_mit_frame` False 计数；消费 `error_code`（§8 rule 10） |
+> | D4 | 只兜 `SystemExit` ⇒ 没装 litegrip 时 `ModuleNotFoundError` 逃出 Qt 槽 ⇒ **整个进程 abort（实测 exit 134）**，连臂遥操一起带走 | 兜 `BaseException`（§8 rule 11） |
+> | D5 | 四个帧字段只判了两个（`force_n` 会显示在界面上） | 四字段全判 |
+> | D6 | `stop()` 超时仍清 `_thread` ⇒ 调用方会再建一个 worker 抢同一 CAN 与端口 | 超时保留引用 + `is_alive()` |
+> | D7 | `_want` 在收尾时被无条件清掉，会吃掉那几毫秒里落下的启动请求 | 只在出错时清 |
+>
+> 每条都配了**变异验证过**的回归网（去掉实现即红）。
+>
+> ### E. 仍未做
 >
 > **Task 8（真机验证）没做** —— 需要两台机 + 两个夹爪 + 已拉的 CAN。本条**不可跳过**。
+>
+> **臂侧 `arm_worker.py` 上报未修的同类 bug**：`_run_teleop` 停下时也不关
+> `self._pub`/`self._sub`（只在 `_teardown` 关），实测同样抛
+> `Address already in use` ⇒ 臂遥操「停掉再启动」在真机上大概率也起不来。
+> 因 spec §10 冻结了该文件、且用户要求夹爪与臂代码上完全分开，**未改，仅上报**。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

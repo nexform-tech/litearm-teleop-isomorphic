@@ -251,6 +251,11 @@ stale = False
 对齐（默认开，见 §9.3）：等首帧（≤5 s）→ goto_rad(q0, kp, kd, duration=1.0)
     ⚠ 关掉对齐时**跳过这一步**，q 仍是上面那个实测位置，直接进跟随环
     ⚠ 5 s 内没等到首帧 → 不 goto，直接进跟随环（q 停在实测位置）
+    ⚠⚠ **只有四个字段全有限的那一帧才算首帧**（§8 rule 9）：非有限值的帧
+       跳过并继续等。**不许**把它们喂给 goto_rad —— 实测那样会把从端"吸"到全闭。
+    ⚠⚠ 等待期间**必须继续发持位帧**（q 取上面那个实测位置）：本仓自己的用例断言
+       「MIT 模式停发会掉力」（`test_watchdog_holds_position_when_master_stops`）
+       ⇒ 这里沉默最多 5 s 是自相矛盾，而且还可能正夹着东西。
 
 每拍：
     payload, _ts = slot.take()
@@ -346,7 +351,9 @@ stale = False
 | 6 | ⚠⚠ **构造时必须显式传 `disable_on_disconnect=False`** —— 否则 rule 4 与 rule 5 自相矛盾 | `LiteGrip.__init__` 的默认值是 **`True`**（`gripper.py:205`）⇒ `disconnect()` 会走 `self._can.disconnect(disable=True)`（`gripper.py:338-339`）⇒ `can_bus.disconnect` 里的 `self.disable()`（`src/litegrip/protocols/can_bus.py:92`）⇒ **掉力、松开**。这会让收尾那帧持位帧白做，并产生 rule 4 明令禁止的结果。**两端都要传** |
 | 7 | ⛔ **绝不调 `lg.close()`** —— 那是**合爪**不是断开（`gripper.py:1103`） | 断开只有 `disconnect()`（`gripper.py:329`）。这是 SDK 的真实命名陷阱 |
 | 8 | 主端零重力期间不调任何 `open`/`close`/`grasp` | 那些会走自己的 MIT 斜坡流，与我们的零力矩帧抢 CAN |
-| 9 | ⚠⚠ **协议边界必须拒非有限值**（`NaN` / `±inf`）：从端**拒收该帧并保持不动**，主端读数非有限时**不发帧** | 不拒的实测后果：`_clamp01(NaN)` 返回 `NaN`，而 `clamp_to_calibrated` 里 `min(hi, NaN)` **返回 `hi`** ⇒ 一条 `NaN` 帧把从端命令到**全闭限位**，且 `error` 是空的；`±inf` 同样被折成端点。**错在危险一侧且静默**。臂侧本来就是这么做的 —— `safety.clamp_to_limits` 逐值判 `math.isfinite` 并抛 `NonFiniteTarget`（`safety.py:142-144`），本条与它同款纪律 |
+| 9 | ⚠⚠ **协议边界必须拒非有限值**（`NaN` / `±inf`）：从端**拒收该帧并保持不动**，主端读数非有限时**不发帧**。⚠ **对齐首帧也必须过这道闸** —— 非有限值的帧**不算首帧**，跳过继续等 | 不拒的实测后果：`_clamp01(NaN)` 返回 `NaN`，而 `clamp_to_calibrated` 里 `min(hi, NaN)` **返回 `hi`** ⇒ 一条 `NaN` 帧把从端命令到**全闭限位**，且 `error` 是空的；`±inf` 同样被折成端点。**错在危险一侧且静默**。臂侧本来就是这么做的 —— `safety.clamp_to_limits` 逐值判 `math.isfinite` 并抛 `NonFiniteTarget`（`safety.py:142-144`），本条与它同款纪律。⚠⚠ 对齐那条路**曾被漏掉**（`align=True` 是默认值），后果同样是"吸到全闭"，而且环里的守卫**救不了它**（那条路不经过守卫）—— 实测：`goto_rad(nan)` + 此后 MIT 指令全是 `pos_closed_rad`。**四个字段都要判**（`force_n` 也会显示在界面上） |
+| 10 | ⚠⚠ **SDK 的失败信号必须被消费**：`enable()` 的返回值、`send_mit_frame()` 的返回值、状态帧的 `error_code` | 三者**都不抛异常**：`enable()` 失败时返回一个 falsy 的 `EnableResult`（`EnableResult.__bool__` 就是 `self.ok`）；`send_mit_frame()` 在未使能时**恒返回 `False`**（`gripper.py:468-471`）。不看它们，实测后果是 `error=''`、`connected=True`、帧数照涨，而**电机根本没使能（夹爪是软的）**，界面却显示"已发 N 帧 · 跟随中"。**只 `poll` 而不看 `error_code` 等于没做** —— §7.4 偏离 #2 说的"不 poll 就永远看不到夹爪自己的故障"，前提是**要读它** |
+| 11 | ⚠⚠ **SDK 不可用的异常绝不许逃出 Qt 槽**（兜 `BaseException`，不是 `SystemExit`） | ① `assert_sdk_pinned` 抛的 `SystemExit` **不是** `Exception` 的子类；② 没装 litegrip 的机器上 `import litegrip` 抛 `ModuleNotFoundError`；③ **PyQt5 对逃出槽的异常直接 abort 进程**（本机实测 `ModuleNotFoundError` ⇒ exit 134、core dumped）。⇒ 只兜 `SystemExit` 的结果是：点一下夹爪按钮把**整个应用**带走，连正在跑的臂遥操一起（没有收尾 movej）—— 直接违反 §2 的故障隔离承诺 |
 
 ## §9 配置与界面
 
