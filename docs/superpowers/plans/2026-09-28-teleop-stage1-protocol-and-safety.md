@@ -1,5 +1,28 @@
 # 同构遥操 阶段一（真机 spike + 协议层 + 安全层）实现计划
 
+> ⛔⛔ **本计划已作废（部分）—— 2026-09-28 用户裁决：必须严格按照 litearm-server 来写。**
+>
+> 本文件描述的是**早先自创的设计**（`move_js` 位置直通、70 B 小端帧、kd 预算收紧
+> `speed_limit`、`IDLE/ALIGN_FAST/FOLLOWING/HOLDING` 状态机、S1~S5 spike）。
+> 那份设计**已经被推翻**：
+>
+> | 本计划里写的 | 现在是什么 |
+> | --- | --- |
+> | 从臂执行 `move_js` 位置直通 | **移植 litearm-server 的 `joint_follow`**（`send_mit_all` + `get_gravity` + `slew_target`） |
+> | 70 B 小端变长帧 | **`>15d` 大端 120 B 定长**（照搬 `teleop_manager.py`） |
+> | kd 预算推 `speed_limit`（J4 = 0.573） | **配置真值**（J4 = 5.0），逐值抄 `litearm_balanced.yaml` |
+> | 自造状态机 + watchdog | **litearm-server 没有状态机**：`active` 由 `is_running` 派生 |
+> | `set_speed` 不用、`park()` 兜底那套 | 不变（仍有效） |
+>
+> ✅ **仍然有效、并已交付的部分**：`slew_target` 的逐字移植与其对拍测试、
+> zenoh 点对点链路的实测结论、以及 `docs/.../specs/` 里 §7/§8 的安全与界面纪律。
+>
+> ⛔ **权威文档是 spec**（`docs/superpowers/specs/2026-09-28-isomorphic-teleop-design.md`，
+> 已按 litearm-server 重写，尤其 §4/§5/§9）。本计划与 spec 冲突时**一律以 spec 为准**。
+> 本计划**不再逐行重写**（2300 行、且大部分是已经完成并提交的历史执行记录）——
+> 它的价值是"当时怎么做的"，不是"现在该怎么做"。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or superpowers:executing-plans
 > to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
