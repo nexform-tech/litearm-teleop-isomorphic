@@ -385,3 +385,50 @@ def test_follow_resumes_normal_tracking_after_a_fallback():
                  gains=servo.JointGains())
     moved = max(max(abs(v) for v in q) for q, _dq in arm.move_js_calls)
     assert moved > 0.3, f"目标改到 0.5 之后应当恢复跟随，实际最大只到 {moved}"
+
+
+class DriftingArm(RuleArm):
+    """模拟「**读实测**」与「**发帧**」之间臂又走了一点（`movej` 超时返回的典型状态）。
+
+    ⚠⚠ 漂移必须发生在 **`move_js` 被调用的那一刻**，不能发生在读状态时 ——
+    否则"读完立刻发"目标又对上了，两次读数互相抵消，**测不出任何东西**。
+    （我第一版就是把漂移放在 `get_state` 里，结果假绿，还把测试跑死循环了。）
+
+    漂移量 0.02 > `RuleArm.TOL=0.005` ⇒ 每发一次都被拒，直到漂移停止。
+    """
+
+    def __init__(self, drift_steps: int = 3, drift: float = 0.02, **kw):
+        super().__init__(**kw)
+        self._left = drift_steps
+        self.drift = drift
+
+    def move_js(self, q, dq=None):
+        if self._left > 0:
+            self._left -= 1
+            self.q = [v + self.drift for v in self.q]
+        return super().move_js(q, dq)
+
+
+def test_prime_retries_until_the_arm_stops_moving():
+    """⚠ `prime` 必须**重读实测 + 重试** —— 单发会在"臂还在动"时被拒而崩掉（真机就是这么挂的）。
+
+    漂移 3 步而 `_send_hold` 试 5 次 ⇒ 第 4 次成功；单发则第一次就失败。
+    """
+    arm = DriftingArm(drift_steps=3)
+    n = {"i": 0}
+
+    def stop():
+        n["i"] += 1
+        return n["i"] > 20
+
+    ok = servo.follow(arm, lambda: None, should_stop=stop, engage_sec=0.0,
+                      hz=100.0, gains=servo.JointGains())
+    assert ok is True, "prime 应当靠重读+重试挺过「臂还在动」的窗口"
+
+
+def test_prime_gives_up_loudly_when_it_never_settles():
+    """永远在动 ⇒ 不能无限重试，必须**响亮失败**（而不是静默转下去）。"""
+    with pytest.raises(RuntimeError, match="prime"):
+        servo.follow(DriftingArm(drift_steps=10 ** 9), lambda: None,
+                     should_stop=lambda: False, engage_sec=0.0,
+                     hz=100.0, gains=servo.JointGains())

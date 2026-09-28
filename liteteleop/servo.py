@@ -149,6 +149,31 @@ def hold_at_current(arm) -> None:
     arm.movej(list(st.q), speed=0.3)
 
 
+def _send_hold(arm, tries: int = 5, gap: float = 0.02) -> bool:
+    """发一帧「**托住实测位姿**」。**每次重读实测**，因为臂可能还在动。
+
+    ⚠⚠ 为什么要重读 + 重试：`move_js` 在「目标 ≠ 实测位姿」且「`dq == 0`」时**被固件拒**。
+    而 `movej` 的到位判据是 `q_tol=0.03`、`dq_tol=0.10` —— 它返回时**臂可能还在动**。
+    于是"读一次实测 → 发一帧"之间位姿就过期了 ⇒ 被拒。
+
+    ⚠ `prime` / `engage` 曾经**没有**这层保护，真机上就是这么崩的：
+    对齐的 `movej` 超时（臂还在走）⇒ `prime` 拿缓存位姿发 `move_js` ⇒ 被拒 ⇒
+    异常直接穿出 `follow` ⇒ `⛔ 遥操异常退出`。
+    """
+    q = _q_meas(arm)
+    for _ in range(max(1, tries)):
+        try:
+            arm.move_js(q, [0.0] * N_JOINTS)
+            return True
+        except Exception:                                # noqa: BLE001
+            time.sleep(gap)
+            try:
+                q = _q_meas(arm)                         # 重读：臂可能又动了
+            except Exception:                            # noqa: BLE001
+                pass
+    return False
+
+
 def _q_meas(arm) -> List[float]:
     st = arm.get_state(refresh=False).value
     if st is None:
@@ -193,16 +218,19 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         ac = list(accel_limit or DEFAULT_ACCEL_LIMIT)
         dt_nom = 1.0 / max(hz, 1.0)
 
-        # ── prime：目标 == 实测位姿、dq=0 ⇒ 固件接受，且用内置刚度与重力【托住】──
+        # ── prime：**托住实测位姿**（目标==实测 ⇒ 固件接受，内置刚度+重力托住）──
+        if not _send_hold(arm):
+            raise RuntimeError(
+                "prime 连发 5 次「托住实测位姿」都被固件拒 —— 这不是稳态残差，"
+                "是链路或臂状态有问题（臂可能一直在动）。受控接管后上抛。")
         q_cmd = _q_meas(arm)
-        arm.move_js(q_cmd, [0.0] * N_JOINTS)
         dq_cmd = [0.0] * N_JOINTS
         q_target = list(q_cmd)
 
         # ── engage：engage_sec 内持续"托在原地"（对应 joint_follow 的低刚度托举段）──
         t_end = time.monotonic() + max(engage_sec, 0.0)
         while time.monotonic() < t_end and not should_stop():
-            arm.move_js(_q_meas(arm), [0.0] * N_JOINTS)
+            _send_hold(arm, tries=2)
             time.sleep(dt_nom)
 
         # ── start：指令/目标都初始化成【当前实测】──
@@ -252,10 +280,8 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                 # 退路：**托住实测位姿**。那一帧目标==实测 ⇒ 一定被接受 ⇒ 看门狗照 kick，
                 # 再把参考同步过去，下一拍 `slew_target` 从实测位姿重新起步
                 # ⇒ **主臂一动，目标一变，就立刻恢复正常跟随**。
-                try:
-                    q_hold = _q_meas(arm)
-                    arm.move_js(q_hold, [0.0] * N_JOINTS)
-                except Exception as e2:              # noqa: BLE001
+                q_hold = _q_meas(arm)
+                if not _send_hold(arm, tries=3):
                     rejects += 1
                     log.warning("move_js 被拒（第 %d 次连续）：%s", rejects, e)
                     if rejects >= _REJECT_ESCALATE:
@@ -314,7 +340,8 @@ def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
                 log.warning("对齐：帧解不开（%s），继续等", e)
         time.sleep(0.01)
     if master_q is None:
-        log.warning("对齐：%.0f s 内未收到主臂帧，跳过对齐（跟随会逐步修正）", timeout)
+        log.warning("对齐：**%.0f s 内没收到主臂帧**，跳过对齐（跟随会逐步修正）。"
+                    "检查主臂是否已启动遥操、arm_id/端口是否一致", timeout)
         return None
 
     clamped, sat = clamp_to_limits(master_q, limits)
@@ -332,7 +359,9 @@ def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
     try:
         arm.movej(clamped, speed=speed)
     except Exception as e:                                # noqa: BLE001
-        log.warning("对齐 movej 失败（跟随会逐步修正）: %s", e)
+        log.warning("对齐：**收到帧了，但 movej 失败**（位移 %.3f rad）: %s —— "
+                    "⚠ 臂可能还在移动中，随后的 prime 会重读实测位姿再托住",
+                    delta, e)
         return None
     log.info("对齐完成（位移 %.3f rad）", delta)
     return list(clamped)
