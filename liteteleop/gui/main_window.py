@@ -7,7 +7,7 @@ import time
 from PyQt5 import QtCore, QtWidgets
 
 from ..arm_worker import ROLE_MASTER, ArmWorker, Snapshot
-from ..settings import Settings, save_settings
+from ..settings import Settings, load_settings, save_settings
 from .bridge import WorkerBridge
 from .pages import JointsPage, LinkPage, TeleopPage
 from .widgets import StatusStrip
@@ -189,10 +189,9 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(ev)
 
 
-def run(argv=None) -> int:
+def run(argv=None, settings=None) -> int:
     argv = list(sys.argv if argv is None else argv)
-    from ..settings import load_settings
     app = QtWidgets.QApplication(argv)
-    w = MainWindow(load_settings())
+    w = MainWindow(settings or load_settings())
     w.show()
     return app.exec_()
