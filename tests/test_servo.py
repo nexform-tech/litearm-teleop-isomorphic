@@ -363,22 +363,46 @@ def test_wall_zone_raises_kd_by_the_configured_extra():
     assert kd[1] == servo.SETUP_B[1], f"J2 不在墙区, kd 不该被动过, 实际 {kd[1]}"
 
 
-# ────────────── 限位内缩量：必须盖住 CDC 路线的滞后冲过 ──────────────
+# ────────────── 限位内缩量 ──────────────
 
-def test_limit_margin_covers_the_worst_case_overshoot():
-    """⛔ `DEFAULT_LIMIT_MARGIN` 必须 **≥ 固件锁存死区(0.05) + 本路线的最坏冲过**。
+def test_limit_margin_does_not_latch_at_limits():
+    """目标贴限位 + 最坏冲过，仍须落在固件锁存死区之内。
 
-    ⚠ 这是**故意偏离 litearm-server 的 0.01** 的地方：server 走 CAN 直连电机（无 USB
-    往返）⇒ 几乎不滞后 ⇒ 0.01 够用。我们走 USB CDC，每拍 2 次往返（实测各 3.333 ms）
-    ⇒ 6.7 ms 滞后；主臂最快轴 10 rad/s ⇒ 冲过 ≈ 0.067 rad，**落在 0.05 死区之外**
-    ⇒ 目标贴着限位时必然锁存 `joint_fault`（随后停发控制帧、电机静默、报 `FB_STALE`）。
+    ⚠ 判据形态 2026-09-28 修正。固件 `safety_check.c` 的锁存条件是
+    `q_meas > q_max + 0.05`，而 `q_meas ≤ q_max − margin + overshoot`：
 
-    判别力：谁把 margin 调回 0.01（以"照抄 server"为名），本用例立刻红。
+        不锁存  ⟺  overshoot ≤ 0.05 + margin  ⟺  **margin ≥ overshoot − 0.05**
+        原式「margin ≥ 0.05 + overshoot」把 0.05 加成而非减掉 ⇒ 要求翻倍，
+        正是 margin 被抬到 0.14 的原因（见 safety.py 的注释）。
+
+    判别力：谁把 `DEFAULT_SPEED_LIMIT` 调大（overshoot 随之变大）到盖过 0.05+margin，
+    本用例立刻红。
     """
     from liteteleop import safety, servo
-    worst = max(servo.DEFAULT_SPEED_LIMIT) * 2 * 0.003333     # 10 rad/s × 2 次往返
-    assert safety.DEFAULT_LIMIT_MARGIN >= 0.05 + worst, (
-        f"margin={safety.DEFAULT_LIMIT_MARGIN} 盖不住 0.05+{worst:.3f}")
+    overshoot = max(servo.DEFAULT_SPEED_LIMIT) * 2 * 0.003333   # 最快轴 × 2 次往返
+    assert safety.DEFAULT_LIMIT_MARGIN >= overshoot - 0.05, (
+        f"margin={safety.DEFAULT_LIMIT_MARGIN} 盖不住 overshoot={overshoot:.4f}"
+        f"（需 ≥ {overshoot - 0.05:.4f}）")
+
+
+def test_limit_margin_keeps_j4_usable():
+    """⛔ margin 不得把**最窄轴 J4** 的正半轴压没。
+
+    J4 的固件软限位上端 = **+0.017547 rad（1°）**，全臂最窄
+    （真源 `litearm-stm32/User/litearm/params/joint_limit_macros.h:16`）。
+    统一内缩 θ 后其上端变 `0.017547 − θ` ⇒ θ ≥ 0.017547 时 J4 正半轴**完全不可用**，
+    主臂往正方向拖 J4 时从臂纹丝不动 —— 2026-09-28 报的「J4 特别容易过软件限位」。
+
+    判别力：谁把 margin 调回 0.14（即任何 ≥ 0.0175 的值），本用例立刻红。
+    ⚠ 固件若改了 J4 的软限位，本常量须同步；真源见上一行的文件。
+    """
+    from liteteleop import safety
+    J4_QMAX = 0.017547
+    assert safety.DEFAULT_LIMIT_MARGIN < J4_QMAX, (
+        f"margin={safety.DEFAULT_LIMIT_MARGIN} ≥ J4 上端 {J4_QMAX} ⇒ J4 正半轴不可用")
+    assert J4_QMAX - safety.DEFAULT_LIMIT_MARGIN >= J4_QMAX / 3.0, (
+        f"J4 剩余正向行程仅 {J4_QMAX - safety.DEFAULT_LIMIT_MARGIN:.6f} rad，"
+        f"不足上端的三分之一")
 
 
 # ────────────────────── 限位墙（第二道位置护栏）──────────────────────
