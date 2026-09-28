@@ -16,14 +16,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 __all__ = [
-    "DEFAULT_KD_BUDGET",
-    "LimitsError",
-    "Limits",
-    "read_limits_ok",
-    "clamp_to_limits",
-    "saturate_dq",
-    "speed_limit_from_kd",
+    "DEFAULT_KD_BUDGET", "LimitsError", "Limits",
+    "read_limits_ok", "clamp_to_limits", "saturate_dq", "speed_limit_from_kd",
     "slew_target",
+    "IDLE", "ALIGN_FAST", "FOLLOWING", "HOLDING", "TeleopState",
 ]
 
 #: 速度上限的默认 kd 预算：`speed_limit_i = kd_budget * tau_max_i / kd_i`（spec §5.1）。
@@ -225,3 +221,141 @@ def slew_target(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
             dq_cmd[i] = v
 
     return q_cmd, dq_cmd
+
+
+# ────────────────────────── 4. 从臂状态机与 watchdog ──────────────────────────
+
+#: 状态常量（字符串，便于日志与界面直接显示）
+IDLE = "IDLE"
+ALIGN_FAST = "ALIGN_FAST"
+FOLLOWING = "FOLLOWING"
+HOLDING = "HOLDING"
+
+
+class TeleopState:
+    """从臂状态机 + watchdog（spec §5）。**纯逻辑，不碰硬件**。
+
+    之所以把状态机独立于"谁发命令"，是因为它的判据全是时间与计数，可完全离线测；
+    真正的 `movej`/`move_js`/`park` 由阶段二的 `ArmWorker` 按 `wants_*` 问询式驱动。
+    问询式（而不是回调式）让"这个状态该不该发命令"变成可断言的事实。
+
+    状态迁移（spec §5.1）::
+
+        IDLE --start--> ALIGN_FAST --align_done--> FOLLOWING
+          ^                ^                          |
+          |        连续收帧 recover_frames      frame_age > watchdog
+          |                |                          v
+          |                +----------------------  HOLDING
+          |                                     | 停留 >= hold_escalate_s
+          +--user_stop--> (movej 收尾)           ⇒ wants_stop_command() 一次
+    """
+
+    def __init__(self, n: int, watchdog_ms: float = 200.0,
+                 recover_frames: int = 5, hold_escalate_s: float = 2.0):
+        if n < 1:
+            raise ValueError(f"关节数需 >= 1（给的是 {n}）")
+        if watchdog_ms <= 0.0:
+            raise ValueError(f"watchdog_ms 需 > 0（给的是 {watchdog_ms}）")
+        if recover_frames < 1:
+            raise ValueError(f"recover_frames 需 >= 1（给的是 {recover_frames}）")
+        self.n = int(n)
+        self.watchdog_s = float(watchdog_ms) / 1000.0
+        self.recover_frames = int(recover_frames)
+        self.hold_escalate_s = float(hold_escalate_s)
+
+        self.state = IDLE
+        self._hold_since: Optional[float] = None
+        self._good_frames = 0
+        self._stop_pending = False
+        self._escalated = False
+
+    # ── 迁移入口 ──────────────────────────────────────────────────────────
+
+    def start(self, now: float) -> None:
+        """用户点「启动遥操」。"""
+        self.state = ALIGN_FAST
+        self._hold_since = None
+        self._good_frames = 0
+        self._stop_pending = False
+        self._escalated = False
+
+    def align_done(self, now: float) -> None:
+        """`ALIGN_FAST` 的 `movej` 已到位（含 spec §5.1 的交接补丁）。"""
+        if self.state == ALIGN_FAST:
+            self.state = FOLLOWING
+
+    def align_failed(self, now: float) -> None:
+        """`ALIGN_FAST` 的 `movej` 失败/超时 ⇒ **保持原地**，不自动进 `FOLLOWING`（spec §5.1）。
+
+        刻意比 server 严格：server 的对齐失败只 `log.warning` 一句就继续进 `joint_follow`
+        （`teleop_manager.py` 的 `_do_align`，注释写「跟随会逐步修正」）。本仓停住 ——
+        因为那一步失败意味着 `q_cmd` **没有同步到对齐位**（server 补丁的前提不成立），
+        进 `FOLLOWING` 就是带着一个未知的大误差起步。
+        **这是本设计唯一一处刻意比 server 严格的地方**（spec §5.1）。
+        """
+        self.state = ALIGN_FAST
+        self._stop_pending = False
+
+    def user_stop(self, now: float) -> None:
+        """用户点「停止」⇒ 收尾 `movej(q_now)`，回 IDLE（spec §5.3）。"""
+        self.state = IDLE
+        self._hold_since = None
+        self._good_frames = 0
+        self._escalated = False
+        self._stop_pending = True
+
+    # ── 每拍 ──────────────────────────────────────────────────────────────
+
+    def tick(self, now: float, frame_age: float) -> str:
+        """每拍调一次。`frame_age` = 距最近一帧的**本地**秒数（0.0 = 从未收到）。
+
+        Returns: 当前状态（与 `self.state` 相同）。
+        """
+        fresh = frame_age > 0.0 and frame_age <= self.watchdog_s
+        if self.state in (FOLLOWING,):
+            if not fresh:
+                self.state = HOLDING
+                self._hold_since = now
+                self._good_frames = 0
+                self._escalated = False
+        elif self.state == HOLDING:
+            if fresh:
+                self._good_frames += 1
+                if self._good_frames >= self.recover_frames:
+                    # ⚠ 回 ALIGN_FAST，**不是** FOLLOWING：主臂在断链期间可能已经动了，
+                    # 直接跟会阶跃（spec §5.2）
+                    self.state = ALIGN_FAST
+                    self._hold_since = None
+                    self._good_frames = 0
+                    self._escalated = False
+            else:
+                self._good_frames = 0
+                if (not self._escalated and self._hold_since is not None
+                        and now - self._hold_since >= self.hold_escalate_s):
+                    # 长时间持位：`park()` 只把刚度钉回 1.0×、tau 仍为 0 ⇒ 会缓慢下垂。
+                    # 补一次 `movej(q_now)` 进 `ht_on`（2× 刚度 + 重力前馈）才真稳。
+                    self._stop_pending = True
+                    self._escalated = True
+        return self.state
+
+    # ── 问询式出口（由阶段二的 ArmWorker 消费） ────────────────────────────
+
+    def wants_stop_command(self) -> bool:
+        """是否该发一条收尾 `movej(q_now, speed=0.3)`。读后须 `consume_stop_command()`。"""
+        return self._stop_pending
+
+    def consume_stop_command(self) -> None:
+        self._stop_pending = False
+
+    def may_dispatch(self, now: float, have_slave_q: bool) -> bool:
+        """本拍能否下发 `move_js`。
+
+        ⚠ 拿不到实测 `q` 就**不许下发** —— 公式要 `q_slave实测`，`get_state().value`
+        可能为 `None`；**绝不用 0 或上一次的值去猜**（猜出来的 `dq` 会被当速度前馈发出去）。
+        （spec §5.1 第 4 点）
+        """
+        return self.state == FOLLOWING and have_slave_q
+
+    def wants_movej(self) -> bool:
+        """是否处于需要 `movej` 的状态（`ALIGN_FAST` / 收尾）。"""
+        return self.state == ALIGN_FAST or self._stop_pending

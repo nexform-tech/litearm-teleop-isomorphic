@@ -196,3 +196,118 @@ def test_speed_limit_rejects_bad_budget(budget):
 def test_speed_limit_rejects_bad_kd():
     with pytest.raises(safety.LimitsError, match="非法"):
         safety.speed_limit_from_kd([0.0] * 7, [1.0] * 7)
+
+
+# ── 状态机与 watchdog ───────────────────────────────────────────────────────
+
+
+def _sm(**kw):
+    defaults = dict(n=7, watchdog_ms=200.0, recover_frames=5, hold_escalate_s=2.0)
+    defaults.update(kw)
+    return safety.TeleopState(**defaults)
+
+
+def test_starts_idle():
+    assert _sm().state == safety.IDLE
+
+
+def test_start_goes_to_align_fast():
+    sm = _sm()
+    sm.start(now=0.0)
+    assert sm.state == safety.ALIGN_FAST
+
+
+def test_align_done_goes_to_following():
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    assert sm.state == safety.FOLLOWING
+
+
+def test_watchdog_trips_to_holding():
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    assert sm.tick(now=1.0 + 0.1, frame_age=0.1) is safety.FOLLOWING
+    # 200 ms 无新帧 ⇒ HOLDING
+    assert sm.tick(now=1.0 + 0.35, frame_age=0.35) is safety.HOLDING
+
+
+def test_hold_escalates_once_after_2s():
+    """HOLDING ≥ 2 s ⇒ 升级 movej(q_now) **一次**，且**仍留在 HOLDING**。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    sm.tick(now=1.5, frame_age=0.5)
+    assert sm.state == safety.HOLDING
+    assert sm.wants_stop_command() is False, "刚进 HOLDING 不该升级"
+    sm.tick(now=2.6, frame_age=1.6)                 # 进入 HOLDING 已 1.1 s
+    assert sm.wants_stop_command() is False
+    sm.tick(now=3.6, frame_age=2.6)                 # 进入 HOLDING 已 2.1 s
+    assert sm.wants_stop_command() is True
+    assert sm.state == safety.HOLDING, "升级后仍留在 HOLDING"
+    sm.consume_stop_command()
+    sm.tick(now=4.0, frame_age=2.0)
+    assert sm.wants_stop_command() is False, "升级只做一次"
+
+
+def test_hold_recovers_to_align_fast_not_following():
+    """恢复必须重走 ALIGN_FAST —— 主臂在断链期间可能已经动了（spec §5.2）。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    sm.tick(now=1.5, frame_age=0.5)
+    assert sm.state == safety.HOLDING
+    for k in range(5):                              # 连续 5 拍收到帧
+        sm.tick(now=2.0 + 0.01 * k, frame_age=0.01)
+    assert sm.state == safety.ALIGN_FAST
+
+
+def test_hold_recovery_needs_consecutive_frames():
+    """不足 5 拍不许恢复（防抖动来回切）。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    sm.tick(now=1.5, frame_age=0.5)
+    for k in range(4):
+        sm.tick(now=2.0 + 0.01 * k, frame_age=0.01)
+    assert sm.state == safety.HOLDING
+    sm.tick(now=2.10, frame_age=0.5)                # 又断了 ⇒ 计数清零
+    sm.tick(now=2.20, frame_age=0.01)
+    assert sm.state == safety.HOLDING
+
+
+def test_align_failed_stays_put():
+    """对齐失败必须停在 ALIGN_FAST —— 且 tick 永远不把它推进 FOLLOWING（spec §5.1）。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_failed(now=1.0)
+    assert sm.state == safety.ALIGN_FAST
+    for k in range(20):
+        sm.tick(now=1.0 + 0.01 * k, frame_age=0.01)
+        assert sm.state == safety.ALIGN_FAST, "只有 align_done() 才能进 FOLLOWING"
+
+
+def test_user_stop_from_any_state():
+    for prep in (None, "align", "following", "holding"):
+        sm = _sm()
+        sm.start(now=0.0)
+        if prep == "align":
+            pass
+        else:
+            sm.align_done(now=1.0)
+        if prep in ("following", "holding"):
+            if prep == "holding":
+                sm.tick(now=2.0, frame_age=0.5)
+        sm.user_stop(now=9.0)
+        assert sm.state == safety.IDLE, f"prep={prep}"
+        assert sm.wants_stop_command() is True
+
+
+def test_state_missing_q_blocks_dispatch():
+    """拿不到实测 q 就不许下发（spec §5.1 第 4 点）—— 不许拿 0 去猜 err。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_done(now=1.0)
+    assert sm.may_dispatch(now=1.0, have_slave_q=True) is True
+    assert sm.may_dispatch(now=1.0, have_slave_q=False) is False
