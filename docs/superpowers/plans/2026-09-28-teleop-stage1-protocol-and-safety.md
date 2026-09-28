@@ -753,7 +753,9 @@ cd /home/llx/litearm-teleop-isomorphic
 python3 -m pytest tests/test_wire.py -q
 ```
 
-Expected: `ModuleNotFoundError: No module named 'liteteleop.wire'`（collection error）
+Expected: **collection error** —— 模块尚不存在。实测文案随 pytest 版本而异
+（`ModuleNotFoundError: No module named ...` 或 `ImportError: cannot import name 'wire' from 'liteteleop'`）
+⇒ **两者都算通过**；判据是「收集期就失败」，不是那条具体文案。
 
 - [ ] **Step 3: 实现**
 
@@ -798,6 +800,7 @@ MAX_JOINTS = 32
 
 class WireError(ValueError):
     """帧不合法（版本不符 / 长度不符 / 关节数不符）。"""
+
 
 @dataclass(frozen=True)
 class Frame:
