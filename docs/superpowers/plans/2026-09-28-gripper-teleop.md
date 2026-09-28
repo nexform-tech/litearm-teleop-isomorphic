@@ -1,5 +1,49 @@
 # 夹爪遥操 Implementation Plan
 
+> ## ⚠ 实施记录（2026-09-29 补）——本计划已**执行完毕**，下列内容与计划原文**不一致**
+>
+> 执行过程中真实的代码、测试命令与预期数字**以下面这张表和实际代码为准**，不要照抄计划正文。
+>
+> ### A. 计划本身的错误（执行时发现并改正）
+>
+> | # | 计划写的 | 实际应为 |
+> |---|---|---|
+> | A1 | Task 4/5/7 用全套命令却写「Expected: 26 / 27 passed」 | 仓库**本来就有 74 个测试**。全套实测：Task 4 后 **101**、Task 5 后 **107**、最终 **118**。按**文件**跑的命令（Task 1–3 的 5 / 15 / 19）才是对的 |
+> | A2 | Task 5 Step 4 `assert p.btn_grip is not p.btn_teleop` | `TeleopPage` **没有** `btn_teleop`（那在 `LinkPage`）⇒ 应按 `MainWindow` 断言 `w.page_teleop.btn_grip is not w.page_link.btn_teleop` |
+> | A3 | Task 5 Step 2(b) `sp_gport` 只 `setRange` 不 `setValue` | QSpinBox 会被钳到 **1**（特权端口）并写进设置 ⇒ 主端绑不上。必须 `setValue(self.gs.gport)` |
+> | A4 | Task 5 Step 2(d) 让 `apply_grip` 里 `btn_grip.setEnabled(bool(g.connected))` | ⚠⚠ **死锁**：`GripWorker` 只能由点这个按钮创建，而 `connected` 又要先有 worker ⇒ **永远点不了**。夹爪按钮**必须从构造起就可点**（与臂的 `btn_teleop` 相反） |
+> | A5 | Task 5 Step 2(c) 锚点写成「`__init__` 末尾（`lay.addWidget(box)` 之后）」 | 会把接线插在 `self.btn_grip` 创建**之前** ⇒ `AttributeError`。锚点应是面板自己的 `lay.addWidget(gbox)` **之后** |
+> | A6 | Task 4 Step 6 SDK 钉死插在「`s = load_settings()` 之后」 | 那在 `--gcan` 赋值**之前** ⇒ 用 `--gcan can0` 启动时 `s.gcan` 还是空串，钉死**永不执行**。锚点必须是 `if a.grip_id: …` **之后** |
+> | A7 | Task 6 Step 1 要「在 README 的启动示例里补」 | README **没有**启动示例节，是新增；另外顺手订正了陷阱 #13（原文写反成「不可混用/帧格式不同」） |
+> | A8 | Task 7 Step 5 的 `m()` 辅助函数 | 变异锚点打不中时它**什么都不打印**，会被误读成「跑了但没红」。已改成失败即报 |
+>
+> ### B. 执行中改的设计（计划没有的）
+>
+> | # | 改动 | 为什么 |
+> |---|---|---|
+> | B1 | **主端 `link.Listener` 建一次、活一个进程**（原计划是每次进 `_master_loop` 新建） | ⚠⚠ 实测两个真 bug：①遥操停下没人关 ⇒ 端口不释放 ⇒ **第二次启动必定 `Address already in use`**（表现：**只能启动一次**）；②就算补上关闭，同端口拆了重建会让订阅↔发布匹配**间歇性失败**（12 轮里 5 轮 `matching=False`）。改常驻后 12 轮 **0 失败**。也与参考实现同形（它主端发在常驻 transport 上） |
+> | B2 | **协议边界拒非有限值**（§8 rule 9） | ⚠⚠ 实测：`_clamp01(NaN)` 返回 NaN，而 `clamp_to_calibrated` 里 `min(hi, NaN)` **返回 hi** ⇒ 一条 NaN 帧把从端命令到**全闭限位**，且 `error` 为空。`±inf` 同样折成端点。**错在危险一侧且静默** |
+> | B3 | 构造期拒 `rate_hz <= 0` / `watchdog_ms <= 0` | 前者在环里抛 `ZeroDivisionError`；后者不崩但让从端**永远**判 stale（静止不动的静默无用配置） |
+> | B4 | `GripSnapshot` 加 `rejected` / `teleop_active` | 丢弃帧要**看得见**；按钮按真实状态刷新 |
+> | B5 | `_on_grip_state` 出错时丢掉 worker（`self.grip = None`） | 否则 worker 死了、按钮又停用 ⇒ 只能重启应用 |
+> | B6 | `TeleopPage` 改成接收 `settings` | 夹爪分区要回填持久化的值 |
+>
+> ### C. 新增的回归网（比计划多）
+>
+> `test_teleop_can_be_restarted_repeatedly`（B1）、
+> `test_slave_rejects_non_finite_frames_and_holds` / `test_master_refuses_to_publish_non_finite`（B2）、
+> `test_degenerate_construction_params_are_rejected`（B3）、
+> `test_exception_inside_the_loop_is_recorded`（失败必须可见）、
+> `test_grip_button_is_clickable_from_construction`（A4 死锁）、
+> `test_grip_click_without_channel_bounces_back_and_creates_nothing`、
+> `test_grip_rejected_frames_are_visible`、`test_grip_settings.py` 三条。
+>
+> 全部经**变异测试**确认有判别力（去掉对应实现即红）。
+>
+> ### D. 仍未做
+>
+> **Task 8（真机验证）没做** —— 需要两台机 + 两个夹爪 + 已拉的 CAN。本条**不可跳过**。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给同构遥操上位机 `liteteleop` 加上夹爪遥操 —— 主端夹爪零重力被人手掰动，从端夹爪跟着开合，走 zenoh 纯点对点。
