@@ -1,6 +1,7 @@
 """`GripWorker` —— 换算 / 前置 / 收尾 / 两端环（真 zenoh 回环，非 mock）。"""
 import socket
 import sys
+import threading
 import time
 import types
 
@@ -291,6 +292,181 @@ def test_slave_rejects_non_finite_frames_and_holds():
     finally:
         s.stop(timeout=5.0)
         pub.close()
+
+
+def test_align_rejects_non_finite_first_frame_and_holds():
+    """⚠⚠ **`align=True`（默认值！）时，非有限值的首帧也必须被跳过。**
+
+    这是我前面几轮全漏掉的一条路径：对齐用的 `_wait_first_frame` 曾经直接把
+    解出来的 tuple 返回给 `openness_to_rad` → `goto_rad`，而
+    `_clamp01(NaN)` 是 NaN、SDK 的 `goto_rad` 会把 NaN **折成端点**
+    ⇒ 夹爪被"吸"到全闭（正常装法 `hi == pos_closed_rad`），
+    而且 `rejected` 同时在涨、`error` 为空 —— 环里的守卫拦不住这条路。
+
+    实测证据（修前）：`goto_rad q=[nan]` 且此后 MIT 指令全是 `0.114`。
+
+    判别力：去掉 `_wait_first_frame` 里的 `math.isfinite` 检查时本用例必红。
+    ⚠ 我这里**故意用 `align=True`** —— 旧用例全用 `align=False`，所以从没走到这一格。
+    """
+    port = _free_port()
+    sg = FakeGrip(position_rad=-0.7)
+    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
+                   rate_hz=100.0, align=True, gripper_factory=lambda _c: sg)
+    pub = link.Listener(port, gw.gripper_teleop_topic("gA"))
+    stop = threading.Event()
+
+    def flood():
+        while not stop.is_set():
+            pub.put(gw.encode_gripper_teleop(float("nan"), float("nan"),
+                                             0.0, time.monotonic()))
+            time.sleep(0.005)
+
+    th = threading.Thread(target=flood, daemon=True)
+    try:
+        s.start()
+        time.sleep(0.3)
+        th.start()
+        s.set_teleop(True)
+        time.sleep(1.2)
+        assert sg.gotos == [], f"非有限值的首帧**不许**进 goto_rad，实际 {sg.gotos}"
+        qs = [f["q"] for f in sg.sent]
+        assert qs, "对齐等待期间也必须继续发持位帧（停发会掉力）"
+        assert all(abs(q - (-0.7)) < 1e-9 for q in qs), \
+            ("必须保持本机实测位置 -0.7，实际 "
+             f"{sorted(set(round(q, 4) for q in qs))}")
+        assert s.snapshot().rejected >= 1, "被跳过的帧要计数"
+        assert s.snapshot().frames_received == 0, "非有限值帧不算收到有效帧"
+    finally:
+        stop.set()
+        th.join(timeout=1.0)
+        s.stop(timeout=5.0)
+        pub.close()
+
+
+def test_non_finite_force_or_position_field_is_also_rejected():
+    """⚠ **四个字段都要判** —— `force_n` 现在也会显示在界面上。"""
+    from liteteleop import grip_wire as _gw
+
+    port = _free_port()
+    sg = FakeGrip(position_rad=-0.7)
+    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
+                   rate_hz=100.0, align=False, gripper_factory=lambda _c: sg)
+    pub = link.Listener(port, _gw.gripper_teleop_topic("gA"))
+    try:
+        s.start()
+        time.sleep(0.3)
+        s.set_teleop(True)
+        time.sleep(0.3)
+        sg.clear_sent()
+        for _ in range(5):                    # openness 有限，但 force_n 是 NaN
+            pub.put(_gw.encode_gripper_teleop(0.5, 60.0, float("nan"), time.monotonic()))
+            time.sleep(0.01)
+        time.sleep(0.25)
+        assert s.snapshot().frames_received == 0, "force_n 非有限值的帧也要拒"
+        assert s.snapshot().rejected >= 1
+        assert all(abs(f["q"] - (-0.7)) < 1e-9 for f in sg.sent), "必须保持不动"
+    finally:
+        s.stop(timeout=5.0)
+        pub.close()
+
+
+# ════════════════════ §8 rule 10：SDK 的失败信号必须被消费 ════════════════════
+
+def test_enable_failure_is_not_silent():
+    """⚠⚠ `enable()` 失败**必须**报出来。
+
+    真 SDK **不抛** —— 只返回一个 falsy 的 `EnableResult`
+    （`EnableResult.__bool__` 就是 `self.ok`），此后 `send_mit_frame` 恒返回 `False`。
+    不查的实测后果：`error=''`、`connected=True`、`frames_sent` 一直涨，
+    而**电机根本没使能（夹爪是软的）** —— 界面还在显示"已发 N 帧 · 跟随中"。
+
+    判别力：去掉 `_run` 里那句 `if not self._grip.enable(): raise` 时本用例必红。
+    """
+    g = FakeGrip(enable_ok=False)
+    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.4)
+        snap = w.snapshot()
+        assert "使能失败" in snap.error, f"enable 失败必须记进 error，实际 {snap.error!r}"
+        assert g.enable_calls == 1
+        assert snap.frames_sent == 0, "使能失败就不该进环发帧"
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_send_failure_is_counted():
+    """⚠ `send_mit_frame` 返回 `False` 时**要计数**（真 SDK 未使能时不抛）。"""
+    g = FakeGrip(enable_ok=False)
+    # 让 enable 成功但发送失败（模拟"使能了、CAN 却发不出去"）
+    g.enable_ok = True
+    orig = g.send_mit_frame
+    g.send_mit_frame = lambda *a, **k: (orig(*a, **k), False)[1]
+    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.35)
+        w.set_teleop(True)
+        time.sleep(0.4)
+        assert w.snapshot().send_failed >= 1, \
+            f"send_mit_frame 返回 False 必须计数，实际 {w.snapshot().send_failed}"
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_gripper_own_fault_code_is_surfaced():
+    """⚠ 夹爪**自己**报的 `error_code` 要消费掉。
+
+    spec §7.4 偏离 #2 说「不 poll 就永远看不到夹爪自己的故障」——
+    可**只 poll 不看 `error_code` 等于没做**。SDK 语义：`1`=已使能、`0`=已失能、
+    其它=真实故障（`litegrip/constants.py:73-95`）。
+
+    判别力：去掉 `_note_grip_fault` 调用时本用例必红。
+    """
+    g = FakeGrip(fault_code=0xB)              # 0xB = MOS 过温
+    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.35)
+        w.set_teleop(True)
+        time.sleep(0.4)
+        fault = w.snapshot().fault
+        assert "11" in fault, f"error_code 要报出来，实际 {fault!r}"
+        assert "过温" in fault, "要说明是什么故障"
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_stop_timeout_keeps_the_thread_reference():
+    """⚠ 收尾超时时**不能**清掉 `self._thread`。
+
+    清了就没人知道那条线程还活着 ⇒ 调用方会再建一个 worker，
+    两条线程同时抢**同一个 CAN** 与**同一个 zenoh 端口**。
+    保留引用 ⇒ 再点一次「停止」能重试 join，`is_alive()` 也能被问到。
+
+    判别力：把 `stop()` 里那句超时 `return` 去掉（即无论超时都清 `_thread`）时必红。
+    """
+    class _SlowDisconnect(FakeGrip):
+        def disconnect(self):
+            time.sleep(1.5)
+            super().disconnect()
+
+    g = _SlowDisconnect()
+    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.35)
+        w.stop(timeout=0.2)                   # 故意短于 disconnect 的 1.5 s
+        assert w.is_alive() is True, "超时后线程仍在跑，必须能被问到"
+        assert w._thread is not None, "超时时不许清掉线程引用"
+        w.stop(timeout=5.0)                   # 再点一次能重试收尾
+        assert w.is_alive() is False
+    finally:
+        w.stop(timeout=5.0)
 
 
 def test_master_refuses_to_publish_non_finite():

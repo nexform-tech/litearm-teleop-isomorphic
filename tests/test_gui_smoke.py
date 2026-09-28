@@ -283,6 +283,65 @@ def test_grip_mismatch_and_error_are_visible(qapp):
     w.close()
 
 
+def test_grip_sdk_unavailable_does_not_abort_the_app(qapp, monkeypatch):
+    """⚠⚠ SDK 不可用时**绝不能让异常逃出 Qt 槽** —— PyQt5 会直接 abort 进程。
+
+    本机实测：`ModuleNotFoundError` 逃出槽 ⇒ **exit 134、core dumped**。
+    只在 `_ensure_grip_worker` 里兜 `SystemExit` 是不够的，因为
+    ① `assert_sdk_pinned` 抛的 `SystemExit` **不是** `Exception` 的子类；
+    ② 一台**没装 litegrip** 的机器上 `import litegrip` 抛 `ModuleNotFoundError`。
+    后果是点一下夹爪按钮把**整个应用**带走，连正在跑的臂遥操一起
+    （没有收尾 movej）—— 直接违反 spec §2 的故障隔离承诺。
+
+    判别力：把 `except BaseException` 改回 `except SystemExit` 时，
+    第一个 `assert` 会因为异常逃出来而报错。
+    """
+    import liteteleop.grip_worker as gwk
+
+    w = MainWindow(Settings(gcan="can0"))
+    try:
+        # ① 没装 SDK
+        monkeypatch.setattr(gwk, "pin_grip_sdk", lambda *a, **k: (_ for _ in ()).throw(
+            ModuleNotFoundError("import of litegrip halted")))
+        assert w._ensure_grip_worker() is None, "SDK 缺失应当只是停用夹爪遥操"
+        assert w.grip is None
+
+        # ② 走错仓（断言抛 SystemExit）
+        monkeypatch.setattr(gwk, "pin_grip_sdk", lambda *a, **k: (_ for _ in ()).throw(
+            SystemExit("⛔ litegrip 导入自别处")))
+        assert w._ensure_grip_worker() is None
+        assert w.grip is None
+    finally:
+        w.close()
+
+
+def test_grip_force_and_fault_are_visible(qapp):
+    """`force_n`、夹爪自身故障码、send_mit_frame 失败次数都要看得见（spec §9.3）。"""
+    from liteteleop.grip_worker import GripSnapshot
+
+    w = MainWindow(Settings())
+    g = GripSnapshot(role="slave", connected=True, force_n=12.3)
+    w._on_grip_state(g)
+    assert "12.3" in w.page_teleop.lab_grip.text(), "力要显示"
+
+    g.fault = "夹爪报告 error_code=11（故障：过温/过流等）—— 继续发帧持位"
+    g.send_failed = 4
+    w._on_grip_state(g)
+    txt = w.page_teleop.lab_grip_mismatch.text()
+    assert "过温" in txt, txt
+    assert "4 次" in txt, txt
+    w.close()
+
+
+def test_can_channel_hint_does_not_crash(qapp):
+    """`can_channels()` 在没有任何 can* 接口的机器上也要安全返回。"""
+    from liteteleop.gui.pages import TeleopPage, can_channels
+
+    assert isinstance(can_channels(), list)
+    p = TeleopPage(Settings())
+    assert isinstance(p.gripper_values()["gcan"], str)
+
+
 def test_grip_rejected_frames_are_visible(qapp):
     """⚠ 丢弃非有限值帧（NaN/Inf）必须**看得见** —— 静默丢弃就是静默失败。"""
     from liteteleop.grip_worker import GripSnapshot

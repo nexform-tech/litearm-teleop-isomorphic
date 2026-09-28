@@ -49,11 +49,25 @@ class FakeCfg:
 
 @dataclass
 class FakeState:
-    """`GripperState` 的最小子集。"""
+    """`GripperState` 的最小子集。
+
+    ⚠ `error_code` 必须留着：SDK 语义 `1` = 已使能、`0` = 已失能、其它 = 故障
+    （`litegrip/constants.py:73-95`）。`grip_worker._note_grip_fault` 就靠它，
+    没有这个字段就测不了"夹爪自己报故障"那条路。
+    """
 
     position_rad: float = 0.0
     position_mm: float = 0.0
     force_n: float = 0.0
+    error_code: int = 1
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.error_code == 1
+
+    @property
+    def is_error(self) -> bool:
+        return self.error_code not in (0, 1)
 
 
 class FakeGrip:
@@ -67,11 +81,18 @@ class FakeGrip:
 
     def __init__(self, cfg: Optional[FakeCfg] = None,
                  position_rad: Optional[float] = None,
-                 calibrated: bool = True):
+                 calibrated: bool = True,
+                 enable_ok: bool = True,
+                 fault_code: Optional[int] = None):
         self.config = cfg or FakeCfg()
         self._calibrated = calibrated
         self._pos = (self.config.pos_closed_rad if position_rad is None
                      else float(position_rad))
+        #: ⚠ `enable()` 的成败。真 SDK **不抛**，只返回一个 falsy 的 EnableResult
+        #: （`EnableResult.__bool__` 就是 `self.ok`）。
+        self.enable_ok = bool(enable_ok)
+        #: 想显式注入的状态帧 error_code（None = 由 enable_ok 推导）。
+        self.fault_code = fault_code
 
         self.connected = False
         self.loaded = False
@@ -82,6 +103,11 @@ class FakeGrip:
         self.gotos: List[dict] = []         # 每次 goto_rad 的实参
         self.disconnects = 0
         self.raise_on_enable: Optional[BaseException] = None
+
+    def _err_code(self) -> int:
+        if self.fault_code is not None:
+            return int(self.fault_code)
+        return 1 if self.enable_ok else 0
 
     # ── 位置：测试可以"用手掰" ──
     @property
@@ -103,10 +129,12 @@ class FakeGrip:
         return True
 
     def enable(self, *a, **k):
+        """⚠ 真 SDK **不抛** —— 失败时返回 falsy 的 `EnableResult`。
+        本替身照此行事（`raise_on_enable` 只用来测"真抛了"的那种异常路径）。"""
         self.enable_calls += 1
         if self.raise_on_enable is not None:
             raise self.raise_on_enable
-        return True
+        return self.enable_ok
 
     def disconnect(self):
         """⚠ 记录调用次数。**真货的 `disable_on_disconnect` 语义在构造参数上**，
@@ -121,7 +149,8 @@ class FakeGrip:
         # 复刻 SDK 的公式（`gripper.py:1561-1562`），含 close_sign
         s = self.config.close_sign
         mm = ((self.config.pos_closed_rad - self._pos) * s * self.config.rad_to_mm)
-        return FakeState(position_rad=self._pos, position_mm=mm, force_n=0.0)
+        return FakeState(position_rad=self._pos, position_mm=mm, force_n=0.0,
+                         error_code=self._err_code())
 
     def poll(self, timeout_s: float = 0.0) -> bool:
         self.polls += 1
@@ -129,8 +158,13 @@ class FakeGrip:
 
     def send_mit_frame(self, q: float, kp: float, kd: float,
                        dq: float = 0.0, tau: float = 0.0) -> bool:
+        """⚠ 真 SDK 在**未使能**时返回 `False` 而**不抛**（`gripper.py:468-471`）。
+        这里照此行事：`enable_ok=False` 时恒返回 `False` 且不动电机。"""
         self.sent.append({"q": float(q), "kp": float(kp), "kd": float(kd),
-                          "dq": float(dq), "tau": float(tau)})
+                          "dq": float(dq), "tau": float(tau),
+                          "accepted": self.enable_ok})
+        if not self.enable_ok:
+            return False
         # kp != 0 ⇒ 这是位置指令，夹爪会朝它走（零力矩帧不改位置）
         if kp:
             self._pos = float(q)

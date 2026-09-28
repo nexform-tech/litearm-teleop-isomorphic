@@ -176,7 +176,10 @@ class MainWindow(QtWidgets.QMainWindow):
         没有通道就**不建** —— 那是「不启用夹爪遥操」的安全默认，不是错误。
         """
         if self.grip is not None:
-            return self.grip
+            if self.grip.is_alive():
+                return self.grip
+            # ⚠ 线程已经收尾完了 ⇒ 丢掉重建（否则会一直把一个死 worker 当活的用）
+            self.grip = None
         v = self.page_teleop.gripper_values()
         if not v["gcan"]:
             self._log("⚠ 未填夹爪 CAN 通道 —— 夹爪遥操未启用")
@@ -187,8 +190,18 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             from ..grip_worker import pin_grip_sdk
             self._log(f"夹爪 SDK: {pin_grip_sdk()}")
-        except SystemExit as e:
-            self._log(str(e))
+        except BaseException as e:                   # noqa: BLE001
+            # ⚠⚠ 必须兜住 **BaseException**，不能只兜 `SystemExit`：
+            #    · `assert_sdk_pinned` 抛的是 `SystemExit`（**不是** `Exception` 的子类）；
+            #    · 一台**没装 litegrip** 的机器上 `import litegrip` 会抛
+            #      `ModuleNotFoundError`；
+            #    · 而 PyQt5 对**逃出槽的异常会直接 abort 进程**（本机实测：
+            #      `ModuleNotFoundError` 逃出槽 ⇒ exit 134、core dumped）。
+            #    ⇒ 只兜 SystemExit 的结果是：点一下「启动夹爪遥操」把**整个应用**
+            #      带走，连正在跑的臂遥操一起（没有收尾 movej）——
+            #      直接违反 spec §2「与臂完全解耦」的故障隔离承诺。
+            self._log(f"⛔ 夹爪 SDK 不可用：{e}")
+            self._log("   （夹爪遥操已停用；臂遥操不受影响）")
             return None
         self.grip = GripWorker(
             role=self.page_link.role(), gcan=v["gcan"], grip_id=v["grip_id"],
@@ -221,9 +234,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.grip.stop()
             except Exception:                        # noqa: BLE001
                 pass
-            self.grip = None
             self.page_teleop.btn_grip.setChecked(False)
-            self._log("夹爪遥操出错并已停止 —— 可再次点「启动夹爪遥操」重试")
+            if self.grip.is_alive():
+                # ⚠⚠ 线程还活着 ⇒ 它仍占着 **zenoh 端口**与 **CAN**。
+                #    这时候再建一个 worker 会让两条线程抢同一份资源
+                #    （旧的要等 `_teardown` 才放端口 ⇒ 新的报 Address already in use）。
+                self._log("⚠ 夹爪 worker 尚未退出 —— 暂不重建；"
+                          "请再点一次「启动夹爪遥操」重试收尾")
+            else:
+                self.grip = None
+                self._log("夹爪遥操出错并已停止 —— 可再次点「启动夹爪遥操」重试")
 
     def _estop(self) -> None:
         """⛔ **不经 worker 队列**（§7.4）—— worker 可能正卡在收尾 `movej` 里。"""

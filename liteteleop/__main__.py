@@ -65,8 +65,17 @@ def main(argv=None) -> int:
     if s.gcan:
         # ⚠⚠ 必须在任何人 import litegrip **之前**钉死，否则本机那份 editable 的
         #    gitee 克隆会被静默抢先（实测：裸 import 落在 moduangongju/lite-grip）。
-        from .grip_worker import pin_grip_sdk
-        print(f"夹爪 SDK: {pin_grip_sdk()}")
+        try:
+            from .grip_worker import pin_grip_sdk
+            print(f"夹爪 SDK: {pin_grip_sdk()}")
+        except BaseException as e:                       # noqa: BLE001
+            # 命令行语义：缺 SDK 就**明确报错退出**，不要甩一坨 traceback。
+            # （`assert_sdk_pinned` 抛 `SystemExit` —— 它不是 `Exception` 的子类；
+            #   没装 litegrip 时 `import` 抛 `ModuleNotFoundError`。）
+            print(f"⛔ 夹爪 SDK 不可用：{e}", file=sys.stderr)
+            print("   --gcan 需要 litegrip（/home/llx/litegrip-python）；"
+                  "去掉 --gcan 可只跑臂遥操", file=sys.stderr)
+            return 2
     import sys as _sys
     # ⚠ 只把程序名交给 Qt：`--role`/`--cdc` 这些是**我们的**参数，Qt 不认识。
     return run([_sys.argv[0]], settings=s)

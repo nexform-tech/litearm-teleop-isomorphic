@@ -1,7 +1,8 @@
 """三个页面：链路 / 关节 / 遥操（spec §8）。"""
 from __future__ import annotations
 
-from typing import Optional
+import os
+from typing import List, Optional
 
 from PyQt5 import QtCore, QtWidgets
 
@@ -13,6 +14,20 @@ from ..wire import N_JOINTS
 from .widgets import JointTable
 
 __all__ = ["LinkPage", "JointsPage", "TeleopPage"]
+
+
+def can_channels() -> List[str]:
+    """本机的 `can*` 网络接口名（spec §9.3）。
+
+    ⚠ 只是个**提示**，不是扫描按钮：`ports.py` 枚举的是 CDC（按 STM32 的 VID:PID
+    过滤），本仓**没有**枚举 SocketCAN 的代码；而 `litegrip` 的 `channel` 就是
+    一个字符串（`gripper.py:198`）⇒ 加枚举＝新增一条没验过的代码路径。
+    读 `/sys/class/net` 是零依赖的，且能挡住"通道名打错"这个常见失败。
+    """
+    try:
+        return sorted(n for n in os.listdir("/sys/class/net") if n.startswith("can"))
+    except OSError:
+        return []
 
 
 class LinkPage(QtWidgets.QWidget):
@@ -297,8 +312,12 @@ class TeleopPage(QtWidgets.QWidget):
         grow.addWidget(self.ed_gpeer)
         gl.addLayout(grow)
 
+        found = can_channels()
         lab_ghint = QtWidgets.QLabel(
-            "⚠ 通道留空 = <b>不启用</b>夹爪遥操。夹爪的 CAN 口与臂的 CDC 口是两回事。")
+            "⚠ 通道留空 = <b>不启用</b>夹爪遥操。夹爪的 CAN 口与臂的 CDC 口是两回事。"
+            + (f"　本机可用：{', '.join(found)}" if found
+               else "　本机未发现 <code>can*</code> 接口（先 "
+                    "<code>ip link set can0 up</code>）"))
         lab_ghint.setWordWrap(True)
         gl.addWidget(lab_ghint)
 
@@ -376,16 +395,22 @@ class TeleopPage(QtWidgets.QWidget):
             self.lab_grip.setText(
                 f"主端夹爪：零重力 · {g.topic} · 发 {g.frames_sent} 帧 · "
                 f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm · "
+                f"力 {g.force_n:.1f} N · "
                 + ("已匹配订阅者" if g.matching else "⚠ 未匹配（发了没人在收）"))
         else:
             age = "—" if g.frame_age is None else f"{g.frame_age * 1000:.0f} ms"
             self.lab_grip.setText(
                 f"从端夹爪：{'持位（watchdog 超时）' if g.stale else '跟随中'} · "
                 f"环频 {g.loop_hz:.0f} Hz · 收 {g.frames_received} 帧 · 帧龄 {age} · "
-                f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm")
+                f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm · "
+                f"力 {g.force_n:.1f} N")
+        # ⚠ 三类"静默失败"都要**看得见**：丢弃的坏帧、发不出去的帧、夹爪自己的故障码
         self.lab_grip_mismatch.setText("　".join(x for x in (
             (f"⚠ 已丢弃 {g.rejected} 条非有限值帧（NaN/Inf）—— 保持不动"
              if g.rejected else ""),
+            (f"⚠ {g.send_failed} 次 send_mit_frame 返回 False —— 夹爪可能没在动"
+             if g.send_failed else ""),
+            (f"⛔ {g.fault}" if g.fault else ""),
             g.mismatch) if x))
         # ⚠ 按钮文本/勾选按**真实状态**刷新，不是按点击 ——
         #    与 `LinkPage.apply()` 对 `btn_teleop` 的做法同款（`pages.py:143-144`）。

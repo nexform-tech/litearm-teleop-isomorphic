@@ -194,6 +194,8 @@ class GripSnapshot:
     watchdog_trips: int = 0
     teleop_active: bool = False         # 由 snapshot() 从 _want 填（供界面按钮刷新）
     rejected: int = 0                   # 被**协议边界**丢弃的帧（非有限值，见 §8 rule 9）
+    send_failed: int = 0                # send_mit_frame 返回 False 的次数（§8 rule 10）
+    fault: str = ""                     # 夹爪自己报的 error_code != 1（§8 rule 10）
     mismatch: str = ""                  # 主从标定不一致告警（§7.3），空 = 无
     error: str = ""
 
@@ -252,6 +254,9 @@ class GripWorker:
         self._mismatch_checked = False
         self._rejected = 0                  # 边界丢弃的帧数（非有限值）
         self._reject_warned = False
+        self._send_failed = 0               # send_mit_frame 返回 False 的次数
+        self._fault = ""                    # 夹爪自己报的 error_code != 1
+        self._fault_warned = False
         self._loops = 0
         self._loop_hz = 0.0
         self._hz_t0 = 0.0
@@ -263,6 +268,11 @@ class GripWorker:
         self._thread = threading.Thread(target=self._run, name="GripWorker", daemon=True)
         self._thread.start()
 
+    def is_alive(self) -> bool:
+        """worker 线程是否仍在跑（收尾超时后调用方要据此决定能不能重建）。"""
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
     def stop(self, timeout: float = 5.0) -> None:
         """停止并收尾。**幂等**。⚠ 收尾**不失能**（spec §8 rule 4/6）。"""
         self._stop.set()
@@ -271,8 +281,15 @@ class GripWorker:
         if t is not None:
             t.join(timeout=timeout)
             if t.is_alive():
-                self._log("⚠ GripWorker 未在超时内退出")
-        self._thread = None
+                # ⚠⚠ **超时时不要把 `self._thread` 清掉。** 清了就没人知道那条线程
+                #    还活着 ⇒ 调用方（`_on_grip_state` / `_ensure_grip_worker`）
+                #    会再建一个 worker，两个线程同时抢**同一个 CAN** 与
+                #    **同一个 zenoh 端口**（旧的那个要等 `_teardown` 才放端口）。
+                #    保留引用 ⇒ 再点一次「停止」能重试 join，`is_alive()` 也能被问到。
+                self._log(f"⚠ GripWorker 未在 {timeout:.0f}s 内退出 —— 它仍在运行；"
+                          "暂不重建（再点一次「停止夹爪遥操」可重试收尾）")
+                return
+            self._thread = None
 
     def set_teleop(self, on: bool) -> None:
         """请求启动/停止夹爪遥操。**与臂的开关是两个独立控件**（spec §2）。"""
@@ -287,6 +304,8 @@ class GripWorker:
             s.loop_hz = self._loop_hz
             s.mismatch = self._mismatch
             s.rejected = self._rejected
+            s.send_failed = self._send_failed
+            s.fault = self._fault
             s.teleop_active = bool(self._want)
             if self._pub is not None:
                 s.matching = self._pub.matching
@@ -317,7 +336,18 @@ class GripWorker:
             self._cfg = self._grip.config
             # ⚠⚠ **必须在 enable() 之前** —— 否则未标定的夹爪会先被使能、再被拒
             check_ready(self._cfg)
-            self._grip.enable()
+            # ⚠⚠ `enable()` **不抛异常** —— 失败时返回一个 falsy 的 `EnableResult`
+            #    （`EnableResult.__bool__` 就是 `self.ok`；SDK `actions.py:401-443`，
+            #    放弃时 `return EnableResult(ok=False, ...)`）。
+            #    不查的实测后果：电机没使能，而此后 `send_mit_frame` 会**永远静默
+            #    返回 False** ⇒ 我们照发、界面照显示"已发 N 帧 · 跟随中"，
+            #    可夹爪其实是**软的**，且 `error` 恒为空 ⇒ 连错误恢复都不触发。
+            #    臂侧就是这么查的（`arm_worker.py:333-336`）。
+            if not self._grip.enable():
+                raise RuntimeError(
+                    "夹爪使能失败（enable() 返回假值）—— 电机没有使能；"
+                    "此时 send_mit_frame 会静默返回 False、夹爪是软的。"
+                    "检查电机供电 / CAN 接线 / 故障码。")
             with self._lock:
                 self._snap.connected = True
                 self._snap.travel_mm = travel_mm_of(self._cfg)
@@ -352,17 +382,23 @@ class GripWorker:
             self._teardown()
 
     def _run_teleop(self) -> None:
+        failed = False
         try:
             if self.role == ROLE_MASTER:
                 self._master_loop()
             else:
                 self._slave_loop()
         except Exception as e:                   # noqa: BLE001
+            failed = True
             self._log(f"⛔ 夹爪遥操异常退出: {e}")
             with self._lock:
                 self._snap.error = str(e)
         finally:
-            self._want = False
+            # ⚠ **只在出错时**清 `_want`。清得太无脑会吃掉一个在收尾期间落下的
+            #    「启动」请求（用户在 `_handoff` 那几毫秒里点了按钮 ⇒ 静默丢掉）。
+            #    干净停止时 `_want` 本来就是 False，不需要再写。
+            if failed:
+                self._want = False
             self._handoff()
             # ⚠⚠ **这一步不能省，也不能只放在 `_teardown` 里。**
             #    从端的订阅是每会话建的，不关就会占着连接/端口。
@@ -399,7 +435,7 @@ class GripWorker:
             else:
                 st = g.get_state(wait=False)
                 q = clamp_to_calibrated(self._cfg, st.position_rad)
-                g.send_mit_frame(q=q, kp=self._kp(), kd=self._kd(), dq=0.0)
+                self._send(q, self._kp(), self._kd())
             self._log("已交接：夹爪保持当前位置，**不失能**")
         except Exception as e:                   # noqa: BLE001
             self._log(f"⚠ 交接持位帧失败: {e}")
@@ -424,19 +460,16 @@ class GripWorker:
         nxt = time.monotonic() + dt
         while self._want and not self._stop.is_set():
             t0 = time.monotonic()
-            g.send_mit_frame(q=0.0, kp=0.0, kd=0.0)
-            g.poll(timeout_s=0.0)
-            st = g.get_state(wait=False)
+            self._send(0.0, 0.0, 0.0)                # 零力矩帧（维持零重力）
+            st = g.get_state(wait=False)             # 内部就是 poll(0.0)
+            self._note_grip_fault(st)
             openness = mm_to_openness(self._cfg, st.position_mm)
-            if not (math.isfinite(openness) and math.isfinite(st.position_mm)):
+            if not all(math.isfinite(v) for v in
+                       (openness, st.position_mm, st.force_n)):
                 # ⚠⚠ 主端也守在边界上（§8 rule 9）：读数坏掉时**不发帧**。
                 #    发出去的话从端会照单全收（见从端那段的说明）；
                 #    不发 ⇒ 从端的 watchdog 超时 ⇒ **持位**，是安全那一侧。
-                self._rejected += 1
-                if not self._reject_warned:
-                    self._reject_warned = True
-                    self._log(f"⚠ 读数非有限值（openness={openness!r}）—— 停止发帧，"
-                              "由从端的 watchdog 转持位")
+                self._count_rejected(openness)
             else:
                 self._pub.put(encode_gripper_teleop(openness, st.position_mm,
                                                     st.force_n, time.monotonic()))
@@ -472,10 +505,11 @@ class GripWorker:
         stale = False
 
         if self.align:
-            first = self._wait_first_frame(slot, timeout_s=5.0)
+            first = self._wait_first_frame(slot, timeout_s=5.0, hold_q=q_cmd)
             if first is not None:
                 o0 = _clamp01(first[0])
-                q_cmd = openness_to_rad(self._cfg, o0)
+                # ⚠ 再钳一道：`_wait_first_frame` 已保证有限，这里保证落在本机标定区间内
+                q_cmd = clamp_to_calibrated(self._cfg, openness_to_rad(self._cfg, o0))
                 self._log(f"对齐首帧 → openness={o0:.3f} → {q_cmd:+.4f} rad")
                 try:
                     g.goto_rad(q_cmd, kp=self.kp, kd=self.kd, duration=1.0)
@@ -492,19 +526,16 @@ class GripWorker:
             payload, _ts = slot.take()
             if payload is not None and len(payload) == GRIP_FRAME_BYTES:
                 openness, position_mm, force_n, _t = decode_gripper_teleop(payload)
-                if not (math.isfinite(openness) and math.isfinite(position_mm)):
-                    # ⚠⚠ **协议边界：非有限值一律拒收**（§8 rule 9），与臂侧
-                    #    `safety.clamp_to_limits` 的 `NonFiniteTarget`（`safety.py:142-144`）
-                    #    同款纪律。
-                    #    不拒的话实测是这样：`_clamp01(NaN)` 返回 NaN、
-                    #    `clamp_to_calibrated` 里 `min(hi, NaN)` **返回 hi**
-                    #    ⇒ 一条 NaN 帧把从端命令到**全闭限位**，而且 `error` 是空的。
-                    #    `±inf` 同样被折成端点。⇒ **错在危险一侧且静默**，必须拦。
-                    self._rejected += 1
-                    if not self._reject_warned:
-                        self._reject_warned = True
-                        self._log(f"⚠ 丢弃非有限值帧（openness={openness!r}）—— "
-                                  "保持当前位置不动，**不是**折成某个端点")
+                # ⚠⚠ **协议边界：非有限值一律拒收**（§8 rule 9），与臂侧
+                #    `safety.clamp_to_limits` 的 `NonFiniteTarget`（`safety.py:142-144`）
+                #    同款纪律。**四个字段都判**（`force_n` 也会被界面显示）。
+                #    不拒的话实测是这样：`_clamp01(NaN)` 返回 NaN、
+                #    `clamp_to_calibrated` 里 `min(hi, NaN)` **返回 hi**
+                #    ⇒ 一条 NaN 帧把从端命令到**全闭限位**，而且 `error` 是空的。
+                #    `±inf` 同样被折成端点。⇒ **错在危险一侧且静默**，必须拦。
+                if not all(math.isfinite(v) for v in
+                           (openness, position_mm, force_n)):
+                    self._count_rejected(openness)
                 else:
                     q_cmd = openness_to_rad(self._cfg, _clamp01(openness))
                     stale = False
@@ -526,23 +557,86 @@ class GripWorker:
                     stale = True
             # §8.2：即使 stale 也照发，只是 q_cmd 不变
             q_cmd = clamp_to_calibrated(self._cfg, q_cmd)
-            g.send_mit_frame(q=q_cmd, kp=self._kp(), kd=self._kd(), dq=0.0)
-            g.poll(timeout_s=0.0)
+            self._send(q_cmd, self._kp(), self._kd())
+            self._note_grip_fault(g.get_state(wait=False))
             with self._lock:
                 self._snap.stale = stale
                 self._snap.frame_age = slot.peek_age(time.monotonic())
             self._publish_state()
             nxt = self._pace(t0, nxt, dt)
 
-    def _wait_first_frame(self, slot, timeout_s: float) -> Optional[tuple]:
+    def _wait_first_frame(self, slot, timeout_s: float,
+                          hold_q: float) -> Optional[tuple]:
+        """等首帧（对齐用）。**只有全字段有限的那一帧才算首帧。**
+
+        ⚠⚠ 非有限值在这里**必须被跳过并继续等**，不能 return —— 这是实测出来的：
+        本函数的返回值喂给 `openness_to_rad` → `goto_rad`，而
+        `_clamp01(NaN)` 是 NaN、SDK 的 `goto_rad` 会把 NaN 折成端点
+        ⇒ **一条 NaN 帧把从端"吸"到全闭限位**（`align=True` 是默认值，
+        实测 `rejected=148` 的同时 MIT 指令全是 `0.114 = pos_closed`）。
+        环里的守卫救不了它，因为那条路根本不经过守卫。
+
+        ⚠⚠ 等待期间**必须继续发持位帧**：本仓自己的用例断言
+        「MIT 模式停发会掉力」（`test_watchdog_holds_position_when_master_stops`），
+        那这里沉默最多 5 s 就是自相矛盾 —— 而且还可能正在夹着东西。
+        """
         deadline = time.monotonic() + timeout_s
+        dt = 1.0 / self.rate_hz
+        nxt = time.monotonic() + dt
         while (self._want and not self._stop.is_set()
                and time.monotonic() < deadline):
             payload, _ts = slot.take()
             if payload is not None and len(payload) == GRIP_FRAME_BYTES:
-                return decode_gripper_teleop(payload)
-            time.sleep(0.01)
+                vals = decode_gripper_teleop(payload)
+                if all(math.isfinite(v) for v in vals):
+                    return vals
+                self._count_rejected(vals[0])
+            # 等待期照发持位帧（q 取本机实测位置，见调用方传入）
+            self._send(hold_q, self._kp(), self._kd())
+            self._note_grip_fault(self._grip.get_state(wait=False))
+            r = nxt - time.monotonic()
+            if r > 0:
+                time.sleep(min(r, 0.01))
+            nxt += dt
+            if nxt < time.monotonic():
+                nxt = time.monotonic() + dt
         return None
+
+    def _count_rejected(self, got) -> None:
+        """记一次「协议边界丢弃」（spec §8 rule 9），只告警一次。"""
+        self._rejected += 1
+        if not self._reject_warned:
+            self._reject_warned = True
+            self._log(f"⚠ 丢弃非有限值帧（openness={got!r}）—— "
+                      "保持当前位置不动，**不是**折成某个端点")
+
+    def _send(self, q: float, kp: float, kd: float) -> None:
+        """发一帧并**检查返回值**（spec §8 rule 10）。
+
+        ⚠ `send_mit_frame` 在未使能（或 CAN 发不出去）时返回 `False` 而**不抛**
+        （SDK `gripper.py:468-471`）⇒ 不查的话我们以为在控制、实际什么都没发生。
+        """
+        if not self._grip.send_mit_frame(q=q, kp=kp, kd=kd, dq=0.0):
+            self._send_failed += 1
+            if self._send_failed == 1:
+                self._log("⚠ send_mit_frame 返回 False —— 电机未使能或 CAN 发不出去，"
+                          "夹爪可能根本没在动")
+
+    def _note_grip_fault(self, st) -> None:
+        """夹爪**自己**报的状态（spec §7.4 偏离 #2 说「不 poll 就看不到」的那个东西）。
+
+        ⚠ 只 poll 而不看 `error_code` 等于没做 —— 要**消费**它。
+        SDK 语义：`1` = 已使能；`0` = 已失能；其它 = 真实故障（过温/过流…）
+        （`litegrip/constants.py:73-95`）。我们既然已经确保过 `enable()` 成功，
+        之后**任何** `!= 1` 都值得报一次。
+        """
+        code = int(getattr(st, "error_code", 1))
+        if code != 1 and not self._fault_warned:
+            self._fault_warned = True
+            self._fault = (f"夹爪报告 error_code={code}"
+                           + ("（已失能）" if code == 0 else "（故障：过温/过流等）")
+                           + " —— 继续发帧持位")
+            self._log(f"⚠ {self._fault}")
 
     def _check_mismatch(self, openness: float, position_mm: float) -> None:
         """spec §7.3：从端能同时拿到 `openness` 与 `position_mm`，
