@@ -153,6 +153,7 @@ class ArmWorker:
         self._sub = None            # slave: link.Connector
         self._slot = link.LatestSlot()
         self._limits = None
+        self._gains = None
 
         self._lock = threading.Lock()
         self._snap = Snapshot(role=role)
@@ -360,6 +361,10 @@ class ArmWorker:
                 self._teleop_want = False
         finally:
             self._teleop_want = False
+        try:
+            self._restore_gains()                        # ⚠ 必须排在下面那句 movej 之前
+        except Exception:                                # noqa: BLE001
+            log.exception("还原增益失败")
         if self._arm is not None:
             try:
                 servo.hold_at_current(self._arm)         # ⛔ 绝不 disable
@@ -393,11 +398,20 @@ class ArmWorker:
                 self._snap.error = str(e)
         finally:
             self._teleop_want = False
+            # ⚠⚠ **先还原增益再 movej**：跟随期间 `mit_kp` 是 25，`movej` 的到位环撑不住。
+            self._restore_gains()
             try:
                 servo.hold_at_current(self._arm)         # 受控接管
             except Exception as e:                       # noqa: BLE001
                 self._log(f"⚠ 收尾 movej 失败: {e}")
 
+
+    def _restore_gains(self) -> None:
+        """还原出厂增益。**幂等**；**任何 `movej` 之前都必须先调它**。"""
+        if self._gains is not None and self._arm is not None:
+            servo.restore_joint_gains(self._arm, self._gains)
+            self._gains = None
+            self._log("已还原出厂增益（movej 要用它）")
 
     def _run_master(self) -> None:
         """主臂：零重力拖动 → 定频采样 → 发布（spec §6）。**主臂不做任何钳位。**"""
@@ -438,8 +452,6 @@ class ArmWorker:
         #
         self._log("等待主臂首帧并对齐 …")
         aligned = servo.align_to_master(arm, self._slot.take, self._limits)
-        self._log("✓ 已对齐（仍用出厂刚度）" if aligned is not None
-                  else "⚠ 未对齐（没收到帧 或 movej 失败）—— 跟随会逐步修正")
 
         # ⚠ **不改任何固件参数**（用户裁决）：K/B 用固件出厂的 `mit_kp`/`mit_kd`。
         #    写 `mit_kp` 会连带改坏 `movej`（它用的就是 `mit_kp`），真机踩过两次。
@@ -447,14 +459,24 @@ class ArmWorker:
         # ⚠⚠ 但**速度上限必须按 kd 预算收紧**：`move_js` 的 `dq` 进电机速度前馈
         #      （`τ += kd_eff·dq`，kd_eff 出厂 J1~J4 = 11），照抄 server 那份配 B=0.5 的
         #      `speed_limit` 会让 J4 的 `kd·dq` = 55 Nm 顶满 tau_max=21 ⇒ **抖**。
-        kd, tau_max = servo.effective_kd(arm)
-        sl_budget = servo.speed_limit_from_kd(kd, tau_max)
+        if aligned is None:
+            self._log("⚠ 未对齐（没收到帧 或 movej 失败）—— 跟随会逐步修正")
+
+        # ⚠⚠ 对齐**之后**才写增益：写进去 `mit_kp` 变 25，`movej` 会撑不住（见 servo.SETUP_K）。
+        self._gains = servo.apply_joint_gains(arm)
+        self._log(f"已写跟随增益 mit_kp={servo.SETUP_K} mit_kd={servo.SETUP_B}、清零 kd_extra"
+                  f"（⛔ 此后任何 movej 之前都必须先还原）")
+
+        # 速度上限：跟随期间 kd_eff 就是 B（很小）⇒ 预算**不会**成为瓶颈，
+        # 但仍算出来打日志 —— 哪天有人改了 SETUP_B，这条会立刻显形。
+        kd_pre, tau_max = servo.effective_kd(arm)
+        kd_post = [servo.SETUP_B] * N_JOINTS
+        sl_budget = servo.speed_limit_from_kd(kd_post, tau_max)
         sl = [min(a, b) for a, b in zip(servo.DEFAULT_SPEED_LIMIT, sl_budget)]
-        self._log(f"kd_eff={[round(x, 1) for x in kd]}  tau_max={[round(x, 1) for x in tau_max]}")
-        self._log(f"speed_limit 配置={servo.DEFAULT_SPEED_LIMIT}")
-        self._log(f"speed_limit 预算={[round(x, 3) for x in sl_budget]}"
-                  f"  ⇒ 实取={[round(x, 3) for x in sl]}")
-        self._log("不改刚度：用固件出厂值（move_js 没有随帧下发 K/B 的通道）")
+        self._log(f"出厂 kd_eff={[round(x, 1) for x in kd_pre]} ⇒ 写后 kd_eff="
+                  f"{[round(x, 1) for x in kd_post]}")
+        self._log(f"speed_limit 预算={[round(x, 2) for x in sl_budget]}"
+                  f" ⇒ 实取(=配置值)={[round(x, 2) for x in sl]}")
 
         def provider():
             payload, _ts = self._slot.take()

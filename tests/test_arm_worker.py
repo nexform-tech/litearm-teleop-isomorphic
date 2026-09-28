@@ -197,17 +197,22 @@ class _ArmedForSlave:
 
 
 def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch):
-    """⚠⚠ 从臂的顺序：**对齐 → 跟随**，而且**一个固件参数都不写**（用户裁决 2026-09-28）。
+    """⚠⚠ 从臂的顺序必须是 **对齐 → 写增益 → 跟随**。
 
-    「不写参数」是硬要求：本路线曾把 `mit_kp` 从出厂的 400 写到 25，而 **`movej` 用的就是
-    `mit_kp`** —— 软 16 倍的位置环撑不住、到不了位，`movej` 撞 `move_timeout`
-    报「未到位, 超时 3.0s」，臂还会**瞬间变软**（真机踩过两次）。
+    写增益会把 `mit_kp` 从出厂的 400 改成 25，而 **`movej` 用的就是 `mit_kp`** ——
+    对齐那句 `movej` 若排在写增益**之后**，位置环软 16 倍、撑不住、到不了位，
+    会撞 `move_timeout` 报「未到位, 超时 3.0s」（**真机踩过**）。
 
-    判别力：谁要是加回 `set_joint_param`/`set_ff_vec`，本用例会红。
+    （2026-09-28 真机验证：写完之后 kp=25 的臂**稳稳托住**，最大偏移 0.0004 rad，
+      ⇒ "软而稳"就是 litearm-server 的手感，不是故障。之前我误判成"垂下去"。）
+
+    判别力：把前两句对调，本用例会红。
     """
     order = []
     monkeypatch.setattr(servo, "align_to_master",
                         lambda *a, **k: (order.append("align"), [0.0] * 7)[1])
+    monkeypatch.setattr(servo, "apply_joint_gains",
+                        lambda *a, **k: (order.append("gains"), servo.JointGains())[1])
     monkeypatch.setattr(servo, "follow",
                         lambda *a, **k: (order.append("follow"), True)[1])
     monkeypatch.setattr(arm_worker.link, "Connector",
@@ -218,7 +223,8 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
         """**读**参数是允许的（要算 kd 预算），**写**不许。"""
 
         def __init__(self):
-            self.jp = [type("P", (), {"kd": 5.0, "tau_max": 78.0})() for _ in range(7)]
+            self.writes = []
+            self.jp = [type("P", (), {"kp": 400.0, "kd": 5.0, "tau_max": 78.0})() for _ in range(7)]
 
         @property
         def params(self):
@@ -230,16 +236,25 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
         def get_ff_vec(self, item):
             return type("M", (), {"value": [6.0] * 7})()
 
+        def set_joint_param(self, idx, kp, kd, tau_max):
+            self.writes.append(("kp/kd", kp, kd))
+
+        def set_ff_vec(self, item, values):
+            assert item == 15, "kd_extra 在 0x26 向量表 item 15"
+            self.writes.append(("kd_extra", list(values)))
+
+        def save_params(self):
+            raise AssertionError("⛔ 绝不许调 save_params（整扇区擦写、不可逆）")
+
         def __getattr__(self, name):
-            if name in ("set_joint_param", "set_ff_vec", "set_joint_limits",
-                        "set_ff_mask", "save_params"):
-                raise AssertionError(f"从臂路径不许**写**固件参数，却访问了 {name!r}")
             raise AttributeError(name)
 
     w = ArmWorker(role=ROLE_SLAVE)
     w._arm = _NoWriteArm()
     w._run_slave()
-    assert order == ["align", "follow"], f"顺序必须是 对齐 → 跟随，实际 {order}"
+    assert order == ["align", "gains", "follow"], (
+        f"顺序必须是 对齐 → 写增益 → 跟随，实际 {order}\n"
+        "⛔ 写增益会改 `mit_kp`，而 `movej` 用的就是它 —— 对齐必须排在写增益之前。")
 
 
 

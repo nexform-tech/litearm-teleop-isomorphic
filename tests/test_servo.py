@@ -409,3 +409,44 @@ def test_apply_payload_reads_back_what_actually_landed():
 def test_default_payload_is_the_gripper_the_user_gave():
     assert servo.DEFAULT_PAYLOAD_MASS == 0.6            # 600 g
     assert servo.DEFAULT_PAYLOAD_COM == (0.0, 0.0, 0.03)  # 质心 3 cm 在 Z 轴
+
+
+# ────────────────────────── 跟随增益的写入 / 还原 ──────────────────────────
+
+def test_apply_writes_kb_and_zeroes_kd_extra():
+    """⚠ **必须清零 `kd_extra`**：`move_js` 的有效阻尼 = `mit_kd + kd_extra`。
+
+    不清的话 J1~J4 是 0.5+6.0 = 6.5（13 倍），`kd·dq` 在 5 rad/s 时 32.5 Nm，
+    而 J4 的 `tau_max` 只有 21 ⇒ 力矩预算被吃光 ⇒ 抖。
+    """
+    arm = FakeArm()
+    servo.apply_joint_gains(arm)
+    assert [p.kp for p in arm.jp] == [25.0] * N_JOINTS
+    assert [p.kd for p in arm.jp] == [0.5] * N_JOINTS
+    assert arm.kd_extra == [0.0] * N_JOINTS
+
+
+def test_apply_keeps_tau_max():
+    arm = FakeArm()
+    before = [p.tau_max for p in arm.jp]
+    servo.apply_joint_gains(arm)
+    assert [p.tau_max for p in arm.jp] == before
+
+
+def test_restore_is_verbatim_and_idempotent():
+    arm = FakeArm()
+    kp0, kd0, ex0 = ([p.kp for p in arm.jp], [p.kd for p in arm.jp], list(arm.kd_extra))
+    saved = servo.apply_joint_gains(arm)
+    assert [p.kp for p in arm.jp] != kp0, "改之前得真的改了"
+    servo.restore_joint_gains(arm, saved)
+    assert [p.kp for p in arm.jp] == kp0
+    assert [p.kd for p in arm.jp] == kd0
+    assert arm.kd_extra == ex0
+    servo.restore_joint_gains(arm, saved)          # 幂等：再来一次不该炸/不该改坏
+    assert [p.kp for p in arm.jp] == kp0
+
+
+def test_verified_setup_values():
+    """真机验证过的那一组（2026-09-28：150 拍 / 2 s 最大偏移 0.0004 rad）。"""
+    assert servo.SETUP_K == 25.0
+    assert servo.SETUP_B == 0.5

@@ -61,6 +61,7 @@ __all__ = [
     "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
     "align_to_master", "DEFAULT_PAYLOAD_MASS", "DEFAULT_PAYLOAD_COM",
     "read_payload", "apply_payload", "speed_limit_from_kd",
+    "SETUP_K", "SETUP_B", "JointGains", "apply_joint_gains", "restore_joint_gains",
     "DEFAULT_KD_BUDGET", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
     "measure_move_js_cost",
@@ -105,6 +106,32 @@ DEFAULT_PAYLOAD_COM = (0.0, 0.0, 0.03)
 #: 载荷质量/质心的 ff item（`FF_SCALAR_ITEMS`）。
 _FF_ITEM_PAYLOAD_MASS = 4
 _FF_ITEM_PAYLOAD_COM = 5
+
+#: **跟随期间写进固件的增益** —— litearm-server 的值（用户裁决）。
+#:
+#: ⚠⚠ **真机验证过（2026-09-28）**：写进去后臂**稳稳托住** ——
+#:     150 拍 / 2.00 s，七轴**最大偏移 0.0004 rad**，`dq` 峰值 0.037 rad/s。
+#:     ⇒ 因为 `move_js` 的 `builtin_mode`（`ff_mask` 含 `FF_MASTER`）**会加 `G(q)`**。
+#:     ⇒ **"软而稳"就是 litearm-server 的手感**，不是故障。
+#:     ⚠ 我一度把它误判成"臂垂下去了"并回退 —— **那是错的**，量过才知道。
+#:
+#: ## 为什么这样能得到「250 Hz + 丝滑」
+#:
+#:     `move_js` + 固件写 K/B      每拍 **1 次往返** ⇒ **250 Hz** ✓
+#:     `send_mit(K,B)` + PC 算 G   每拍 2 次往返   ⇒ 只到 ~150 Hz
+#:
+#: 两条在**力矩上算出来是同一件事**（`builtin_mode` 的 G 顶上 PC 送的那份），
+#: 所以前者用更少的往返拿到同样的手感。
+#:
+#: ## 代价（必须管住）
+#:
+#: ⚠ 写的是**固件的 `mit_kp`/`mit_kd`** ⇒ **`movej` 也用这两个数**。
+#:   `mit_kp` 从 400 降到 25 后，`movej` 的到位环**撑不住**（真机踩过：报
+#:   「未到位, 超时 3.0s」）。⇒ **凡是要调 `movej` 的地方，必须先把增益还原。**
+#: ⚠ 只写 RAM（不调 `save_params()`）⇒ 断电即还原；但**进程崩溃会留在改过的值上**，
+#:   所以恢复点必须放进 `finally`。
+SETUP_K = 25.0
+SETUP_B = 0.5
 
 #: 速度前馈能吃掉多少力矩预算。`speed_limit_i ≤ budget · tau_max_i / kd_eff_i`。
 DEFAULT_KD_BUDGET = 0.30
@@ -160,6 +187,57 @@ def speed_limit_from_kd(kd, tau_max, kd_budget: float = DEFAULT_KD_BUDGET):
             raise ValueError(f"第 {i} 轴 kd/tau_max 非法: kd={k} tau_max={tm}")
         out.append(kd_budget * tm / k)
     return out
+
+
+@dataclass
+class JointGains:
+    """改参数前**存下的原值**，用于逐字还原。"""
+
+    kp: List[float] = field(default_factory=list)
+    kd: List[float] = field(default_factory=list)
+    tau_max: List[float] = field(default_factory=list)
+    kd_extra: List[float] = field(default_factory=list)
+    applied: bool = False
+
+
+def apply_joint_gains(arm, K: float = SETUP_K, B: float = SETUP_B) -> JointGains:
+    """把跟随增益写进固件：`mit_kp=K`、`mit_kd=B`、**`kd_extra=0`**。
+
+    ⚠ **必须清零 `kd_extra`**：`move_js` 的有效阻尼是 `mit_kd + kd_extra`，
+    本机 `kd_extra = [6,6,6,6,0,0,0]`。只设 `kd=0.5` 的话 J1~J4 实际是 **6.5（13 倍）**，
+    `kd·dq` 在 5 rad/s 时是 32.5 Nm，而 J4 的 `tau_max` 只有 21 ⇒ 力矩预算被吃光。
+
+    ⛔ 只写 RAM。**绝不调 `save_params()`**（整扇区擦写、不可逆）。
+    """
+    jp = arm.params.all_joint_params()
+    saved = JointGains(
+        kp=[float(p.kp) for p in jp],
+        kd=[float(p.kd) for p in jp],
+        tau_max=[float(p.tau_max) for p in jp],
+        kd_extra=[float(x) for x in arm.get_ff_vec(_FF_VEC_KD_EXTRA).value])
+    for i in range(N_JOINTS):
+        arm.params.set_joint_param(i, float(K), float(B), saved.tau_max[i])
+    arm.set_ff_vec(_FF_VEC_KD_EXTRA, [0.0] * N_JOINTS)
+    saved.applied = True
+    log.info("已写入跟随增益 mit_kp=%.1f mit_kd=%.1f，并清零 kd_extra", K, B)
+    return saved
+
+
+def restore_joint_gains(arm, saved) -> None:
+    """把 `apply_joint_gains` 存下的原值逐字写回。**幂等**。
+
+    ⚠ **任何 `movej` 之前都必须先调它** —— 跟随期间 `mit_kp` 是 25，`movej` 撑不住。
+    """
+    if saved is None or not getattr(saved, "applied", False):
+        return
+    try:
+        for i in range(N_JOINTS):
+            arm.params.set_joint_param(i, saved.kp[i], saved.kd[i], saved.tau_max[i])
+        arm.set_ff_vec(_FF_VEC_KD_EXTRA, saved.kd_extra)
+        saved.applied = False
+        log.info("已还原出厂增益 mit_kp/kd 与 kd_extra")
+    except Exception:
+        log.exception("⚠ 还原增益失败 —— 参数会留在改过的值上，直到断电或手工还原！")
 
 
 def read_payload(arm):
