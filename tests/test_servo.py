@@ -1,9 +1,9 @@
 """从臂伺服环的离线测试（用假臂，不需要硬件）。
 
 覆盖三件真机上不好反复验的事：
-  1. 参数写入/还原**逐字**正确（`K`/`B`/`kd_extra`），且异常路径也会还原
+  1. **K/B 逐帧是 server 的值**（`joint_follow` 的 25 / 0.5），且 `G(q)` 被钳到 `tau_max`
   2. 参考生成确实经过 `slew_target`（速度/加速度受限、且**永不发 NaN**）
-  3. 固件连续拒帧会**升级**（不是无限吞掉 —— 拒帧 = 没 kick 看门狗 = 会下垂）
+  3. 实测 **23 ms** 量级的 `all_joint_params()` **只在启动时读一次**，绝不进循环
 """
 from __future__ import annotations
 
@@ -33,39 +33,50 @@ class _State:
 
 
 class FakeArm:
-    """够 `servo` 用的假臂。记录每一次 `move_js` 的入参。"""
+    """够 `servo` 用的假臂。记录每一次 `send_mit_all` 的五元组。
 
-    def __init__(self, reject_at=(), q=None):
-        """`reject_at`：**第几次 `move_js` 调用**被拒（1 基）。空 = 全接受。"""
+    ⚠ MIT 透传**没有** `move_js` 那条「目标 ≠ 实测位姿且 `dq == 0` 就拒帧」的限制
+    （那属于固件的 `MOVE_JS` 分支）⇒ 本假臂**不需要** `reject_at`。
+    """
+
+    def __init__(self, q=None, tau_max=78.0, gravity=None):
         self.q = list(q or [0.0] * N_JOINTS)
-        # 出厂值刻意与 servo 的默认 K/B 不同，才能测出"真的改了"
-        self.jp = [_JP(kp=400.0, kd=5.0, tau_max=78.0) for _ in range(N_JOINTS)]
+        # 出厂值刻意与 servo 的 K/B 不同，才能测出"真的随帧下发了 server 的值"
+        self.jp = [_JP(kp=400.0, kd=5.0, tau_max=tau_max) for _ in range(N_JOINTS)]
         self.kd_extra = [6.0, 6.0, 6.0, 6.0, 0.0, 0.0, 0.0]
-        self.move_js_calls: list = []
-        self.move_timeout = 3.0
+        self.mit_calls: list = []          # (q, dq, kp, kd, tau)
         self.movej_calls: list = []
-        self.reject_at = set(reject_at)
-        self._sent = 0
+        self.move_timeout = 3.0
+        self._gravity = gravity
+        self.joint_param_reads = 0
 
     # ---- servo 用到的接口 ----
     def get_state(self, refresh=False):
         return _Msg(_State(self.q))
 
-    def move_js(self, q, dq=None):
-        self._sent += 1
-        if self._sent in self.reject_at:
-            raise RuntimeError("被固件拒绝: ERR [03,2]")
-        self.move_js_calls.append((list(q), list(dq)))
+    def send_mit_all(self, q, dq, kp, kd, tau):
+        self.mit_calls.append((list(q), list(dq), list(kp), list(kd), list(tau)))
 
     def movej(self, q, speed=1.0):
         self.movej_calls.append(list(q))
         self.q = list(q)
 
     @property
+    def model(self):
+        return self
+
+    def get_gravity(self, q):
+        """假重力项。⚠ 默认刻意取**远超 tau_max** 的数，好测钳位。"""
+        if self._gravity is not None:
+            return _Msg(list(self._gravity))
+        return _Msg([100.0] * N_JOINTS)
+
+    @property
     def params(self):
         return self
 
     def all_joint_params(self):
+        self.joint_param_reads += 1
         return list(self.jp)
 
     def set_joint_param(self, idx, kp, kd, tau_max):
@@ -107,7 +118,7 @@ def test_follow_slew_respects_speed_limit():
 
     dt = 1.0 / 100.0
     prev = None
-    for q, dq in arm.move_js_calls:
+    for q, dq, *_ in arm.mit_calls:
         if prev is not None:
             step = max(abs(a - b) for a, b in zip(q, prev))
             assert step <= max(servo.DEFAULT_SPEED_LIMIT) * dt * 1.5, (
@@ -119,11 +130,11 @@ def test_follow_never_sends_non_finite():
     arm = FakeArm()
 
     def stop():
-        return len(arm.move_js_calls) > 20
+        return len(arm.mit_calls) > 20
 
     servo.follow(arm, lambda: [0.5] * N_JOINTS, should_stop=stop,
                  engage_sec=0.0, hz=100.0, )
-    for q, dq in arm.move_js_calls:
+    for q, dq, *_ in arm.mit_calls:
         assert all(math.isfinite(v) for v in q)
         assert all(math.isfinite(v) for v in dq)
 
@@ -140,58 +151,64 @@ def test_follow_holds_when_provider_returns_none():
     servo.follow(arm, lambda: None, should_stop=stop,
                  engage_sec=0.0, hz=100.0, )
     # 目标恒为初始实测位姿 ⇒ 不该走动
-    for q, _dq in arm.move_js_calls[1:]:
+    for q, _dq, *_ in arm.mit_calls[1:]:
         assert max(abs(v) for v in q) < 1e-6, "返回 None 时不该往别处走"
 
 
-# ────────────────────────── 拒帧升级 ──────────────────────────
+# ────────────────────── MIT 透传：照搬 server 的 K/B ──────────────────────
 
-def test_follow_escalates_after_consecutive_rejects():
-    """连续被拒必须**炸出来**：拒帧 = 没 kick 看门狗 = 0.1s 后 fail-soft 下垂。
+def _run(arm, target, ticks=20, hz=100.0):
+    """跑 `ticks` 拍（`engage_sec=0` ⇒ 只有 prime + 主循环）。"""
+    n = {"i": 0}
 
-    ⚠ 判据要有**判别力**：不仅"抛了异常"，还要断言**走了受控接管那条路**
-    （`movej_calls` 非空）—— 否则 prime 阶段随便抛个异常也能让本条变绿。
+    def stop():
+        n["i"] += 1
+        return n["i"] > ticks
+
+    return servo.follow(arm, lambda: target, should_stop=stop, engage_sec=0.0, hz=hz)
+
+
+def test_follow_sends_the_server_gains_on_every_frame():
+    """⛔ K/B 必须**逐帧是 server 的值**（25 / 0.5）—— 这是「丝滑」的全部来源。
+
+    旧 `move_js` 路线用的是固件出厂值 **400 / 11**（刚度 16×、阻尼 22×），
+    真机判据：「跟随太慢，有明显的延迟」「没有 litearm-server 丝滑」。
+
+    判别力：把 `follow` 里的 `kp/kd` 换回出厂值，本用例立刻红。
     """
-    # prime 用掉第 1 次调用；从第 2 次起全拒 ⇒ 必然走到 _REJECT_ESCALATE
-    arm = FakeArm(reject_at=range(2, 10_000))
-    with pytest.raises(RuntimeError, match="拒绝"):
-        servo.follow(arm, lambda: [0.1] * N_JOINTS, should_stop=lambda: False,
-                     engage_sec=0.0, hz=100.0, )
-    assert arm.movej_calls, "升级前必须**受控接管**（movej），不能只抛异常"
-    assert len(arm.move_js_calls) == 1, \
-        "只有 prime 那一次该成功（第 1 次调用），主循环里的全部被拒"
+    arm = FakeArm()
+    _run(arm, [0.1] * N_JOINTS)
+    assert arm.mit_calls, "一帧都没发出去"
+    for _q, _dq, kp, kd, _tau in arm.mit_calls:
+        assert kp == [servo.SETUP_K] * N_JOINTS, f"K 不是 server 的 {servo.SETUP_K}"
+        assert kd == [servo.SETUP_B] * N_JOINTS, f"B 不是 server 的 {servo.SETUP_B}"
 
 
-def test_consecutive_reject_count_is_what_triggers_it():
-    """把连续拒帧控制在阈值**以下** ⇒ 不该升级（证明阈值真的在起作用）。"""
-    n = servo._REJECT_ESCALATE - 1
-    arm = FakeArm(reject_at=range(2, 2 + n))
-    calls = {"i": 0}
+def test_follow_clamps_gravity_to_tau_max():
+    """`τ_ff = clamp(G(q), ±tau_max)` —— 照搬 `joint_follow.compute_tau_ff`。
 
-    def stop():
-        calls["i"] += 1
-        return calls["i"] > n + 5
-
-    ok = servo.follow(arm, lambda: [0.1] * N_JOINTS, should_stop=stop,
-                      engage_sec=0.0, hz=100.0, )
-    assert ok is True, f"只拒了 {n} 次（阈值 {servo._REJECT_ESCALATE}）不该升级"
+    ⚠ 固件对 MIT 透传**不会**自己加 G（`control_loop.c`：「`move_mit` 永不叠加内置」）
+    ⇒ **这一项不发就是没有重力补偿，臂会垂。**
+    """
+    arm = FakeArm(tau_max=21.0)          # 假 G 恒给 100 ⇒ 必须被钳到 21
+    _run(arm, [0.0] * N_JOINTS)
+    assert arm.mit_calls, "一帧都没发出去"
+    for _q, _dq, _kp, _kd, tau in arm.mit_calls:
+        assert tau == [21.0] * N_JOINTS, f"G 没被钳到 tau_max：{tau}"
 
 
-def test_follow_tolerates_occasional_reject():
-    """零星被拒**不该**中断跟随（下一拍就恢复）。"""
-    arm = FakeArm(reject_at=(2, 3, 4))            # prime 之后的头三拍被拒
-    calls = {"n": 0}
+def test_follow_reads_joint_params_once_not_per_tick():
+    """⚠ `all_joint_params()` 实测 **23 ms**（7 轴逐个读）⇒ 进循环就把环频钉死在 43 Hz。
 
-    def stop():
-        calls["n"] += 1
-        return calls["n"] > 25
-
-    ok = servo.follow(arm, lambda: [0.2] * N_JOINTS, should_stop=stop,
-                      engage_sec=0.0, hz=100.0, )
-    assert ok is True
-    assert arm.move_js_calls, "被拒几次之后应该恢复正常下发"
+    判别力：把 `_read_tau_max` 挪进主循环，本用例会红。
+    """
+    arm = FakeArm()
+    _run(arm, [0.1] * N_JOINTS, ticks=30)
+    assert arm.joint_param_reads == 1, \
+        f"`all_joint_params` 被调了 {arm.joint_param_reads} 次，应当只有启动那一次"
 
 
+# ────────────────────────── 收尾 ──────────────────────────
 # ────────────────────────── 收尾 ──────────────────────────
 
 
@@ -264,110 +281,6 @@ def test_align_warns_but_still_moves_on_a_large_slew(caplog):
     assert got is not None, "不该拒绝"
     assert arm.movej_calls, "应当**照样**执行 movej（只是先预警）"
     assert any("偏大" in r.message for r in caplog.records), "大位移没预警"
-
-
-class RuleArm(FakeArm):
-    """模拟固件那条规则：**目标 ≠ 实测位姿 且 dq 全 0 ⇒ 拒帧**。
-
-    ⚠ 实测残差用 `movej` 的到位判据 `q_tol=0.03` 那个量级 —— 真机就是死在这上面：
-    从臂到位后 `slew_target` 给 `dq=0`，而实测与目标差 0.03 ⇒ **每拍都被拒**
-    ⇒ 不 kick 看门狗 ⇒ 0.1 s 后 fail-soft ⇒ 臂会垂。
-    """
-
-    TOL = 0.005
-
-    def move_js(self, q, dq=None):
-        dq = list(dq) if dq is not None else [0.0] * N_JOINTS
-        gap = max(abs(a - b) for a, b in zip(q, self.q))
-        if gap > self.TOL and max(abs(v) for v in dq) == 0.0:
-            self._sent += 1
-            raise RuntimeError("被固件拒绝: ERR [03,2]")
-        super().move_js(q, dq)
-
-
-def test_follow_falls_back_to_holding_when_target_is_unreachable():
-    """目标差 0.03（`q_tol` 量级）且 dq 收敛到 0 ⇒ **退路必须接管，不许升级退出**。
-
-    判别力：去掉那条退路，本用例会因为「连续 20 次被拒」而抛 RuntimeError。
-    """
-    arm = RuleArm(q=[0.0] * N_JOINTS)
-    n = {"i": 0}
-
-    def stop():
-        n["i"] += 1
-        return n["i"] > 120                      # 够 slew_target 收敛
-
-    ok = servo.follow(arm, lambda: [0.03] * N_JOINTS, should_stop=stop,
-                      engage_sec=0.0, hz=200.0, )
-    assert ok is True, "应该靠退路走完，而不是升级退出"
-    assert arm.move_js_calls, "退路那一帧必须真的发出去"
-
-
-def test_follow_resumes_normal_tracking_after_a_fallback():
-    """退路之后，目标一动就要**恢复**（不是永远托在原地）。"""
-    arm = RuleArm(q=[0.0] * N_JOINTS)
-    targets = [[0.03] * N_JOINTS] * 60 + [[0.5] * N_JOINTS] * 40
-    n = {"i": 0}
-
-    def provider():
-        i = min(n["i"], len(targets) - 1)
-        return targets[i]
-
-    def stop():
-        n["i"] += 1
-        return n["i"] > len(targets)
-
-    servo.follow(arm, provider, should_stop=stop, engage_sec=0.0, hz=200.0,
-                 )
-    moved = max(max(abs(v) for v in q) for q, _dq in arm.move_js_calls)
-    assert moved > 0.3, f"目标改到 0.5 之后应当恢复跟随，实际最大只到 {moved}"
-
-
-class DriftingArm(RuleArm):
-    """模拟「**读实测**」与「**发帧**」之间臂又走了一点（`movej` 超时返回的典型状态）。
-
-    ⚠⚠ 漂移必须发生在 **`move_js` 被调用的那一刻**，不能发生在读状态时 ——
-    否则"读完立刻发"目标又对上了，两次读数互相抵消，**测不出任何东西**。
-    （我第一版就是把漂移放在 `get_state` 里，结果假绿，还把测试跑死循环了。）
-
-    漂移量 0.02 > `RuleArm.TOL=0.005` ⇒ 每发一次都被拒，直到漂移停止。
-    """
-
-    def __init__(self, drift_steps: int = 3, drift: float = 0.02, **kw):
-        super().__init__(**kw)
-        self._left = drift_steps
-        self.drift = drift
-
-    def move_js(self, q, dq=None):
-        if self._left > 0:
-            self._left -= 1
-            self.q = [v + self.drift for v in self.q]
-        return super().move_js(q, dq)
-
-
-def test_prime_retries_until_the_arm_stops_moving():
-    """⚠ `prime` 必须**重读实测 + 重试** —— 单发会在"臂还在动"时被拒而崩掉（真机就是这么挂的）。
-
-    漂移 3 步而 `_send_hold` 试 5 次 ⇒ 第 4 次成功；单发则第一次就失败。
-    """
-    arm = DriftingArm(drift_steps=3)
-    n = {"i": 0}
-
-    def stop():
-        n["i"] += 1
-        return n["i"] > 20
-
-    ok = servo.follow(arm, lambda: None, should_stop=stop, engage_sec=0.0,
-                      hz=100.0, )
-    assert ok is True, "prime 应当靠重读+重试挺过「臂还在动」的窗口"
-
-
-def test_prime_gives_up_loudly_when_it_never_settles():
-    """永远在动 ⇒ 不能无限重试，必须**响亮失败**（而不是静默转下去）。"""
-    with pytest.raises(RuntimeError, match="prime"):
-        servo.follow(DriftingArm(drift_steps=10 ** 9), lambda: None,
-                     should_stop=lambda: False, engage_sec=0.0,
-                     hz=100.0, )
 
 
 # ────────────────────────── 末端载荷（夹爪）──────────────────────────

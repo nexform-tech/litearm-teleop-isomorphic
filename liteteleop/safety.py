@@ -12,6 +12,10 @@
   **不用 `move_js`**：它用 `joint_follow` → `send_mit`，**K/B 随帧下发**。
   真实的速度限幅是 `joint_follow.speed_limit`（真机验证过的
   `[2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]`），不是推导出来的。
+  ⚠⚠ **它被加回来过一次，又删了**（2026-09-28 真机）：理由是"`kd_eff·dq` 会顶满
+  `tau_max` ⇒ 抖"，于是按 30% 预算把速度压成 J3/J4 **11%**、腕部 J5~J7 **9~15%**
+  ⇒ 用户实测「跟随太慢，有明显的延迟」。**拿速度换"前馈不顶满"这笔交易不划算** ——
+  前馈饱和改成只打日志。教训：**推导出来的安全值，也必须过真机"好不好用"这一关**。
 - `saturate_dq` —— 同上：它是"`dq` 是速度前馈"那个语义下的产物。
 - `IDLE/ALIGN_FAST/FOLLOWING/HOLDING` + `TeleopState` 状态机 —— **litearm-server 没有
   状态机**：它的 `active` 由 `TeleopManager.is_running` **派生**，watchdog 超时调

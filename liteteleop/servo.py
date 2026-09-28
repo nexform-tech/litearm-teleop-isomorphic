@@ -1,45 +1,26 @@
-"""从臂伺服环 —— 逻辑照 litearm-server，**执行器用 `move_js`**。
+"""从臂伺服环 —— **逻辑与执行器都照 litearm-server 的 `joint_follow`**。
 
-## 为什么是 `move_js`（用户裁决 2026-09-28）
+litearm-server 的从臂是 `joint_follow` → `send_mit(K, B, q_cmd, dq_cmd, G(q))`：
+**K/B 随帧下发、重力在 PC 本地算**。本 SDK 没有 `joint_follow`，但这两件事都直接可做：
 
-litearm-server 的从臂用 `joint_follow` → `send_mit`：**K/B 随帧下发、重力在 PC 本地算**。
-本 SDK 没有 `joint_follow`，而把它移植到 PC 上会**每拍要两次往返**
-（`send_mit_all` + 问 `get_gravity`），实测各 3.3 ms ⇒ 6.7 ms ⇒ 只到 ~150 Hz。
+    τ_ff = clamp(G(q), ±tau_max)                      # get_gravity，一次往返
+    send_mit_all(q_cmd, dq_cmd, K=25, B=0.5, τ_ff)    # 一次往返
 
-`move_js` **本身就是固件里的伺服环**（`ARM_MODE_MOVE_JS` 分支，300 Hz 里跑）：
+⚠ **别用 `move_js` 代替**（那是已弃的旧路线）：`move_js` 的 K/B 是**固件出厂参数**
+（`mit_kp`=400、`mit_kd`+`kd_extra`=11），**没有随帧通道** —— 刚度差 16 倍、阻尼差 22 倍，
+手感**不可能**一样。真机判据：「跟随太慢，有明显的延迟」「没有 litearm-server 丝滑」。
+唯一能改它的办法是写固件参数，而**那条路已证伪**（见 `SETUP_K` 上面那段）。
 
-    q_ref = slew_linear(target_q, q_ref, |dq|·dt)     ← 限速跟随
-    τ = mit_kp·(q_ref−q) + (mit_kd+kd_extra)·(dq_ref−dq) + G(q_d) + 摩擦
-
-⇒ **每拍只要一次往返（3.3 ms）** ⇒ **250 Hz 装得下**，而且**不用改固件**。
-
-## 为什么没有 K/B（用户裁决 2026-09-28）
-
-litearm-server 的 `K=25` / `B=0.5` 走 `send_mit` **随帧下发**。`move_js` **没有那条通道**，
-要改只能写固件的 `mit_kp`/`mit_kd`。**但那是碰不得的**：
-
-- `movej` 用的就是 `mit_kp`。把它从出厂的 **400 降到 25**（软 16 倍），位置环**撑不住、
-  到不了位** ⇒ `movej` 撞 `move_timeout` 报「未到位, 超时 3.0s」（**真机踩过**）
-- 臂会**瞬间变软**（真机也确实如此）
-
-⇒ 写进去还得在**每一句 `movej` 之前还原**，一整套耦合。用户裁决：**不改刚度，用出厂值**。
-
-**代价（已接受）**：刚度/阻尼不再是 litearm-server 的 25/0.5，而是固件的
-`mit_kp`（J1/J2 400、J3/J4 300、腕部 50）与 `mit_kd + kd_extra`（J1~J4 5+6=11、腕部 2.5）。
-**比 litearm-server 硬得多**，跟踪更紧、手感更"僵"，但**行为可预期**。
+**执行器是 `send_mit_all`（MIT 透传），K/B 随帧下发** —— 与 litearm-server 的
+`joint_follow` **逐值一致**（`K=25 / B=0.5`，见 `SETUP_K` 那段的对照表）。
 
 ## 与 `joint_follow` 的已知差异（用户已知悉并接受）
 
-| # | `joint_follow` | 本实现（`move_js`） | 处置 |
+| # | `joint_follow` | 本实现 | 处置 |
 | --- | --- | --- | --- |
-| ① | K/B **随帧下发**（25 / 0.5） | **用固件出厂刚度**（400/300/50，阻尼 11/2.5） | 见上：改固件参数会连带改坏 `movej` |
-| ② | 有力矩通道（限位墙叠在 `tau_ff`） | **没有** | 位置护栏靠 `clamp_to_limits`（server 的主护栏也是它） |
-| ③ | `dq` **只做**速度前馈 | `dq` **双角色**（还限 `q_ref` 速率） | ⚠ `dq=0` 且目标 ≠ 实测时**固件会拒帧** ⇒ 退路 + `_REJECT_ESCALATE` |
-
-## ⚠ 本模块**不写任何固件参数**
-
-不碰 `set_joint_param` / `set_ff_vec` / `save_params`。⇒ 没有"崩了之后参数留在改过的值上"
-这类问题，也没有"哪句 `movej` 必须先还原"的顺序耦合。
+| ① | K/B **随帧下发**（25 / 0.5） | **同**（走 `send_mit_all` 的 `kp`/`kd`） | ✅ 一致 |
+| ② | 有力矩通道（限位墙叠在 `tau_ff`） | **没有**（`tau_ff` 让给重力项） | 位置护栏靠 `clamp_to_limits`（server 的主护栏也是它） |
+| ③ | 每拍 **1 次**往返 | 每拍 **2 次**（`get_gravity` + `send_mit_all`，各实测 3.333 ms） | ⇒ **~150 Hz**（旧 `move_js` 是 1 次 ⇒ 250 Hz）。用户裁决：先试纯粹版 |
 
 控制律的**参考生成**（`slew_target`）、**参数真值**、**watchdog**、**对齐**、**钳位**
 仍然逐条照 litearm-server，见 spec §5、§9.1。
@@ -60,11 +41,11 @@ log = logging.getLogger("liteteleop.servo")
 __all__ = [
     "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
     "align_to_master", "DEFAULT_PAYLOAD_MASS", "DEFAULT_PAYLOAD_COM",
-    "read_payload", "apply_payload", "speed_limit_from_kd",
-    "SETUP_K", "SETUP_B", "JointGains", "apply_joint_gains", "restore_joint_gains",
-    "DEFAULT_KD_BUDGET", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
+    "read_payload", "apply_payload",
+    "SETUP_K", "SETUP_B", "ENGAGE_KP", "ENGAGE_KD",
+    "JointGains", "apply_joint_gains", "restore_joint_gains",
+    "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
-    "measure_move_js_cost",
 ]
 
 # ── 参数真值 ────────────────────────────────────────────────────────────────
@@ -78,11 +59,13 @@ DEFAULT_SPEED_LIMIT = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]
 DEFAULT_ACCEL_LIMIT = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]
 DEFAULT_ENGAGE_SEC = 0.3
 
-#: **从臂伺服环**频率 = pylitearm 的 `arm._hz` = `control_loop_hz`
-#: （`sdk/arm.py:652` 读它；`litearm_balanced.yaml:32` = 250）。
-#: ⚠ **与主臂的 `pub_hz = 200` 是两个不同的数**，别混。
-#: ⚠ `move_js` 一次往返实测 ≈3.3 ms ⇒ 周期 4 ms 占 83%，**250 装得下但没有余量**。
-DEFAULT_HZ = 250.0
+#: **从臂伺服环**频率。⚠ **这是"打算跑到多少"，不是"能跑到多少"** ——
+#: MIT 路线每拍 **2 次往返**（`get_gravity` + `send_mit_all`，各实测 **3.333 ms**）
+#: ⇒ **实际上限 ~150 Hz**。`dt_nom = 1/hz` 会**直接进 `slew_target`**，
+#: 所以这个数**必须贴着实际周期填**，否则限速参考本身就算错了。
+#: ⚠ 旧 `move_js` 路线每拍 1 次往返，那时这里填 250（`litearm_balanced.yaml:32`）。
+#: ⚠ 与主臂的 `pub_hz = 200` 是两个不同的数，别混。
+DEFAULT_HZ = 150.0
 
 #: **对齐**：照搬 `teleop_manager` 的三个默认值。
 #: `align_speed` 是"多快挪到主臂位姿"，不是跟随速度 —— 它必须慢。
@@ -147,64 +130,44 @@ _FF_ITEM_PAYLOAD_COM = 5
 #:   「未到位, 超时 3.0s」）。⇒ **凡是要调 `movej` 的地方，必须先把增益还原。**
 #: ⚠ 只写 RAM（不调 `save_params()`）⇒ 断电即还原；但**进程崩溃会留在改过的值上**，
 #:   所以恢复点必须放进 `finally`。
+#: **从臂跟随增益 —— 照抄 `joint_follow` 的 `K=25.0 / B=0.5`，随 `send_mit_all` 每帧下发。**
+#:
+#: ⚠⚠ 与**上面那段"写进固件"的路线完全不同**（那条已证伪），两者是**不同通道**：
+#:
+#:     写 `mit_kp`/`mit_kd`      → **固件全局参数** ⇒ `movej` 也用 ⇒ 改坏 `movej`（真机踩过）
+#:     `send_mit_all(kp=,kd=)`   → **只对这一帧生效** ⇒ `movej` **完全不受影响** ✓
+#:
+#: ## 为什么必须换执行器，才拿得到 server 的手感
+#:
+#: 两条路控制律**形式相同、参数差一个数量级**：
+#:
+#:     joint_follow（server）   τ =  25·(q_cmd−q) + 0.5·(dq_cmd−dq) + G(q)
+#:     move_js      （旧路线）   τ = 400·(q_cmd−q) +  11·(dq_cmd−dq) + G(q)
+#:                                     ↑ 刚度 16×       ↑ 阻尼 22×
+#:
+#: `move_js` **没有 K/B 通道**（那两个是固件出厂参数）⇒ 手感**不可能**一样。
+#: 真机判据：旧路线用户报「跟随太慢，有明显的延迟」「没有 litearm-server 丝滑」。
+#:
+#: ## 代价
+#:
+#:     `send_mit_all` + `get_gravity`   每拍 **2 次往返**（各实测 3.333 ms）⇒ **~150 Hz**
+#:     `move_js`                        每拍 1 次往返 ⇒ 250 Hz
+#:
+#: ⚠ 这一趟**省不掉**：固件对 MIT 透传**不会**自己加 G（`control_loop.c`：
+#:   「`move_mit` / `move_js+tau_ff` 永不叠加内置」）⇒ **G 必须 PC 送**。
 SETUP_K = 25.0
 SETUP_B = 0.5
-# ⛔ 以下两个函数**当前未被调用**，见上面那段。
 
-#: 速度前馈能吃掉多少力矩预算。`speed_limit_i ≤ budget · tau_max_i / kd_eff_i`。
-DEFAULT_KD_BUDGET = 0.30
+#: `joint_follow.engage()` 的托举增益（`engage_kp=15.0, engage_kd=0.8`）——
+#: 比跟随增益**更软**：接管瞬间"轻轻接住"，而不是猛拉过去。
+ENGAGE_KP = 15.0
+ENGAGE_KD = 0.8
+
+# ⛔ 以下两个函数**当前未被调用**，见上面那段。
 
 #: `kd_extra` 在 0x26 **向量表**（`FF_VEC_ITEMS[15]`）—— ⚠ **不是** 0x28 标量表，
 #: `get_ff_scalar(15, ·)` 取到的是 `zg_engage_kp`（见 spec §10 陷阱 #8）。
 _FF_VEC_KD_EXTRA = 15
-
-#: 连续被固件拒帧到这个次数 ⇒ 视作"链路/状态坏了"，抛出而不是继续硬撑。
-#: 理由：`move_js` 被拒 ⇒ **没有 kick 看门狗** ⇒ 0.1 s 后固件 fail-soft ⇒ **臂会垂**。
-#: 零星一两次没关系（下一拍就恢复），连续不停就是真问题，必须让人知道。
-_REJECT_ESCALATE = 20
-
-
-
-def effective_kd(arm):
-    """读**有效阻尼** `kd_eff = mit_kd + kd_extra`（逐轴）。
-
-    ⚠ 这是 `move_js` 路线**最要紧的一个数**：`move_js` 的 `dq` 会进电机速度前馈
-    （`τ += kd_eff·dq`），而 `kd_eff` 是**固件出厂值**（本机 J1~J4 = 5+6 = **11**、
-    腕部 = 2.5+0 = 2.5）。litearm-server 的 B=0.5 是随帧下发的，**不是这个数**。
-    """
-    jp = arm.params.all_joint_params()
-    kd = [float(p.kd) for p in jp]
-    extra = [float(x) for x in arm.get_ff_vec(_FF_VEC_KD_EXTRA).value]
-    return [a + b for a, b in zip(kd, extra)], [float(p.tau_max) for p in jp]
-
-
-def speed_limit_from_kd(kd, tau_max, kd_budget: float = DEFAULT_KD_BUDGET):
-    """按 kd 预算把力矩上限折算成**速度上限**：`speed_limit_i = budget·tau_max_i/kd_i`。
-
-    ## 为什么 `move_js` 路线**必须**做这一步
-
-    `move_js` 的 `dq` **是双角色**：既限 `q_ref` 的走位速率，**又直接进电机速度前馈**
-    （`τ += kd_eff·dq`）。而 `kd_eff` 是固件出厂值（J1~J4 = **11**）。
-
-    拿 litearm-server 的配置值 `speed_limit = [2.8, 3.4, 5, 5, 10, 8, 13]` 直接用的后果：
-
-        J4: kd_eff·dq = 11 × 5.0 = **55 Nm**，而 J4 的 tau_max 只有 **21**
-
-    ⇒ 前馈一项就把力矩预算**顶满** ⇒ `τ` 被钳 ⇒ **非线性** ⇒ **抖**（真机现象）。
-
-    litearm-server 不会遇到：它的 `B = 0.5` 走 `send_mit` **随帧下发**，
-    `B·dq = 0.5 × 5 = 2.5 Nm`，微不足道 —— **那份配置是配 `B=0.5` 的**。
-
-    ⇒ 逐轴取 `min(配置值, 预算值)`。@30%：J1/J2 2.13、**J3 0.63、J4 0.57**、J5~J7 1.20。
-    """
-    if len(kd) != len(tau_max) or not kd:
-        raise ValueError("kd/tau_max 长度不符或为空")
-    out = []
-    for i, (k, tm) in enumerate(zip(kd, tau_max)):
-        if k <= 0.0 or tm <= 0.0:
-            raise ValueError(f"第 {i} 轴 kd/tau_max 非法: kd={k} tau_max={tm}")
-        out.append(kd_budget * tm / k)
-    return out
 
 
 @dataclass
@@ -285,8 +248,8 @@ def apply_payload(arm, mass: float, com=(0.0, 0.0, 0.0)):
 def hold_at_current(arm) -> None:
     """受控接管 —— `request_stop()` / `emergency_hold_healthy()` 的对应物。
 
-    用 `movej(实测位姿)` 让固件的 S 曲线 + `ht_on` 接管。
-    ⛔ **绝不 `disable()`**：失能会让臂在自重下自由落体。
+    ⚠ **用 `movej`（会把固件切回 `MOVE_J` 模式）** —— 这正是收尾想要的：交给固件的
+    S 曲线 + `ht_on` 接管。⛔ **绝不 `disable()`**：失能会让臂在自重下自由落体。
     """
     st = arm.get_state(refresh=True).value
     if st is None:
@@ -294,49 +257,36 @@ def hold_at_current(arm) -> None:
     arm.movej(list(st.q), speed=0.3)
 
 
-def _send_hold(arm, tries: int = 5, gap: float = 0.02) -> bool:
-    """发一帧「**托住实测位姿**」。**每次重读实测**，因为臂可能还在动。
-
-    ⚠⚠ 为什么要重读 + 重试：`move_js` 在「目标 ≠ 实测位姿」且「`dq == 0`」时**被固件拒**。
-    而 `movej` 的到位判据是 `q_tol=0.03`、`dq_tol=0.10` —— 它返回时**臂可能还在动**。
-    于是"读一次实测 → 发一帧"之间位姿就过期了 ⇒ 被拒。
-
-    ⚠ `prime` / `engage` 曾经**没有**这层保护，真机上就是这么崩的：
-    对齐的 `movej` 超时（臂还在走）⇒ `prime` 拿缓存位姿发 `move_js` ⇒ 被拒 ⇒
-    异常直接穿出 `follow` ⇒ `⛔ 遥操异常退出`。
-    """
-    q = _q_meas(arm)
-    for _ in range(max(1, tries)):
-        try:
-            arm.move_js(q, [0.0] * N_JOINTS)
-            return True
-        except Exception:                                # noqa: BLE001
-            time.sleep(gap)
-            try:
-                q = _q_meas(arm)                         # 重读：臂可能又动了
-            except Exception:                            # noqa: BLE001
-                pass
-    return False
-
-
 def _q_meas(arm) -> List[float]:
+    """读**实测**关节角。⚠ `refresh=False` 走 SDK 缓存（实测 **0.001 ms**）——
+    `refresh=True` 实测 **10 ms**，进了循环就等于把环频钉死在 100 Hz。"""
     st = arm.get_state(refresh=False).value
     if st is None:
         raise RuntimeError("状态帧取不到（链路静默）")
     return list(st.q)
 
 
-def measure_move_js_cost(arm, n: int = 100) -> float:
-    """实测 `move_js` 一次往返的耗时（ms）—— 环频上限由它决定。
+def _read_tau_max(arm) -> List[float]:
+    """逐轴力矩上限。⚠ `all_joint_params()` 实测 **23 ms**（7 轴逐个读）⇒ **只许启动时读一次**。"""
+    return [float(p.tau_max) for p in arm.params.all_joint_params()]
 
-    ⚠ 用 `move_js(q_now, dq=0)` 量：目标 == 实测位姿、`dq=0` ⇒ **臂不动**
-    （真机验证过这种组合会被接受）。
+
+def _send_mit(arm, q, dq, kp, kd, tau_max) -> None:
+    """**照搬 `joint_follow.step()` 的最后那一步**：
+
+        τ_ff = clamp(G(q_meas), ±tau_max)          # 重力前馈
+        send_mit_all(q_cmd, dq_cmd, K, B, τ_ff)    # 弹簧-阻尼交给电机 MIT 环
+
+    ⚠⚠ **`G(q)` 必须由 PC 侧送**：固件对 MIT 透传**永不叠加内置前馈**
+    （`control_loop.c` 的 gating 注释原话：「`move_mit` / `move_js+tau_ff` 永不叠加内置」）
+    ⇒ **不送 G 就是没有重力补偿，臂会垂。**
+
+    ⚠ 代价：`get_gravity` 是一次往返（实测 **3.333 ms** = 一个固件 tick），
+    `send_mit_all` 又一次 ⇒ **每拍 2 次往返 ⇒ ~150 Hz**。这是 MIT 路线的固有开销。
     """
-    q = _q_meas(arm)
-    t0 = time.monotonic()
-    for _ in range(n):
-        arm.move_js(q, [0.0] * N_JOINTS)
-    return (time.monotonic() - t0) / n * 1000.0
+    g = [float(x) for x in arm.model.get_gravity(q).value]
+    tau = [min(max(g[i], -tau_max[i]), tau_max[i]) for i in range(N_JOINTS)]
+    arm.send_mit_all(list(q), list(dq), list(kp), list(kd), tau)
 
 
 def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
@@ -344,32 +294,51 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
            engage_sec: float = DEFAULT_ENGAGE_SEC, hz: float = DEFAULT_HZ,
            should_stop: Callable[[], bool] = lambda: False,
            duration_s: Optional[float] = None) -> bool:
-    """从臂跟随环。**参考生成与调用序照抄 `joint_follow`，执行器换 `move_js`。**
+    """从臂跟随环 —— **逐条照搬 `joint_follow`**（`pylitearm/control/joint_follow.py`）。
 
     `target_provider()` 返回**目标关节角序列**；返回 `None` 时**保持上一拍的
     `q_cmd/dq_cmd` 不动**（照搬 `joint_follow` 那一支 —— "首帧到达前原地不动"）。
 
-    ⚠ **不改任何固件参数** —— K/B 用固件出厂的 `mit_kp`/`mit_kd`(+`kd_extra`)。
+    ## ⚠⚠ 执行器是 `send_mit_all`（MIT 透传），**不是** `move_js`
+
+    两条路的控制律**形式相同、参数差一个数量级** —— 这就是手感的全部差别：
+
+    | | `joint_follow`（本函数照搬的） | `move_js`（旧路线，已弃） |
+    | --- | --- | --- |
+    | `K` | **25**（随帧下发） | **400**（固件 `mit_kp`，改不了） |
+    | `B` | **0.5**（随帧下发） | **11**（固件 `mit_kd`+`kd_extra`，改不了） |
+    | 重力 `G` | **PC 送** | 固件内置 |
+    | 每拍往返 | 2 次 ⇒ **~150 Hz** | 1 次 ⇒ 250 Hz |
+
+    `move_js` 的 K/B 是**固件出厂参数，没有随帧通道**；唯一能改的办法是写固件参数，
+    而那条路已证伪（动态跟随断轴 + 连带改坏 `movej`）。⇒ **要 server 的手感就得换执行器。**
+
+    ⚠ 用户裁决 2026-09-28：**先试纯粹的 150 Hz**，`G` 不降频（降频能回到 250 Hz，
+    但那是下一步的事，先把"对不对"验了再谈"快不快"）。
     """
     try:
         sp = list(speed_limit or DEFAULT_SPEED_LIMIT)
         ac = list(accel_limit or DEFAULT_ACCEL_LIMIT)
         dt_nom = 1.0 / max(hz, 1.0)
+        kp = [float(x) for x in (K if K is not None else [SETUP_K] * N_JOINTS)]
+        kd = [float(x) for x in (B if B is not None else [SETUP_B] * N_JOINTS)]
+        tau_max = _read_tau_max(arm)
 
-        # ── prime：**托住实测位姿**（目标==实测 ⇒ 固件接受，内置刚度+重力托住）──
-        if not _send_hold(arm):
-            raise RuntimeError(
-                "prime 连发 5 次「托住实测位姿」都被固件拒 —— 这不是稳态残差，"
-                "是链路或臂状态有问题（臂可能一直在动）。受控接管后上抛。")
+        # ── prime：托住实测位姿（`joint_follow.prime`）──
         q_cmd = _q_meas(arm)
         dq_cmd = [0.0] * N_JOINTS
         q_target = list(q_cmd)
+        _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max)
 
-        # ── engage：engage_sec 内持续"托在原地"（对应 joint_follow 的低刚度托举段）──
-        t_end = time.monotonic() + max(engage_sec, 0.0)
-        while time.monotonic() < t_end and not should_stop():
-            _send_hold(arm, tries=2)
-            time.sleep(dt_nom)
+        # ── engage：`engage_sec` 内用**低刚度**托住（`joint_follow.engage`）──
+        if engage_sec > 1e-6:
+            q_ref = _q_meas(arm)
+            kp_e = [ENGAGE_KP] * N_JOINTS
+            kd_e = [ENGAGE_KD] * N_JOINTS
+            t_end = time.monotonic() + engage_sec
+            while time.monotonic() < t_end and not should_stop():
+                _send_mit(arm, q_ref, [0.0] * N_JOINTS, kp_e, kd_e, tau_max)
+                time.sleep(dt_nom)
 
         # ── start：指令/目标都初始化成【当前实测】──
         q_cmd = _q_meas(arm)
@@ -378,8 +347,6 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
 
         base = time.monotonic()
         next_tick = base + dt_nom
-        rejects = 0
-        holding = False          # 是否正处在「托住实测位姿」的退路里
 
         while not should_stop():
             if duration_s is not None and time.monotonic() - base >= duration_s:
@@ -400,41 +367,14 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             q_cmd, dq_cmd = slew_target(q_target, q_cmd, dq_cmd, sp, ac, dt_nom)
 
             try:
-                arm.move_js(q_cmd, dq_cmd)
-                rejects = 0
-                if holding:
-                    holding = False
-                    log.info("已恢复正常跟随")
-            except Exception as e:                   # noqa: BLE001
-                # ⚠⚠ `move_js` 在「目标 ≠ 实测位姿」且「`dq == 0`」时**会被固件拒**
-                # （真机实证）。而从臂到位后 `slew_target` 给的就是 `dq=0`，并且
-                # **实测与目标总有 settle 残差** —— `movej` 的到位判据是 `q_tol=0.03`，
-                # 允许差 0.03 rad。于是**每一拍都被拒** ⇒ 拒帧就**不 kick 看门狗**
-                # ⇒ 0.1 s 后 fail-soft ⇒ **臂会垂**。真机实测：连续 20 次后升级退出。
-                #
-                # 这不是 `send_mit` 的问题（MIT 帧不受这条限制），所以 litearm-server
-                # 碰不到 —— 是 `move_js` 路线的固有短板。
-                #
-                # 退路：**托住实测位姿**。那一帧目标==实测 ⇒ 一定被接受 ⇒ 看门狗照 kick，
-                # 再把参考同步过去，下一拍 `slew_target` 从实测位姿重新起步
-                # ⇒ **主臂一动，目标一变，就立刻恢复正常跟随**。
-                q_hold = _q_meas(arm)
-                if not _send_hold(arm, tries=3):
-                    rejects += 1
-                    log.warning("move_js 被拒（第 %d 次连续）：%s", rejects, e)
-                    if rejects >= _REJECT_ESCALATE:
-                        log.error("连续 %d 次被拒 —— 受控接管并上抛", rejects)
-                        hold_at_current(arm)
-                        raise
-                else:
-                    rejects = 0
-                    q_cmd[:] = q_hold
-                    dq_cmd[:] = [0.0] * N_JOINTS
-                    q_target = list(q_hold)
-                    if not holding:
-                        holding = True
-                        log.info("目标不可达（残差在 movej 的 q_tol=0.03 之内）"
-                                 "⇒ 改为托住实测位姿；主臂一动即恢复。原错误: %s", e)
+                _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max)
+            except Exception:                        # noqa: BLE001
+                # ⚠ MIT 透传**没有** `move_js` 那条「目标 ≠ 实测位姿且 `dq == 0` 就拒帧」
+                #   的限制（`move_js` 路线因此才需要「托住实测位姿」的退路）。
+                #   走到这里就是链路/帧本身出问题 ⇒ **直接受控接管并上抛**，不再硬撑。
+                log.exception("send_mit_all 失败，受控接管")
+                hold_at_current(arm)
+                raise
 
             r = next_tick - time.monotonic()
             if r > 0:

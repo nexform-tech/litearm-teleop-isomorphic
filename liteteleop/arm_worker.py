@@ -440,7 +440,7 @@ class ArmWorker:
             self._log(f"⚠ zero_g_stop 失败: {e}")
 
     def _run_slave(self) -> None:
-        """从臂：订阅 → 钳位 → `slew_target` → `move_js`（spec §5）。"""
+        """从臂：订阅 → 钳位 → `slew_target` → `send_mit_all`（spec §5）。"""
         arm = self._arm
         self._limits = read_safe_limits(arm)             # 读不到会抛 ⇒ 拒启动
         self._log(f"软限位 {list(zip(self._limits.lo, self._limits.hi))}")
@@ -453,29 +453,26 @@ class ArmWorker:
         self._log("等待主臂首帧并对齐 …")
         aligned = servo.align_to_master(arm, self._slot.take, self._limits)
 
-        # ⚠ **不改任何固件参数**（用户裁决）：K/B 用固件出厂的 `mit_kp`/`mit_kd`。
-        #    写 `mit_kp` 会连带改坏 `movej`（它用的就是 `mit_kp`），真机踩过两次。
-        #
-        # ⚠⚠ 但**速度上限必须按 kd 预算收紧**：`move_js` 的 `dq` 进电机速度前馈
-        #      （`τ += kd_eff·dq`，kd_eff 出厂 J1~J4 = 11），照抄 server 那份配 B=0.5 的
-        #      `speed_limit` 会让 J4 的 `kd·dq` = 55 Nm 顶满 tau_max=21 ⇒ **抖**。
+        # ⚠ **不改任何固件参数** —— K/B 走 `send_mit_all` **随帧下发**，
+        #    而不是写固件的全局 `mit_kp`/`mit_kd`（后者会连带改坏 `movej`，真机踩过两次）。
+        #    随帧下发**只对这一帧生效** ⇒ `movej` 完全不受影响。
         # ⚠ 对齐成败**必须报出来**（这行曾被误删 ⇒ 出了故障却看不出对齐成没成、差多少）
         if aligned is None:
             self._log("⚠ 未对齐（5 s 内没收到主臂帧，或 movej 失败）—— 跟随会逐步修正")
         else:
             self._log(f"✓ 已对齐 → {[round(v, 3) for v in aligned]}")
 
-        # ⛔ **不改刚度**（用户裁决 2026-09-28）：写 `mit_kp` 那条路**只验证了静态、
-        #    动态跟随会位置越界断轴**（见 servo.SETUP_K 那段注释）。用固件出厂值。
-
-        # ⚠⚠ 速度上限**必须**按 kd 预算收紧（见上面那段）。
-        # ⚠ 先读、再打日志 —— 早先写成"先写增益再读"，两行都显示改后的值，是 bug。
-        kd, tau_max = servo.effective_kd(arm)
-        sl_budget = servo.speed_limit_from_kd(kd, tau_max)
-        sl = [min(a, b) for a, b in zip(servo.DEFAULT_SPEED_LIMIT, sl_budget)]
-        self._log(f"出厂 kd_eff={[round(x, 1) for x in kd]}  tau_max={[round(x, 1) for x in tau_max]}")
-        self._log(f"speed_limit 配置={servo.DEFAULT_SPEED_LIMIT}")
-        self._log(f"speed_limit 预算={[round(x, 3) for x in sl_budget]}  ⇒ 实取={[round(x, 3) for x in sl]}")
+        # ⚠⚠ 速度上限**照抄 litearm-server 的配置值**（用户裁决 2026-09-28，真机实测）。
+        #    曾按 kd 预算收紧（`speed_limit_i = 0.30·tau_max_i/kd_i`），把 J3/J4 压到 **11%**
+        #    （5.0 → 0.63/0.573）、腕部 J5~J7 压到 **9~15%**（10/8/13 → 1.2）
+        #    ⇒ 用户实测「跟随太慢，有明显的延迟」⇒ 撤掉，回到 S0 验过的 server 原值。
+        # ⚠ 这份配置**本来就是配 `B=0.5` 的** —— K/B 随帧下发之后，它才第一次名副其实。
+        sl = list(servo.DEFAULT_SPEED_LIMIT)
+        self._log(f"从臂跟随：K={servo.SETUP_K} B={servo.SETUP_B}"
+                  f"（照搬 joint_follow，随 send_mit_all 下发）")
+        self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
+        self._log("⚠ 每拍 2 次往返（get_gravity + send_mit_all，实测各 3.333 ms）"
+                  "⇒ 上限 ~150 Hz")
 
         def provider():
             payload, _ts = self._slot.take()

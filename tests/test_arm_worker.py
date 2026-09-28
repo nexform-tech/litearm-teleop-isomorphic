@@ -207,10 +207,16 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
     而且顺序数组会多一项）。
     """
     order = []
+    seen = {}
     monkeypatch.setattr(servo, "align_to_master",
                         lambda *a, **k: (order.append("align"), [0.0] * 7)[1])
-    monkeypatch.setattr(servo, "follow",
-                        lambda *a, **k: (order.append("follow"), True)[1])
+
+    def _fake_follow(*a, **k):
+        order.append("follow")
+        seen.update(k)
+        return True
+
+    monkeypatch.setattr(servo, "follow", _fake_follow)
     monkeypatch.setattr(arm_worker.link, "Connector",
                         lambda *a, **k: _FakeEndpoint())
     monkeypatch.setattr(arm_worker, "read_safe_limits", lambda arm, **k: _FakeLimits())
@@ -249,6 +255,13 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
     w._arm = _NoWriteArm()
     w._run_slave()
     assert order == ["align", "follow"], f"顺序必须是 对齐 → 跟随，实际 {order}"
+    # ⛔ 速度上限必须**逐字是 litearm-server 的配置值**（用户裁决 2026-09-28，真机实测）。
+    #   曾按 kd 预算收紧（`0.30·tau_max/kd_eff`）⇒ J3/J4 只剩 **11%**、腕部只剩 **9~15%**
+    #   ⇒ 用户实测「跟随太慢，有明显的延迟」。
+    #   判别力：谁把那个预算加回来，本用例会红。
+    assert seen["speed_limit"] == list(servo.DEFAULT_SPEED_LIMIT), (
+        f"speed_limit 必须是 server 原值 {servo.DEFAULT_SPEED_LIMIT}，"
+        f"实际 {seen['speed_limit']}")
 
 
 
