@@ -266,8 +266,13 @@ class ArmWorker:
 
     def _run(self) -> None:
         import litearm as pa
+        from .ports import resolve_port
         try:
-            self._arm = pa.Arm(port=self.port, move_timeout=self.move_timeout)
+            # ⚠ **不能用 SDK 的 find_cdc_port() 自动选**：同型号两条臂 VID:PID 相同，
+            #    它取第一个匹配 ⇒ 主/从两个进程会抢到同一个口而且不报错（见 ports.py）。
+            port = resolve_port(self.port)
+            self._log(f"使用 CDC 口 {port}")
+            self._arm = pa.Arm(port=port, move_timeout=self.move_timeout)
             self._arm.connect()
             attach_state_hook(self._arm, self._push)
             with self._lock:

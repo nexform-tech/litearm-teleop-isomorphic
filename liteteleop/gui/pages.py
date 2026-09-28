@@ -6,6 +6,7 @@ from typing import Optional
 from PyQt5 import QtCore, QtWidgets
 
 from ..arm_worker import ROLE_MASTER, ROLE_SLAVE, Snapshot, PUB_HZ, SLAVE_HZ
+from ..ports import list_arms
 from ..settings import Settings
 from ..wire import N_JOINTS
 from .widgets import JointTable
@@ -48,6 +49,19 @@ class LinkPage(QtWidgets.QWidget):
             w.editingFinished.connect(self._emit_changed)
         self.sp_port.valueChanged.connect(self._emit_changed)
 
+        # ⚠ CDC 口：**两条以上同型号臂时必须显式选**（VID:PID 相同，自动挑会挑错且不报错）
+        row_port = QtWidgets.QHBoxLayout()
+        self.cb_port = QtWidgets.QComboBox()
+        self.btn_rescan = QtWidgets.QPushButton("重新扫描")
+        self.btn_rescan.clicked.connect(self.rescan_ports)
+        self.lab_port_note = QtWidgets.QLabel()
+        row_port.addWidget(QtWidgets.QLabel("CDC 口"))
+        row_port.addWidget(self.cb_port, 1)
+        row_port.addWidget(self.btn_rescan)
+        form.addRow("臂", self._wrap(row_port))
+        form.addRow("", self.lab_port_note)
+        self.cb_port.currentIndexChanged.connect(self._emit_changed)
+
         row3 = QtWidgets.QHBoxLayout()
         self.btn_connect = QtWidgets.QPushButton("连接臂")
         self.btn_teleop = QtWidgets.QPushButton("启动遥操")
@@ -62,6 +76,7 @@ class LinkPage(QtWidgets.QWidget):
         row3.addWidget(self.btn_connect); row3.addWidget(self.btn_teleop)
         form.addRow("动作", self._wrap(row3))
 
+        self.rescan_ports()
         self.lab_info = QtWidgets.QLabel("未连接")
         self.lab_info.setWordWrap(True)
         form.addRow("状态", self.lab_info)
@@ -75,6 +90,30 @@ class LinkPage(QtWidgets.QWidget):
     def _wrap(lay) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget(); w.setLayout(lay); return w
 
+    def rescan_ports(self) -> None:
+        """重新枚举 CDC 口。**序列号才是唯一标识**，所以标签里带上它。"""
+        cur = self.s.cdc_port
+        self.cb_port.blockSignals(True)
+        self.cb_port.clear()
+        self.cb_port.addItem("自动（只有一条臂时）", "")
+        for a in list_arms():
+            self.cb_port.addItem(a.label, a.device)
+        idx = self.cb_port.findData(cur)
+        self.cb_port.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cb_port.blockSignals(False)
+        n = self.cb_port.count() - 1
+        if n >= 2:
+            self.lab_port_note.setText(
+                f"⚠ 检测到 <b>{n}</b> 条臂。同型号 VID:PID 相同，"
+                "<b>必须选一个</b> —— 自动挑会挑错而且不报错。")
+            self.lab_port_note.setStyleSheet("color:#b02020;")
+        elif n == 0:
+            self.lab_port_note.setText("未检测到 STM32 CDC 口（检查 USB 与 dialout 权限）")
+            self.lab_port_note.setStyleSheet("color:#b02020;")
+        else:
+            self.lab_port_note.setText(f"检测到 1 条臂：{self.cb_port.itemText(1)}")
+            self.lab_port_note.setStyleSheet("")
+
     def role(self) -> str:
         return ROLE_MASTER if self.rb_master.isChecked() else ROLE_SLAVE
 
@@ -87,6 +126,7 @@ class LinkPage(QtWidgets.QWidget):
         self.s.peer = self.ed_peer.text().strip() or "127.0.0.1"
         self.s.jport = int(self.sp_port.value())
         self.s.arm_id = self.ed_arm_id.text().strip() or "armA"
+        self.s.cdc_port = self.cb_port.currentData() or ""
         self.settings_changed.emit()
 
     def apply(self, s: Snapshot) -> None:
