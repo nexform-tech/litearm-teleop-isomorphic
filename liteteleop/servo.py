@@ -54,8 +54,14 @@ DEFAULT_SPEED_LIMIT = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]
 DEFAULT_ACCEL_LIMIT = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]
 DEFAULT_ENGAGE_SEC = 0.3
 
-#: litearm-server 的 `zero_gravity`/`joint_follow` 环频（`self._hz`）。
-DEFAULT_HZ = 200.0
+#: **从臂伺服环**频率 = pylitearm 的 `arm._hz` = `cfg["transport"]["control_loop_hz"]`
+#: （`sdk/arm.py:652` 读它，`litearm_balanced.yaml:32` = **250**）。
+#: ⚠⚠ **与主臂的 `pub_hz = 200` 是两个不同的数** —— 那个是 `TeleopManager.__init__`
+#: 的发布率，管的是"主臂多久发一帧"。别混（我混过一次）。
+#: ⚠ 但见 §9.3：250 Hz 的周期只有 4 ms，而本仓的 `G(q)` 走串口往返 **3.31 ms**
+#: （pylitearm 是本地 Pinocchio，亚毫秒）⇒ **250 Hz 在这套移植上跑不动**。
+#: 这条是"照抄不来"的地方，**环频必须按实测 `G(q)` 代价定**，见 `measure_gravity_cost`。
+DEFAULT_HZ = 250.0
 
 #: MIT 帧的电机硬性范围（达妙）：超范围会被电调饱和钳掉。
 MIT_KP_MAX = 500.0
