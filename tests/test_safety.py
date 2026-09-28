@@ -417,3 +417,21 @@ def test_limits_reject_zero_width_in_the_type_itself():
     """零宽度不变量放在**类型**里，不只是工厂里（phase 2 会长期持有 `Limits` 对象）。"""
     with pytest.raises(safety.LimitsError, match="零宽度或反了"):
         safety.Limits(lo=(0.0, 1.0), hi=(0.0, 2.0))
+
+
+def test_slew_clamps_out_of_range_initial_speed():
+    """⛔ 真缺陷：`v = clamp(v, ±v_limit)` 这行**是承重的**，而它原先**没有判别力**。
+
+    删掉它，全套 30 条仍绿 —— 因为当 `dq_cmd` 起点本来就合法时，加速限幅足以把 `v`
+    留在范围内。只有**起点就越界**才露出来 —— 而这正是运行期把 `speed_limit_j`
+    或 `kd_budget` 调小（spec §8 把它们作为界面字段）时的情形。
+
+    实测（评审量化）：起点 `dq=3.0`、`speed_limit=0.57` 时，原版夹到 0.57；
+    删掉该行后冲到 **2.76** ⇒ `kd·|dq| = 30.4 Nm` vs `tau_max = 21 Nm`（**145%**，预算是 30%）。
+    """
+    sp, ac, dt = 0.57, 14.0, 0.01
+    q_cmd, dq_cmd = [0.0], [3.0]                     # 起点速度就越界
+    for k in range(3):
+        q_cmd, dq_cmd = safety.slew_target([10.0], q_cmd, dq_cmd, [sp], [ac], dt)
+        assert abs(dq_cmd[0]) <= sp + 1e-12, (
+            f"第 {k} 拍 |dq_cmd|={abs(dq_cmd[0])} 越过 speed_limit={sp} —— 限速钳位失效")

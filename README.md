@@ -3,8 +3,10 @@
 Isomorphic (leader-follower) teleoperation for the **LiteArm robotic manipulator
 series**.
 
-> **Status:** repository initialized. Source code, packaging and documentation
-> have not landed yet.
+> **Status:** stage 1 landed on the `feat/teleop-stage1-protocol` branch (not yet merged):
+> wire protocol codec, zenoh point-to-point link, and the pure-logic safety layer
+> (`liteteleop/{wire,link,safety}.py`, 55 tests). The real-machine spike and the
+> PyQt5 GUI are **not** in yet — see `docs/superpowers/plans/` for what remains.
 
 ## Scope
 

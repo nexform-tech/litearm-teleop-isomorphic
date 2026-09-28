@@ -224,11 +224,18 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import statistics
 import sys
 import time
 
 import litearm as pa
+
+# ⚠ spike 必须用**出货的** `safety.slew_target`，不许内联副本 ——
+# 内联过一版取**标量**上限的 `_slew`，与出货版（逐轴 `speed_limit[i]`）不是同一个函数，
+# 那样 spike 报的数字出自另一个实现，而且照它的调用约定调出货版会 TypeError。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from liteteleop import safety      # noqa: E402
 
 SEND_HZ = 100.0
 DT = 1.0 / SEND_HZ
@@ -243,8 +250,8 @@ S2_OFFSET = 0.20
 S2_DQ = 0.30
 S2_RATE_TOL = 0.20           # ±20%
 # S3: 遥操速度量级（既有实证的上限是 0.5，这里要越过它）
-S3_HZ = 0.5
-S3_AMP = 0.25
+# ⚠ 幅值/频率**不在这里定**：由「承重轴」的 `speed_limit_j` 现算（见 s3_...）。
+#   早先写死 `S3_AMP=0.25` 驱动 J2，只到它设计上限的 37% —— 永远碰不到承重轴 J4。
 S3_SEC = 20.0
 S3_RMS_TOL = 0.05            # rad
 # S4: 100 Hz ACK 稳定性
@@ -362,81 +369,83 @@ def s2_dq_sets_rate(arm, q0):
           f"{rate:.3f} rad/s（J1 speed_limit=2.0）")
 
 
+def _axis_limits(arm, kd_budget=0.30):
+    """读各轴 `kd` / `tau_max` / `kd_extra`，算**逐轴** `speed_limit_j`（spec §5.1）。
+
+    ⚠ 这是判据③④的基准。早先版本用 `peak_dq * 1.35` 这个拍脑袋的标量，
+    于是**永远碰不到承重轴**（§5.1 论证承重的是 J4，0.573 rad/s）——
+    S3 按原样跑永远回答不了 spec 要它回答的问题。
+    """
+    jp = [arm.params.get_joint_param(i).value for i in range(arm.n)]
+    kd_extra = []
+    for i in range(arm.n):
+        try:
+            kd_extra.append(float(arm.get_ff_scalar(15, i).value))
+        except Exception as e:                      # noqa: BLE001
+            print(f"    ⚠ 读 kd_extra(J{i + 1}) 失败: {e} —— 退回 0（mit_kd 近似）", flush=True)
+            kd_extra.append(0.0)
+    kd = [p.kd + e for p, e in zip(jp, kd_extra)]
+    tau_max = [p.tau_max for p in jp]
+    return kd, tau_max, safety.speed_limit_from_kd(kd, tau_max, kd_budget)
+
+
 def s3_high_speed_feedforward(arm, q0):
-    print(f"\n=== S3: 遥操速度量级（正弦 {S3_AMP}rad @{S3_HZ}Hz）下的速度前馈 ===", flush=True)
-    print("     既有实证的上限是 0.5 rad/s；本节峰值 dq 约 "
-          f"{2 * math.pi * S3_HZ * S3_AMP:.2f} rad/s", flush=True)
-    # 用 spec §5.1 的 slew_target 生成参考（与阶段二同一份代码，但此处先内联，
-    # 避免 spike 依赖还没实现的 safety.py；Task 5 会把它抽出去）
+    print("\n=== S3: 遥操速度量级下的速度前馈（**驱动承重轴**）===", flush=True)
+    kd, tau_max, sl = _axis_limits(arm)
+    print(f"    逐轴 speed_limit_j = {[round(x, 3) for x in sl]}", flush=True)
+    j = min(range(arm.n), key=lambda k: sl[k])          # 承重轴 = 上限最小的那根
+    print(f"    承重轴 = J{j + 1}：上限 {sl[j]:.3f} rad/s"
+          f"（kd={kd[j]:.1f}, tau_max={tau_max[j]:.1f}）", flush=True)
+    amp, hz = 0.5 * sl[j], 0.5
+    peak = 2 * math.pi * hz * amp
+    sp = [sl[j] * 1.2] * arm.n
+    ac = [max(4.0 * peak, 14.0)] * arm.n
     arm.movej(q0, speed=ALIGN_SPEED)
     time.sleep(0.3)
-    peak_dq = 2 * math.pi * S3_HZ * S3_AMP
-    q_cmd = list(q0)
-    dq_cmd = [0.0] * arm.n
-    errs = []
+    q_cmd, dq_cmd = list(q0), [0.0] * arm.n
+    errs, tau_seen, dq_seen = [], [], []
     t0 = time.monotonic()
     nxt = t0 + DT
     while time.monotonic() - t0 < S3_SEC:
         t = time.monotonic() - t0
-        raw = [x for x in q0]
-        raw[1] += S3_AMP * math.sin(2 * math.pi * S3_HZ * t)
-        # 梯形曲线：限速 peak_dq*1.35、限加速 4*peak_dq（足够跟得上，不做瓶颈）
-        q_cmd, dq_cmd = _slew(raw, q_cmd, dq_cmd, peak_dq * 1.35, 4.0 * peak_dq, DT)
+        raw = list(q0)
+        raw[j] += amp * math.sin(2 * math.pi * hz * t)
+        q_cmd, dq_cmd = safety.slew_target(raw, q_cmd, dq_cmd, sp, ac, DT)
         arm.move_js(q_cmd, dq_cmd)
         st = arm.get_state(refresh=False).value
-        errs.append(max(abs(q_cmd[i] - st.q[i]) for i in range(arm.n)))
+        if st is None:
+            raise RuntimeError("状态缓存为空 —— 见 spec §5.1：拿不到实测 q 不许下发/判据")
+        errs.append(abs(q_cmd[j] - st.q[j]))
+        tau_seen.append(abs(st.tau[j]))                 # ← 判据③的经验交叉核对
+        dq_seen.append(abs(dq_cmd[j]))
         r = nxt - time.monotonic()
         if r > 0:
             time.sleep(r)
         nxt += DT
         if nxt < time.monotonic():
             nxt = time.monotonic() + DT
+
+    # ④ |dq_cmd| ≤ speed_limit_j —— 纯逻辑，与硬件无关，但也必须成立
+    worst_dq = max(dq_seen)
+    check(f"S3④ |dq_cmd| ≤ speed_limit_j={sl[j]:.3f}",
+          worst_dq <= sl[j] + 1e-9, f"峰值 {worst_dq:.3f} rad/s")
+    # ③ kd·|dq_cmd| 不超 kd_budget·tau_max（算式）
+    kd_tau = kd[j] * worst_dq
+    budget = safety.DEFAULT_KD_BUDGET * tau_max[j]
+    check(f"S3③ kd·|dq_cmd| ≤ 预算 {budget:.2f} Nm",
+          kd_tau <= budget + 1e-6, f"{kd_tau:.2f} Nm")
+    print(f"    （经验交叉核对：实测峰值 |tau(J{j + 1})| = {max(tau_seen):.2f} Nm，"
+          f"tau_max = {tau_max[j]:.1f}；⚠ 它含重力与刚度项，不是纯前馈）", flush=True)
     # 丢掉前 20% 的起步段
     body = errs[len(errs) // 5:]
     rms = statistics.fmean([e * e for e in body]) ** 0.5
-    check(f"S3 跟踪误差 rms ≤ {S3_RMS_TOL} rad（峰值 dq≈{peak_dq:.2f}）",
+    check(f"S3① 跟踪误差 rms ≤ {S3_RMS_TOL} rad（承重轴 J{j + 1}）",
           rms <= S3_RMS_TOL, f"rms={rms:.4f} rad, max={max(body):.4f}")
-    # 抖动判据：后半段误差的峰峰值不应比前半段显著放大（自激会单调放大）
     h = len(body) // 2
     pp1 = max(body[:h]) - min(body[:h])
     pp2 = max(body[h:]) - min(body[h:])
-    check("S3 无自激（后半段误差峰峰值未显著放大）", pp2 <= pp1 * 2.0 + 0.01,
+    check("S3② 无自激（后半段误差峰峰值未显著放大）", pp2 <= pp1 * 2.0 + 0.01,
           f"前半 {pp1:.4f} / 后半 {pp2:.4f}")
-
-
-def _slew(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
-    """spike 内联版 slew_target —— 与 pylitearm/src/pylitearm/control/joint_follow.py:45-88 逐字同构。
-
-    Task 5 会把正式版放进 liteteleop/safety.py 并与原版对拍；
-    此处内联只是为了让 spike 不依赖尚未实现的安全层。
-    """
-    dt = max(dt, 1e-4)
-    for i in range(len(raw_target)):
-        v_limit = max(1e-4, speed_limit)
-        a_limit = max(1e-4, accel_limit)
-        dv_max = a_limit * dt
-        diff = raw_target[i] - q_cmd[i]
-        v = dq_cmd[i]
-        if abs(diff) < 1e-5 and abs(v) < dv_max:
-            q_cmd[i] = raw_target[i]
-            dq_cmd[i] = 0.0
-            continue
-        stopping_dist = (v * v) / (2.0 * a_limit) if a_limit > 0.0 else 0.0
-        moving_toward = diff * v > 0.0
-        if moving_toward and abs(diff) <= stopping_dist:
-            desired_v = 0.0
-        else:
-            desired_v = math.copysign(v_limit, diff)
-        v += max(-dv_max, min(dv_max, desired_v - v))
-        v = max(-v_limit, min(v_limit, v))
-        step = v * dt
-        if diff * step > 0.0 and abs(step) >= abs(diff):
-            q_cmd[i] = raw_target[i]
-            dq_cmd[i] = 0.0
-        else:
-            q_cmd[i] += step
-            dq_cmd[i] = v
-    return q_cmd, dq_cmd
 
 
 def s4_ack_rate(arm, q0):
