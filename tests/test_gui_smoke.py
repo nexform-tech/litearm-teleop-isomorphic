@@ -128,7 +128,7 @@ def test_gripper_preset_fills_600g_and_3cm(qapp):
     w = MainWindow(Settings())
     w.page_teleop.btn_gripper.click()
     assert w.page_teleop.sp_mass.value() == 0.6
-    assert [sp.value() for sp in w.page_teleop.sp_com] == [0.03, 0.0, 0.0]
+    assert [sp.value() for sp in w.page_teleop.sp_com] == [0.0, 0.0, 0.03]
     w.close()
 
 
@@ -138,7 +138,7 @@ def test_apply_payload_emits_what_is_in_the_boxes(qapp):
     w.page_teleop.payload_applied.connect(lambda m, c: got.append((m, list(c))))
     w.page_teleop.btn_gripper.click()
     w.page_teleop.btn_payload.click()
-    assert got == [(0.6, [0.03, 0.0, 0.0])], got
+    assert got == [(0.6, [0.0, 0.0, 0.03])], got
     w.close()
 
 

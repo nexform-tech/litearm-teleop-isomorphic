@@ -165,7 +165,18 @@ class TeleopPage(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        lay = QtWidgets.QVBoxLayout(self)
+        # ⚠ 套**滚动区**：本页内容（对照表 + 参数 + 载荷组）比默认窗口高，
+        #    不套的话底部会被裁掉（离屏量过：内容到 y≈496 而页面只有 476）。
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        sa = QtWidgets.QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QtWidgets.QFrame.NoFrame)
+        inner = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(inner)
+        sa.setWidget(inner)
+        outer.addWidget(sa)
+
         self.lab = QtWidgets.QLabel("未启动")
         self.lab.setStyleSheet("font-size: 15px;")
         lay.addWidget(self.lab)
@@ -177,52 +188,75 @@ class TeleopPage(QtWidgets.QWidget):
         for r in range(N_JOINTS):
             self.cmp.setItem(r, 0, QtWidgets.QTableWidgetItem("—"))
             self.cmp.setItem(r, 1, QtWidgets.QTableWidgetItem("—"))
+        self.cmp.setMinimumHeight(190)
         lay.addWidget(self.cmp)
 
-        self.lab_params = QtWidgets.QLabel()
+        # ⚠ 文本**全静态** ⇒ 在 __init__ 里就设好。
+        #    放在 apply() 里设的后果：布局按"空标签"算好了高度，之后不重算 ⇒ **文字被裁**
+        #    （离屏量出来只有 20px 高，而这里有 4 行）。
+        self.lab_params = QtWidgets.QLabel(
+            "参数（限速/限加速逐值照抄 litearm-server）\n"
+            "  speed_limit = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]\n"
+            "  accel_limit = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]    engage_sec = 0.3\n"
+            "⚠ 刚度/阻尼用固件出厂值（mit_kp 400/300/50），不是 server 的 K=25/B=0.5："
+            "`move_js` 没有随帧下发 K/B 的通道（spec §5.3）")
         self.lab_params.setWordWrap(True)
+        self.lab_params.setMinimumHeight(self.lab_params.sizeHint().height())
         lay.addWidget(self.lab_params)
 
         # ── 末端载荷（夹爪）──────────────────────────────────────────────
+        # ── 末端载荷（夹爪）──────────────────────────────────────────────
+        # ⚠ 用**嵌套 QHBoxLayout**，不用 QGridLayout —— 网格是**共享列**的，
+        #    上一行的"质心 x"标签会和下一行按钮占同一列 ⇒ 宽度互相挤，标签重叠。
         box = QtWidgets.QGroupBox("末端载荷（夹爪）—— 影响重力前馈")
-        bl = QtWidgets.QGridLayout(box)
+        bl = QtWidgets.QVBoxLayout(box)
 
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("质量"))
         self.sp_mass = QtWidgets.QDoubleSpinBox()
         self.sp_mass.setRange(0.0, 20.0); self.sp_mass.setDecimals(3)
         self.sp_mass.setSingleStep(0.05); self.sp_mass.setSuffix(" kg")
+        self.sp_mass.setMinimumWidth(110)
         self.sp_mass.setValue(servo.DEFAULT_PAYLOAD_MASS)
+        row1.addWidget(self.sp_mass)
         self.sp_com = []
-        for k, name in enumerate(("x", "y", "z")):
+        for k, name in enumerate(("质心 X", "质心 Y", "质心 Z")):
+            row1.addSpacing(12)
+            row1.addWidget(QtWidgets.QLabel(name))
             sp = QtWidgets.QDoubleSpinBox()
             sp.setRange(-1.0, 1.0); sp.setDecimals(4)
             sp.setSingleStep(0.005); sp.setSuffix(" m")
+            sp.setMinimumWidth(105)
             sp.setValue(servo.DEFAULT_PAYLOAD_COM[k])
             self.sp_com.append(sp)
+            row1.addWidget(sp)
+        row1.addStretch(1)
+        bl.addLayout(row1)
 
-        bl.addWidget(QtWidgets.QLabel("质量"), 0, 0)
-        bl.addWidget(self.sp_mass, 0, 1)
-        for k, name in enumerate(("质心 x", "质心 y", "质心 z")):
-            bl.addWidget(QtWidgets.QLabel(name), 0, 2 + k)
-            bl.addWidget(self.sp_com[k], 0, 3 + k)
-        bl.addWidget(QtWidgets.QLabel("⚠ 质心在 <b>ee_link 系</b>、单位米"), 1, 0, 1, 3)
+        lab_hint = QtWidgets.QLabel(
+            "⚠ 质心在 <b>ee_link 系</b>、单位<b>米</b>；本项目夹爪的 3 cm 在 <b>Z</b> 轴")
+        lab_hint.setWordWrap(True)
+        bl.addWidget(lab_hint)
 
-        row = QtWidgets.QHBoxLayout()
+        row2 = QtWidgets.QHBoxLayout()
         self.btn_payload = QtWidgets.QPushButton("应用载荷")
-        self.btn_gripper = QtWidgets.QPushButton("预设：夹爪 600 g / 3 cm")
+        self.btn_gripper = QtWidgets.QPushButton("预设：夹爪 600 g / Z 3 cm")
         self.btn_gripper.clicked.connect(self._preset_gripper)
         self.btn_payload.clicked.connect(self._apply_payload)
-        row.addWidget(self.btn_payload); row.addWidget(self.btn_gripper)
-        w = QtWidgets.QWidget(); w.setLayout(row)
-        bl.addWidget(w, 1, 3, 1, 3)
+        row2.addWidget(self.btn_payload)
+        row2.addWidget(self.btn_gripper)
+        row2.addStretch(1)
+        bl.addLayout(row2)
 
         self.lab_payload = QtWidgets.QLabel("当前生效：—")
         self.lab_payload.setWordWrap(True)
-        bl.addWidget(self.lab_payload, 2, 0, 1, 6)
+        bl.addWidget(self.lab_payload)
+
         note = QtWidgets.QLabel(
             "⚠ 固件会**静默钳制**（质量 [0,20]、质心 [-1,1]）且照样回 ACK ⇒ "
-            "下面显示的是**读回值**，不是输入值。⛔ 只写 RAM，断电即还原。")
+            "上面显示的是**读回值**，不是输入值。⛔ 只写 RAM，断电即还原。")
         note.setWordWrap(True)
-        bl.addWidget(note, 3, 0, 1, 6)
+        bl.addWidget(note)
         lay.addWidget(box)
 
     def _preset_gripper(self) -> None:
@@ -256,10 +290,3 @@ class TeleopPage(QtWidgets.QWidget):
                 + ("　⚠ 全是 0 ⇒ 可能没设上" if s.payload_mass == 0.0 else ""))
         else:
             self.lab_payload.setText("当前生效：—（未连接或读不到）")
-        self.lab_params.setText(
-            "参数（逐值照抄 litearm-server 的 litearm_balanced.yaml · 执行器 move_js）\n"
-            "  K = [25.0]×7   B = [0.5]×7   engage_sec = 0.3\n"
-            "  speed_limit = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]\n"
-            "  accel_limit = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]\n"
-            "⚠ K/B 由 apply_joint_gains 写进固件参数（**只写 RAM**），退出时还原；\n"
-            "  同时**清零 kd_extra** —— 否则有效阻尼 = mit_kd + kd_extra，J1~J4 会变成 13 倍")

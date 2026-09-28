@@ -398,8 +398,8 @@ def test_apply_payload_reads_back_what_actually_landed():
     判别力：`apply_payload` 若返回输入值而不是读回值，本用例会红。
     """
     arm = PayloadArm()
-    m, c = servo.apply_payload(arm, 0.6, (0.03, 0.0, 0.0))
-    assert (m, c) == (0.6, [0.03, 0.0, 0.0])
+    m, c = servo.apply_payload(arm, 0.6, (0.0, 0.0, 0.03))
+    assert (m, c) == (0.6, [0.0, 0.0, 0.03])
 
     m2, c2 = servo.apply_payload(arm, -5.0, (2.0, 0.0, 0.0))     # 全越界
     assert m2 == 0.0, "负质量被固件钳成 0，读回必须反映这一点"
@@ -408,4 +408,4 @@ def test_apply_payload_reads_back_what_actually_landed():
 
 def test_default_payload_is_the_gripper_the_user_gave():
     assert servo.DEFAULT_PAYLOAD_MASS == 0.6            # 600 g
-    assert servo.DEFAULT_PAYLOAD_COM == (0.03, 0.0, 0.0)  # 质心 3 cm
+    assert servo.DEFAULT_PAYLOAD_COM == (0.0, 0.0, 0.03)  # 质心 3 cm 在 Z 轴
