@@ -18,6 +18,36 @@
 
 ---
 
+## ⚠ 维护本计划文档时必读
+
+**本计划的代码块就是交付物。**改动本文档后，**必须真编译每个 ` ```python ` 块**，不能只数空行：
+
+```bash
+python3 - <<'PY'
+import ast
+blocks=[];inb=False;cur=[];lang=""
+for L in open("docs/superpowers/plans/2026-09-28-teleop-stage1-protocol-and-safety.md",encoding="utf-8"):
+    L=L.rstrip("\n")
+    if L.startswith("```"):
+        if not inb: inb=True;lang=L[3:].strip();cur=[]
+        else: inb=False;blocks.append((lang,"\n".join(cur)))
+        continue
+    if inb: cur.append(L)
+bad=0
+for i,(l,b) in enumerate(blocks):
+    if l!="python": continue
+    try: ast.parse(b)
+    except SyntaxError as e: bad+=1;print(f"#{i}: {e.msg} 行 {e.lineno}")
+print(f"python 块 {sum(1 for l,_ in blocks if l=='python')} 个，失败 {bad}")
+raise SystemExit(1 if bad else 0)
+PY
+```
+
+**为什么写这条**：2026-09-28 我用 `\n{3,}\n\n` 批量折叠空行（为了过 MD012），**连围栏内的代码一起折了**，
+把 `@dataclass(frozen=True)` 和它的 `class Frame:` 之间插进了 2 个空行 —— 装饰器语法直接坏掉。
+而当时的自检只数空行（"残留 0 处"），**对"代码还能不能编译"零判别力**，于是静默通过。
+**⇒ 判据要挑真正会坏的那个性质：含代码的文档，判据是「编译得过」，不是「格式看着对」。**
+
 ## 交付边界（阶段一不做什么）
 
 - ❌ 不做 GUI、不做 `arm_worker.py`、不做 `safety.py` 的遥操循环接线（阶段二）
@@ -770,8 +800,6 @@ class WireError(ValueError):
     """帧不合法（版本不符 / 长度不符 / 关节数不符）。"""
 
 @dataclass(frozen=True)
-
-
 class Frame:
     """一帧解出来的值。`q`/`dq` 是 tuple（不可变，避免跨线程被就地改）。"""
 
@@ -976,8 +1004,6 @@ def test_matching_flag():
         m.close()
 
 @pytest.mark.slow
-
-
 def test_close_is_mandatory_for_exit():
     """⚠ 不 close ⇒ 进程永久挂死（spec §2.1 `[实测]`）。
 
@@ -1406,8 +1432,6 @@ def test_speed_limit_j4_is_the_binding_case():
     assert min(got) < 0.7, "J4 的上限必须明显低于它的 speed_limit=1.75"
 
 @pytest.mark.parametrize("budget", [0.0, -0.1, 1.5])
-
-
 def test_speed_limit_rejects_bad_budget(budget):
     with pytest.raises(safety.LimitsError, match="kd_budget"):
         safety.speed_limit_from_kd([1.0] * 7, [1.0] * 7, kd_budget=budget)
@@ -1481,7 +1505,7 @@ python3 -m pytest tests/test_safety.py -q
 
 在 `safety.py` 的 `slew_target` docstring 末尾追加（**不改逻辑**）：
 
-```python
+```text
     ⚠ **移植已知边界（照抄，不在本计划修）**：`diff` 恰为 0 或落在 `±1e-5` 死区内、
     而 `|v| ≥ dv_max` 时，`math.copysign(v_limit, diff)` 在 `diff == 0` 会返回 `+v_limit`
     ⇒ 该轴可能继续正向加速而非停住（原版同样如此）。实践中 `diff` 极少恰为 0，
