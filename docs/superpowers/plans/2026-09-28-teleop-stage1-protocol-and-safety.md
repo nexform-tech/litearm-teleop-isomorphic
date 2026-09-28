@@ -387,13 +387,23 @@ def _axis_limits(arm, kd_budget=0.30):
     S3 按原样跑永远回答不了 spec 要它回答的问题。
     """
     jp = [arm.params.get_joint_param(i).value for i in range(arm.n)]
-    kd_extra = []
-    for i in range(arm.n):
-        try:
-            kd_extra.append(float(arm.get_ff_scalar(15, i).value))
-        except Exception as e:                      # noqa: BLE001
-            print(f"    ⚠ 读 kd_extra(J{i + 1}) 失败: {e} —— 退回 0（mit_kd 近似）", flush=True)
-            kd_extra.append(0.0)
+    # ⚠⚠ `kd_extra` 住在 **0x26 向量表** (`FF_VEC_ITEMS[15]`)，**不是** 0x28 标量表：
+    #    `get_ff_scalar(15, sub)` 取到的是标量表的 item 15 = `zg_engage_kp`（一个完全
+    #    不相干的数），而且 `sub` 只容许 0..2 ⇒ J4~J7 会抛 `InvalidCommandError`。
+    #    正确读法是一次拿全 7 轴：`get_ff_vec(15).value -> list[float]`。
+    #    （真机实测 J1.8.0-7J：`mit_kd=[5,5,4,5,2.5,2.5,2.5]`、
+    #      `kd_extra=[6,6,6,6,0,0,0]` ⇒ `kd_eff=[11,11,10,11,2.5,2.5,2.5]`。）
+    # ⚠ 读失败时必须**往安全一侧倒**：把 kd_extra 记成 0 会让 kd 变**小** ⇒ `speed_limit`
+    #    变**宽**（J4 从 0.573 放到 1.260，最紧轴还会从 J4 误变成 J5）—— 那是错在危险一侧。
+    #    固件 `params.c:153` 的钳幅上界是 50.0，取它作保守替代。
+    try:
+        kd_extra = [float(x) for x in arm.get_ff_vec(15).value]
+        if len(kd_extra) != arm.n:
+            raise ValueError(f"kd_extra 长度 {len(kd_extra)} != n={arm.n}")
+    except Exception as e:                          # noqa: BLE001
+        print(f"    ⚠ 读 kd_extra 失败: {e} —— 按固件钳幅上界 50.0 保守估算"
+              f"（⛔ 不许退回 0：那会让 speed_limit 变**宽**）", flush=True)
+        kd_extra = [50.0] * arm.n
     kd = [p.kd + e for p, e in zip(jp, kd_extra)]
     tau_max = [p.tau_max for p in jp]
     return kd, tau_max, safety.speed_limit_from_kd(kd, tau_max, kd_budget)
