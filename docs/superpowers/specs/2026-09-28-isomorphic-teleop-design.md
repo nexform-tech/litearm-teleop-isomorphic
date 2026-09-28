@@ -311,45 +311,65 @@ struct ">15d"  =  120 字节
 
 ## 5. 从臂伺服环
 
-> ⛔ **本节是 litearm-server 的 `joint_follow` 的忠实移植**，不是本仓的设计。
-> 三份来源：`pylitearm/control/joint_follow.py`（控制律与控制器）、
-> `pylitearm/sdk/arm.py:2006+`（伺服环循环）、
-> `pylitearm/config/litearm_balanced.yaml`（参数真值）。
-> 本仓实现见 [liteteleop/servo.py](../../../liteteleop/servo.py)。
+> ⛔ **逻辑照 litearm-server，执行器用 `move_js`**（用户裁决 2026-09-28：「就先用
+> `move_js` 来实现吧，不动固件」）。本仓实现见
+> [liteteleop/servo.py](../../../liteteleop/servo.py)。
 
-**从臂执行不再走 `move_js`。** 早先那版选 `move_js` 位置直通，由此推出"`K`/`B` 透不过
-`move_js` ⇒ 只能按 kd 预算收紧 `speed_limit`"—— **那是在解自己造出来的问题**。
-litearm-server 用 `joint_follow` → **`send_mit`，K/B 随帧下发**；本 SDK 有
-`send_mit_all`，所以可以**逐行照搬**。
+### 5.1 为什么是 `move_js`（而不是移植 `joint_follow`）
 
-### 5.1 控制律（照搬）
+litearm-server 的从臂是 `joint_follow` → `send_mit`：**K/B 随帧下发、重力在 PC 本地算**。
+本 SDK 没有 `joint_follow`，而**把它移植到 PC 上会每拍要两次往返**：
 
-```text
-τ = K·(q_cmd − q) + B·(dq_cmd − dq) + G(q)
+| 方案 | 每拍往返 | 实测 | 上限 | 250 Hz |
+| --- | --- | --- | --- | --- |
+| PC 移植 `joint_follow` | `send_mit_all` + `get_gravity` | 3.34 + 3.33 = **6.7 ms** | ~150 Hz | ✗ |
+| **`move_js`** | **1 次** | **3.34 ms** | ~300 Hz | **✓** |
+
+⚠ 根因不是重力，是这套 SDK **每条命令都要等应答**：三条互不相干的命令
+（`get_gravity`/`get_joint_param`/`get_ff_vec`）**都是 3.33 ms**，
+而 `get_state(refresh=False)` 走缓存只要 0.001 ms。3.3 ms 是**固件的一拍** ——
+`LITEARM_CTRL_HZ = 300`（`litearm.h:76`），且 `usb_cmd_process()` 是
+`control_loop_step()` 的一环 ⇒ **命令最快也要等固件的下一拍**。
+
+**`move_js` 本身就是固件里的伺服环**（`ARM_MODE_MOVE_JS` 分支，在这 300 Hz 里跑）：
+
+```c
+v_lim = |dq|;
+q_ref = slew_linear(target_q, q_ref, v_lim·dt);      /* 限速跟随 */
+τ = mit_kp·(q_ref−q) + (mit_kd+kd_extra)·(dq_ref−dq) + G(q_d) + 摩擦;
 ```
 
-- `q_cmd`/`dq_cmd` = `slew_target` 对**外部目标**做速度/加速度限幅后的指令
-- 弹簧-阻尼项由**电机固件的 MIT 环**执行；PC 侧只算重力前馈并下发
-- `G(q)` 取 `arm.model.get_gravity(q)`；`τ_ff` 钳到 `tau_max`（同为固件读回值）
-- 限位墙：`JointLimitWall`（`wall.py`，逐字移植）叠加在 `τ_ff` 上
+⇒ 和 `joint_follow` 是**同一件事**（限速跟随 + 刚度 + 阻尼 + 重力），
+只是计算摊在固件侧 ⇒ **每拍只要一次往返**。
 
-### 5.2 每拍顺序（照搬 `joint_follow` 循环体）
+### 5.2 与 `joint_follow` 的三处已知差异（**用户已知悉并接受**）
 
-```text
-prime()    叠加重力补偿 + 当前位置刚度，防松手前下坠（一次性）
-engage()   以 kp=15 / kd=0.8 托住当前姿态 engage_sec=0.3 s，减少接管冲击
-start()    把 q_cmd/dq_cmd/q_target/dq_target 全部初始化成【当前实测】
-loop:
-    (q_target, dq_target) = target_provider()      # 返回 None ⇒ 保持上一拍的 q_cmd/dq_cmd
-    set_target(q_target, dq_target)
-    step():  读反馈 → 检故障 → slew_target → τ_ff = G(q) + wall → send_mit_all
-```
+| # | `joint_follow` | 本实现（`move_js`） | 处置 |
+| --- | --- | --- | --- |
+| ① | K/B **随帧下发** | K/B **预先写进固件参数** | `apply_joint_gains()` / `restore_joint_gains()` |
+| ② | 有力矩通道（限位墙叠在 `tau_ff`） | **没有** | 位置护栏靠 `clamp_to_limits`（server 的主护栏也是它）。`wall.py` **未接线** |
+| ③ | `dq` **只做**速度前馈 | `dq` **双角色**（还限 `q_ref` 速率） | ⚠ `dq=0` 且目标 ≠ 实测时**固件拒帧** ⇒ `_REJECT_ESCALATE` |
 
-⚠ `target_provider()` 返回 `None` 时**保持上一拍的 `q_cmd/dq_cmd` 不动** ——
-这是"首帧到达前原地不动"的落点（`teleop_manager._target_provider` 把共享目标初始化成
-**从臂自身当前 q**，所以首帧之前它自己不动，绝不返回垃圾值）。
+**③ 的后果与处置**（真机实证）：`slew_target` 收敛后 `dq_cmd=0`，而此刻若从臂实测与
+`q_cmd` 还差 ~0.005 rad 以上，`move_js` 会被回 `ERR{0x03,0x02}`。
+被拒 ⇒ **这一拍没有 kick 看门狗** ⇒ 0.1 s 后 fail-soft ⇒ **臂会垂**。
+⇒ 零星被拒忽略（下一拍恢复），**连续 `_REJECT_ESCALATE` 次即受控接管并上抛**。
 
-### 5.3 参数真值（**逐个照抄**，不得就地调参）
+### 5.3 参数：写进固件，退出还原
+
+`apply_joint_gains(arm, K, B)`：
+
+- `params.set_joint_param(i, K[i], B[i], tau_max)` —— `tau_max` **保持原值**
+- `set_ff_vec(15, [0]*7)` —— **必须清零 `kd_extra`**：`move_js` 的有效阻尼是
+  `mit_kd + kd_extra`，本机 `kd_extra=[6,6,6,6,0,0,0]`。只设 `kd=0.5` 的话
+  J1~J4 实际阻尼是 **6.5（13 倍）**，`kd·dq` 在 5 rad/s 时 32.5 Nm —— 而 J4 的
+  `tau_max` 只有 **21** ⇒ **力矩预算被吃光**。
+
+⚠ **只写 RAM**（**绝不调 `save_params()`** —— 那是整扇区擦写、不可逆）⇒ **断电即还原**。
+⚠ 但**进程崩溃时参数会留在改过的值上**（直到断电）⇒ 恢复放进 `finally`，
+   并提供 `restore_joint_gains()` 显式还原。
+
+### 5.4 参数真值（**逐个照抄，不得就地调参**）
 
 `pylitearm/config/litearm_balanced.yaml` 的 `joint_follow:` 段：
 
@@ -361,57 +381,46 @@ loop:
 | `accel_limit` | `[14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]` |
 | `engage_sec` | `0.3` |
 
-`joint_limit_wall:` 段：`margin_rad 0.02`、
-`stiffness [200,200,150,150,100,60,20]`、`damping [2,2,2,2,2,3,1]`、
-`firmware_kd_extra 0.8`、`slew_rate 0`（关闭）、`tau_max [19.5,19.5,5.25,5.25,1,1,1]`。
+⚠ 注意语义：`speed_limit`/`accel_limit` 在这里是 **PC 侧 `slew_target` 的限幅**，
+**不是**从臂的绝对速度上限 —— 固件的 `MOVE_JS` 分支还会按 `|dq|` 再 slew 一次（差异 ③）。
 
-⇒ **J4 的 `speed_limit` 是 5.0 rad/s。** 早先按 kd 预算推出来的 0.573 rad/s 作废 ——
-那套推导的立足点（`move_js` 刚度由固件定死）在 `joint_follow` 下不成立。
+### 5.5 每拍顺序（照搬 `joint_follow` 的循环体，执行器换掉）
 
-### 5.4 软限位钳位
+```text
+prime    : move_js(实测位姿, dq=0)        # 目标==实测 ⇒ 固件接受；内置刚度+重力【托住】
+engage   : 持续 engage_sec 秒，"托在原地"  # 对应 joint_follow 的低刚度托举段
+start    : q_cmd = dq_cmd = q_target = 当前实测
+loop:
+    q_target = target_provider()          # 返回 None ⇒ 保持上一拍（照搬）
+    q_cmd, dq_cmd = slew_target(q_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt)
+    move_js(q_cmd, dq_cmd)                # ← 只有这一次往返
+    （被拒 ⇒ 计数；连续 _REJECT_ESCALATE 次 ⇒ hold_at_current + 上抛）
+```
+
+### 5.6 软限位钳位
 
 对应 `teleop_manager._read_safe_limits()` + 收帧时的 `np.clip`：
 
 1. 读**固件**软限位 —— `arm.params.all_joint_params()` 的 `q_min`/`q_max`
    （⚠ 本 SDK **没有 `arm.kin`**，server 是从 `kin` 或配置读的）
 2. 两侧各内缩 `margin`（默认 `0.01`，取自 server 的 `safety.joint_limit_margin_rad`）
-3. 收到帧后 `clip(q, lo, hi)` 再交给 `set_target`
+3. 收到帧后 `clamp_to_limits` 再交给 `slew_target`
 
-⚠ 限位是 `joint_follow` **唯一的位置安全护栏**（SDK 内部不校验关节限位）。
-拿不到就**抛**，绝不退回兜底哨兵 —— server 命中兜底会大声告警，本仓直接拒启动。
+⚠ 这是**主**位置护栏（server 也是）。`move_js` 的固件入口另有 `clampf(q, q_min, q_max)`。
 
-### 5.5 watchdog 与退出（照搬）
+### 5.7 watchdog 与退出（照搬）
 
 - `watchdog_ms = 200`（server 的默认值）。**收到首帧之后**才生效
 - 超时 ⇒ 计数 + **结束伺服环**，**不自动重连**
-- ⚠ 永远收不到首帧时 watchdog 不会触发（它是从"上一次收到"算的），
-  server 另有一条 `max(5, 3×watchdog)` 的**首帧诊断告警**，只告警不停 —— 照搬
+- ⚠ 永远收不到首帧时 watchdog 不会触发（它从"上一次收到"算），server 另有一条
+  `max(5, 3×watchdog)` 的**首帧诊断告警**，只告警不停 —— 照搬
 
-### 5.6 收尾（`request_stop()` 的对应物）
+### 5.8 收尾（`request_stop()` 的对应物）
 
-本 SDK **没有 `arm.request_stop()`**。收尾 = 用 `movej(实测位姿)` 让固件的 S 曲线 +
-`ht_on` 接管 —— 即 `servo.hold_via_movej()`。
+本 SDK **没有 `arm.request_stop()`**。收尾 = `servo.hold_at_current()`：
+用 `movej(实测位姿)` 让固件的 S 曲线 + `ht_on` 接管。
 
 ⛔ **绝不 `disable()`**：失能会让臂在自重下自由落体（spec §7.3）。
-
-### 5.7 与 pylitearm 的接口适配（**只有这几处**）
-
-| pylitearm | 本仓 | 说明 |
-| --- | --- | --- |
-| `hw.send_mit(K, B, q, dq, tau)` | `arm.send_mit_all(q, dq, K, B, tau)` | ⚠ **参数顺序不同** |
-| `self.dyn.gravity(q)` | `arm.model.get_gravity(q).value` | 见下 ⚠⚠ |
-| `hw.read_q_dq()` | `st.q` / `st.dq`（`get_state`） | SDK 已有独立读线程 |
-| `hw.faulted()` | `st.faulted` / `st.joint_fault` | |
-| `hw.assert_operational(measured_overspeed_factor=inf, skip_position=True)` | **丢弃** | 那两个实参的意思就是"把位置与超速护栏都关掉"，**丢弃即等价** |
-| `hw.emergency_hold_healthy()` | `movej(实测位姿)` | 见 §5.6 |
-| `arm.request_stop()` | 同上 | 本 SDK 无此原语 |
-| `arm.zero_gravity(on_sample=)` | `arm.zero_g_start()` + 轮询 | 见 §6 |
-
-⚠⚠ **`G(q)` 是唯一有性能后果的偏离。** pylitearm 在**本地**用 Pinocchio 算（亚毫秒）；
-本仓走 `model.get_gravity` 的**串口往返**。**实测 3.31 ms/次**（`servo.measure_gravity_cost`）
-⇒ 理论上限 ~302 Hz，**200 Hz（5 ms 周期）太紧**（光重力就吃掉 66%）。
-⇒ **实务环频取 100 Hz**，并把 `G(q)` 的耗时作为可观测项持续盯住。
-这条是"照抄不来"的地方，必须显式记着。
 
 ---
 
