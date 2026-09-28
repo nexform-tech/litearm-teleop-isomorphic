@@ -196,29 +196,33 @@ class _ArmedForSlave:
         pass
 
 
-def test_slave_aligns_BEFORE_writing_the_follow_gains(monkeypatch):
-    """⚠⚠ **对齐必须排在 `apply_joint_gains` 之前。**
+def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch):
+    """⚠⚠ 从臂的顺序：**对齐 → 跟随**，而且**一个固件参数都不写**（用户裁决 2026-09-28）。
 
-    本路线把 K/B **写进固件**（`move_js` 没有随帧下发的通道），而那会把 `mit_kp`
-    从出厂的 400 降到 25 —— 而 `movej` 用的就是 `mit_kp`。软 16 倍的位置环
-    **撑不住、到不了位**，`movej` 会撞 `move_timeout` 报「未到位, 超时 3.0s」（真机踩过）。
+    「不写参数」是硬要求：本路线曾把 `mit_kp` 从出厂的 400 写到 25，而 **`movej` 用的就是
+    `mit_kp`** —— 软 16 倍的位置环撑不住、到不了位，`movej` 撞 `move_timeout`
+    报「未到位, 超时 3.0s」，臂还会**瞬间变软**（真机踩过两次）。
 
-    判别力：把两句对调，本用例会红。
+    判别力：谁要是加回 `set_joint_param`/`set_ff_vec`，本用例会红。
     """
     order = []
     monkeypatch.setattr(servo, "align_to_master",
                         lambda *a, **k: (order.append("align"), [0.0] * 7)[1])
-    monkeypatch.setattr(servo, "apply_joint_gains",
-                        lambda *a, **k: (order.append("gains"), servo.JointGains())[1])
     monkeypatch.setattr(servo, "follow",
                         lambda *a, **k: (order.append("follow"), True)[1])
     monkeypatch.setattr(arm_worker.link, "Connector",
                         lambda *a, **k: _FakeEndpoint())
     monkeypatch.setattr(arm_worker, "read_safe_limits", lambda arm, **k: _FakeLimits())
 
-    w = ArmWorker(role=ROLE_SLAVE)
-    w._arm = _ArmedForSlave()
-    w._run_slave()
+    class _NoParamsArm(_ArmedForSlave):
+        def __getattr__(self, name):
+            if name in ("params", "set_joint_param", "set_ff_vec", "get_ff_vec",
+                        "set_joint_limits", "set_ff_mask", "save_params"):
+                raise AssertionError(f"⛔ 从臂路径不许碰固件参数，却访问了 {name!r}")
+            raise AttributeError(name)
 
-    assert order == ["align", "gains", "follow"], (
-        f"顺序必须是 对齐 → 改刚度 → 跟随，实际 {order}")
+    w = ArmWorker(role=ROLE_SLAVE)
+    w._arm = _NoParamsArm()
+    w._run_slave()
+    assert order == ["align", "follow"], f"顺序必须是 对齐 → 跟随，实际 {order}"
+

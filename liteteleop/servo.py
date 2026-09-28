@@ -13,20 +13,33 @@ litearm-server 的从臂用 `joint_follow` → `send_mit`：**K/B 随帧下发�
 
 ⇒ **每拍只要一次往返（3.3 ms）** ⇒ **250 Hz 装得下**，而且**不用改固件**。
 
-## 与 `joint_follow` 的三处已知差异（用户已知悉并接受）
+## 为什么没有 K/B（用户裁决 2026-09-28）
+
+litearm-server 的 `K=25` / `B=0.5` 走 `send_mit` **随帧下发**。`move_js` **没有那条通道**，
+要改只能写固件的 `mit_kp`/`mit_kd`。**但那是碰不得的**：
+
+- `movej` 用的就是 `mit_kp`。把它从出厂的 **400 降到 25**（软 16 倍），位置环**撑不住、
+  到不了位** ⇒ `movej` 撞 `move_timeout` 报「未到位, 超时 3.0s」（**真机踩过**）
+- 臂会**瞬间变软**（真机也确实如此）
+
+⇒ 写进去还得在**每一句 `movej` 之前还原**，一整套耦合。用户裁决：**不改刚度，用出厂值**。
+
+**代价（已接受）**：刚度/阻尼不再是 litearm-server 的 25/0.5，而是固件的
+`mit_kp`（J1/J2 400、J3/J4 300、腕部 50）与 `mit_kd + kd_extra`（J1~J4 5+6=11、腕部 2.5）。
+**比 litearm-server 硬得多**，跟踪更紧、手感更"僵"，但**行为可预期**。
+
+## 与 `joint_follow` 的已知差异（用户已知悉并接受）
 
 | # | `joint_follow` | 本实现（`move_js`） | 处置 |
 | --- | --- | --- | --- |
-| ① | K/B **随帧下发** | K/B **预先写进固件参数** | `apply_joint_gains()`，退出时 `restore_joint_gains()` |
-| ② | 有力矩通道（限位墙叠在 `tau_ff`） | **没有** | 位置护栏靠 `np.clip`-等价的 `clamp_to_limits`（server 的主护栏也是它） |
-| ③ | `dq` **只做**速度前馈 | `dq` **双角色**（还限 `q_ref` 速率） | ⚠ `dq=0` 且目标 ≠ 实测时**固件会拒帧** —— 见 `_REJECT_ESCALATE` |
+| ① | K/B **随帧下发**（25 / 0.5） | **用固件出厂刚度**（400/300/50，阻尼 11/2.5） | 见上：改固件参数会连带改坏 `movej` |
+| ② | 有力矩通道（限位墙叠在 `tau_ff`） | **没有** | 位置护栏靠 `clamp_to_limits`（server 的主护栏也是它） |
+| ③ | `dq` **只做**速度前馈 | `dq` **双角色**（还限 `q_ref` 速率） | ⚠ `dq=0` 且目标 ≠ 实测时**固件会拒帧** ⇒ 退路 + `_REJECT_ESCALATE` |
 
-## ⚠⚠ 参数写入的安全性质
+## ⚠ 本模块**不写任何固件参数**
 
-- `set_joint_param` / `set_ff_vec` **只写 RAM**，**不调 `save_params()`** ⇒ **断电即还原**，
-  不会把臂的出厂配置改坏（⛔ 绝不调 `save_params()` —— 那是整扇区擦写，不可逆）
-- 但**进程崩溃时参数会留在改过的值上**（直到断电）⇒ 必须提供显式恢复路径，
-  并把"退出恢复"放进 `finally`
+不碰 `set_joint_param` / `set_ff_vec` / `save_params`。⇒ 没有"崩了之后参数留在改过的值上"
+这类问题，也没有"哪句 `movej` 必须先还原"的顺序耦合。
 
 控制律的**参考生成**（`slew_target`）、**参数真值**、**watchdog**、**对齐**、**钳位**
 仍然逐条照 litearm-server，见 spec §5、§9.1。
@@ -46,16 +59,18 @@ log = logging.getLogger("liteteleop.servo")
 
 __all__ = [
     "AlignTooFar", "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
-    "align_to_master", "DEFAULT_K", "DEFAULT_B", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
-    "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "JointGains", "apply_joint_gains",
-    "restore_joint_gains", "hold_at_current", "follow", "measure_move_js_cost",
+    "align_to_master", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
+    "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
+    "measure_move_js_cost",
 ]
 
 # ── 参数真值 ────────────────────────────────────────────────────────────────
-# ⛔ 逐个照抄 `pylitearm/config/litearm_balanced.yaml` 的 `joint_follow:` 段
-#    （litearm-server 真机验证过的那一套），**没有就地调参**。
-DEFAULT_K = [25.0] * N_JOINTS
-DEFAULT_B = [0.5] * N_JOINTS
+# ⛔ 限速/限加速逐个照抄 `pylitearm/config/litearm_balanced.yaml` 的 `joint_follow:` 段。
+#
+# ⚠⚠ **K/B 不在这里** —— 见模块 docstring「为什么没有 K/B」。
+#    litearm-server 的 K=25 / B=0.5 走 `send_mit` **随帧下发**；`move_js` **没有那条通道**，
+#    要改只能写固件的 `mit_kp`/`mit_kd`，而那会**连带改坏 `movej`**（`movej` 用的就是
+#    `mit_kp`，软 16 倍的位置环撑不住、到不了位）。用户裁决：**不改刚度，用出厂值**。
 DEFAULT_SPEED_LIMIT = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]
 DEFAULT_ACCEL_LIMIT = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]
 DEFAULT_ENGAGE_SEC = 0.3
@@ -65,10 +80,6 @@ DEFAULT_ENGAGE_SEC = 0.3
 #: ⚠ **与主臂的 `pub_hz = 200` 是两个不同的数**，别混。
 #: ⚠ `move_js` 一次往返实测 ≈3.3 ms ⇒ 周期 4 ms 占 83%，**250 装得下但没有余量**。
 DEFAULT_HZ = 250.0
-
-#: `emit_reason` 的 item：`kd_extra`（τ 域软件微分阻尼）。见 spec §10 陷阱 #8：
-#: 它在 **0x26 向量表**里，要用 `get_ff_vec(15)` 读，**不是** `get_ff_scalar(15,·)`。
-_FF_VEC_KD_EXTRA = 15
 
 #: **对齐**：照搬 `teleop_manager` 的三个默认值。
 #: `align_speed` 是"多快挪到主臂位姿"，不是跟随速度 —— 它必须慢。
@@ -89,56 +100,6 @@ ALIGN_WARN_DELTA = 0.30
 #: 零星一两次没关系（下一拍就恢复），连续不停就是真问题，必须让人知道。
 _REJECT_ESCALATE = 20
 
-
-@dataclass
-class JointGains:
-    """改参数前**存下来的原值**，用于退出时逐字还原。"""
-
-    kp: List[float] = field(default_factory=list)
-    kd: List[float] = field(default_factory=list)
-    tau_max: List[float] = field(default_factory=list)
-    kd_extra: List[float] = field(default_factory=list)
-    applied: bool = False
-
-
-def apply_joint_gains(arm, K: Sequence[float], B: Sequence[float]) -> JointGains:
-    """把 `K`/`B` 写进固件的关节参数 —— `joint_follow` 的"K/B 随帧下发"的替代。
-
-    ⚠ 为什么必须连 `kd_extra` 一起改：`move_js` 的有效阻尼是
-    **`mit_kd + kd_extra`**，本机 `kd_extra = [6,6,6,6,0,0,0]`。
-    只设 `kd=0.5` 的话，J1~J4 的实际阻尼是 **6.5（13 倍）**，`kd·dq` 在 5 rad/s 时
-    是 32.5 Nm —— 而 J4 的 `tau_max` 只有 21 ⇒ **力矩预算被吃光**。
-
-    ⚠ **只写 RAM**（不调 `save_params()`）⇒ 断电即还原。
-    """
-    jp = arm.params.all_joint_params()
-    saved = JointGains(
-        kp=[float(p.kp) for p in jp],
-        kd=[float(p.kd) for p in jp],
-        tau_max=[float(p.tau_max) for p in jp],
-        kd_extra=[float(x) for x in arm.get_ff_vec(_FF_VEC_KD_EXTRA).value],
-    )
-    for i in range(N_JOINTS):
-        arm.params.set_joint_param(i, float(K[i]), float(B[i]), saved.tau_max[i])
-    arm.set_ff_vec(_FF_VEC_KD_EXTRA, [0.0] * N_JOINTS)
-    saved.applied = True
-    log.info("已写入关节增益：K=%s B=%s，并清零 kd_extra", list(K), list(B))
-    return saved
-
-
-def restore_joint_gains(arm, saved: Optional[JointGains]) -> None:
-    """把 `apply_joint_gains` 存下的原值逐字写回。幂等，可重复调。"""
-    if saved is None or not saved.applied:
-        return
-    try:
-        for i in range(N_JOINTS):
-            arm.params.set_joint_param(i, saved.kp[i], saved.kd[i], saved.tau_max[i])
-        arm.set_ff_vec(_FF_VEC_KD_EXTRA, saved.kd_extra)
-        saved.applied = False
-        log.info("已还原关节增益 kp/kd/tau_max 与 kd_extra")
-    except Exception:
-        log.exception("⚠ 还原关节增益失败 —— 参数会留在改过的值上，"
-                      "直到断电或手工还原！")
 
 
 def hold_at_current(arm) -> None:
@@ -202,22 +163,15 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
            K=None, B=None, speed_limit=None, accel_limit=None,
            engage_sec: float = DEFAULT_ENGAGE_SEC, hz: float = DEFAULT_HZ,
            should_stop: Callable[[], bool] = lambda: False,
-           duration_s: Optional[float] = None,
-           gains: Optional[JointGains] = None) -> bool:
+           duration_s: Optional[float] = None) -> bool:
     """从臂跟随环。**参考生成与调用序照抄 `joint_follow`，执行器换 `move_js`。**
 
     `target_provider()` 返回**目标关节角序列**；返回 `None` 时**保持上一拍的
     `q_cmd/dq_cmd` 不动**（照搬 `joint_follow` 那一支 —— "首帧到达前原地不动"）。
 
-    ⚠ `gains`：传入 `apply_joint_gains()` 的返回值，则**不**在这里改参数
-    （调用方负责生命周期）。传 `None` 时本函数自己改、自己在 `finally` 里还原。
+    ⚠ **不改任何固件参数** —— K/B 用固件出厂的 `mit_kp`/`mit_kd`(+`kd_extra`)。
     """
-    own_gains = gains is None
-    saved = gains
     try:
-        if own_gains:
-            saved = apply_joint_gains(arm, K or DEFAULT_K, B or DEFAULT_B)
-
         sp = list(speed_limit or DEFAULT_SPEED_LIMIT)
         ac = list(accel_limit or DEFAULT_ACCEL_LIMIT)
         dt_nom = 1.0 / max(hz, 1.0)
@@ -310,8 +264,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                 next_tick = time.monotonic() + dt_nom
         return True
     finally:
-        if own_gains:
-            restore_joint_gains(arm, saved)
+        pass
 
 
 # ────────────────────────── 对齐（照搬 `_do_align`）──────────────────────────
