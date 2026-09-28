@@ -90,6 +90,29 @@ __version__ = "0.0.0"
 
 `tests/__init__.py`：空文件（0 字节）。
 
+`pyproject.toml` —— **本仓当前没有这个文件**，本步创建（只放最小可用元数据，不加构建后端；
+本阶段只是包，还不发版）：
+
+```toml
+[project]
+name = "liteteleop"
+version = "0.0.0"
+description = "LiteArm 同构遥操上位机（主臂零重力拖动 → zenoh 点对点 → 从臂 move_js 跟随）"
+requires-python = ">=3.10"
+dependencies = ["zenoh>=1.7", "PyQt5>=5.15"]      # PyQt5 阶段二才用，先声明
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: 慢测（起子进程 / 数十秒），用 -m \"not slow\" 跳过"]
+```
+
+> ⚠ `version = "0.0.0"` 是**占位**：仓规 `AGENTS.md` 规定版本由 semantic-release 从 git tag 推导，
+> **这个字段永不手工改**。
+> ⚠ `markers` 与 `testpaths` 在这里一次配好，Task 4 只做确认、不再改此文件。
+
 - [ ] **Step 3: 确认 pytest 能发现空套件**
 
 ```bash
@@ -179,12 +202,10 @@ S5_DRIFT_SEC = 30.0
 
 results: list[tuple] = []
 
-
 def check(name: str, ok: bool, detail: str = "") -> bool:
     results.append((name, ok, detail))
     print(f"  {'✓' if ok else '✗'} {name}" + (f"  [{detail}]" if detail else ""), flush=True)
     return ok
-
 
 def read_q(arm):
     """读实测 q（**等一帧新的**）。⚠ get_state() 返回 Msg 信封，取 .value（spec §2.2）。"""
@@ -193,14 +214,12 @@ def read_q(arm):
         raise RuntimeError("取不到状态帧")
     return list(st.q)
 
-
 def read_q_cached(arm):
     """读缓存里的最近一帧 q —— **不取帧**，用于 100 Hz 紧循环（取帧会拖垮发送节拍）。"""
     st = arm.get_state(refresh=False).value
     if st is None:
         raise RuntimeError("状态缓存为空（链路刚起？）")
     return list(st.q)
-
 
 def spin(arm, q, dq, secs: float) -> None:
     """按 100 Hz 喂 move_js，持续 secs 秒。q/dq 为序列。"""
@@ -214,7 +233,6 @@ def spin(arm, q, dq, secs: float) -> None:
         nxt += DT
         if nxt < time.monotonic():
             nxt = time.monotonic() + DT
-
 
 def s1_dq_zero_freezes(arm, q0):
     print("\n=== S1: dq=0 发偏移 —— 按控制律应【纹丝不动】 ===", flush=True)
@@ -235,20 +253,26 @@ def s1_dq_zero_freezes(arm, q0):
     moved = max(abs(qs[-1][i] - qs[0][i]) for i in range(arm.n))
     check(f"S1 dq=0 时臂没动 (|Δq| < {S1_MOVE_TOL})", moved < S1_MOVE_TOL, f"{moved:.5f} rad")
 
+def _rate_probe(arm, q0, dq_cmd, offset):
+    """发 `dq=dq_cmd` 的偏移，量【运动进行中】的实测速率。
 
-def s2_dq_sets_rate(arm, q0):
-    print(f"\n=== S2: dq={S2_DQ} 应让实测速率 ≈{S2_DQ} rad/s ===", flush=True)
+    ⛔ **测量窗口必须落在运动期间**：走完 `offset/dq_cmd` 秒后臂就停了，
+    在停住之后量只会得到 0 —— 本计划第一版就是这么错的（命令 0.30 rad/s、0.2 rad
+    在 **0.667 s** 走完，而窗口取的是 1.25~1.75 s）。
+    """
     tgt = [x for x in q0]
-    tgt[1] += S2_OFFSET
-    # 先回到起点，避免上一节的残留
+    tgt[1] += offset
     arm.movej(q0, speed=ALIGN_SPEED)
     time.sleep(0.3)
+    move_s = offset / max(dq_cmd, 1e-6)
     qs, ts = [], []
     t0 = time.monotonic()
     nxt = t0 + DT
-    while time.monotonic() - t0 < 3.0:
-        arm.move_js(tgt, [S2_DQ] * arm.n)
+    while time.monotonic() - t0 < move_s * 0.8:      # 只跑到走完的 80%
+        arm.move_js(tgt, [dq_cmd] * arm.n)
         st = arm.get_state(refresh=False).value
+        if st is None:
+            raise RuntimeError("状态缓存为空 —— 见 spec §5.1：拿不到实测 q 不许下发/判据")
         qs.append(list(st.q))
         ts.append(time.monotonic())
         r = nxt - time.monotonic()
@@ -257,13 +281,26 @@ def s2_dq_sets_rate(arm, q0):
         nxt += DT
         if nxt < time.monotonic():
             nxt = time.monotonic() + DT
-    # 取中段（避开起步加速与末段到位的减速）
-    k = len(qs) // 2
-    lo, hi = max(0, k - 25), min(len(qs) - 1, k + 25)
-    dq_meas = (qs[hi][1] - qs[lo][1]) / max(ts[hi] - ts[lo], 1e-6)
-    ok = abs(dq_meas - S2_DQ) <= S2_RATE_TOL * S2_DQ
-    check(f"S2 实测速率 ≈ {S2_DQ} rad/s (±{S2_RATE_TOL:.0%})", ok, f"{dq_meas:.3f} rad/s")
+    # 用【后 60%】的窗口：跳过头几拍的伺服起步滞后
+    lo = max(0, int(len(qs) * 0.4))
+    hi = len(qs) - 1
+    moved = qs[hi][1] - qs[lo][1]
+    return moved / max(ts[hi] - ts[lo], 1e-6), moved
 
+def s2_dq_sets_rate(arm, q0):
+    print("\n=== S2: dq 幅值 → 实测走位速率（含饱和） ===", flush=True)
+    for dq_cmd, offset in ((S2_DQ, S2_OFFSET), (1.0, 0.5)):
+        rate, moved = _rate_probe(arm, q0, dq_cmd, offset)
+        # ⭐ 先证明"确实动了" —— 否则速率≈0 也能"接近"某些期望值，判据会失去意义
+        check(f"S2 dq={dq_cmd} 确实驱动了运动", abs(moved) > 0.3 * offset,
+              f"位移 {moved:.4f} rad")
+        ok = abs(rate - dq_cmd) <= S2_RATE_TOL * dq_cmd
+        check(f"S2 dq={dq_cmd} 时实测速率 ≈{dq_cmd} rad/s (±{S2_RATE_TOL:.0%})",
+              ok, f"{rate:.3f} rad/s")
+    # 饱和：dq 远高于 speed_limit 时实测速率被固件的 speed_limit 封住（本机 J1=2.0）
+    rate, _ = _rate_probe(arm, q0, 5.0, 1.0)
+    check("S2 dq=5.0 被 speed_limit 封顶（实测 < 3.0 rad/s）", rate < 3.0,
+          f"{rate:.3f} rad/s（J1 speed_limit=2.0）")
 
 def s3_high_speed_feedforward(arm, q0):
     print(f"\n=== S3: 遥操速度量级（正弦 {S3_AMP}rad @{S3_HZ}Hz）下的速度前馈 ===", flush=True)
@@ -306,7 +343,6 @@ def s3_high_speed_feedforward(arm, q0):
     check("S3 无自激（后半段误差峰峰值未显著放大）", pp2 <= pp1 * 2.0 + 0.01,
           f"前半 {pp1:.4f} / 后半 {pp2:.4f}")
 
-
 def _slew(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
     """spike 内联版 slew_target —— 与 pylitearm/control/joint_follow.py:45-88 逐字同构。
 
@@ -341,7 +377,6 @@ def _slew(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
             dq_cmd[i] = v
     return q_cmd, dq_cmd
 
-
 def s4_ack_rate(arm, q0):
     print(f"\n=== S4: {SEND_HZ:.0f} Hz move_js 连续 {S4_SEC:.0f}s 的 ACK 返回率 ===", flush=True)
     sent, ack_fail, worst_ms = 0, 0, 0.0
@@ -372,7 +407,6 @@ def s4_ack_rate(arm, q0):
     # _cmd 超时是 1.2 s ⇒ 任何一次超时都会表现为一帧耗时逼近 1200 ms
     check("S4 无 1.2s 级卡顿", worst_ms < 1200.0, f"最坏 {worst_ms:.1f} ms")
 
-
 def s5_stop_ab(arm, q0):
     print(f"\n=== S5: 收尾 A/B —— 只停发 vs movej(q_now)，各录 {S5_DRIFT_SEC:.0f}s ===", flush=True)
 
@@ -398,7 +432,6 @@ def s5_stop_ab(arm, q0):
     print(f"    B movej(q_now): 漂移 {d_b:.4f} rad", flush=True)
     check("S5 B（movej 收尾）漂移显著小于 A（只停发）", d_b < d_a * 0.5,
           f"A={d_a:.4f} B={d_b:.4f} 比值 {d_b / max(d_a, 1e-9):.2f}")
-
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
@@ -453,14 +486,17 @@ def main(argv=None) -> int:
             except Exception as e:                  # noqa: BLE001
                 print(f"⚠ 收尾 movej 失败: {e}", flush=True)
 
-    print("\n================ 结果 ================", flush=True)
-    for name, ok, detail in results:
-        print(f"{'✓' if ok else '✗'} {name}" + (f"  [{detail}]" if detail else ""), flush=True)
-    n_fail = sum(1 for _, ok, _ in results if not ok)
-    print(f"\n{len(results) - n_fail}/{len(results)} 通过", flush=True)
-    arm.close()          # ⚠ 必须 close（spec §7.3）
+    # ⚠ arm.close() 必须**无条件**执行（spec §7.3）：中途抛异常也不能跳过它，
+    # 否则进程退出会挂死。
+    try:
+        print("\n================ 结果 ================", flush=True)
+        for name, ok, detail in results:
+            print(f"{'✓' if ok else '✗'} {name}" + (f"  [{detail}]" if detail else ""), flush=True)
+        n_fail = sum(1 for _, ok, _ in results if not ok)
+        print(f"\n{len(results) - n_fail}/{len(results)} 通过", flush=True)
+    finally:
+        arm.close()
     return 1 if n_fail else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
@@ -521,14 +557,39 @@ PYTHONPATH=/home/llx/litearm-python/src python3 scripts/spike_move_js.py --skip 
 
 ## 与 spec 的关系
 
-- S1/S2/S4/S5 通过 ⇒ spec §5.3 的收尾序列与 §2.3(b) 的三段表**由 `[源码]` 升级为 `[实测]`**。
+- S1 通过 ⇒ spec §2.3(a) 的「`dq=0` 冻结」**由 `[源码]` 升级为 `[实测]`**。
+- ⛔ **本 spike 不覆盖**：spec §2.3(b) 的刚度三段表（S5 只量了 A/B 净漂移差，没量刚度）、
+  spec §5.3 的**主臂**收尾序列（脚本从不进零重力，`zero_g_*`/`park` 一次没调）、
+  §2.3(d) 急停的失能后果。**这三项留待另一次真机验证**，别顺手升级它们。
 - **S3 是本轮的核心未知**（spec §11）。若 S3 未通过 ⇒ **停下来找用户裁决**：
   spec §5.1 的 `dq` 公式要改，候选退路见 spec §11 的 S3 段落。
 ```
 
-- [ ] **Step 5: 若 S1~S5 全绿，回写 spec 的来源等级**
+- [ ] **Step 5: 回写 spec 的来源等级（**只写 spike 真正验过的东西**）**
 
-把 spec §2.3(b) 三段表与 §5.3 标题里的 `[源码]` 改成 `[实测]`，并在 §2.3 顶部补一行指向本报告。
+Step 4 的结论**只覆盖下表**，别扩大：
+
+| 由 spike 升级为 `[实测]` | 依据 |
+| --- | --- |
+| `dq = 0` ⇒ 该轴冻结（`\|Δq\| < 0.005 rad`） | S1 |
+| `dq` 幅值 ⇒ 走位速率；超过 `speed_limit` 后饱和 | S2 |
+| 遥操速度量级（**>0.5 rad/s**）下速度前馈的跟踪误差与稳定性 | S3 |
+| 100 Hz `move_js` 连续 30 s 的 ACK 返回率 | S4 |
+| **从臂**收尾：`movej(q_now)` 的漂移显著小于只停发 | S5 |
+
+⛔ **spike 没测、必须保持 `[源码]` 的**（**别顺手一起改**，那是伪造证据）：
+
+- **§2.3(b) 的刚度三段表**（1.0× / 0.6× / 2× 与 `ht_on` 的重力前馈）—— S5 只量了 A/B 的
+  **净漂移差**，既没量刚度，也没把 1.0× 与 0.6× 两段分开量。
+- **§5.3 的「主臂」收尾序列**（`park()` → `zero_g_stop()` → `movej`）—— 本脚本**从不进零重力**
+  （grep 可见：`zero_g_start`/`zero_g_stop`/`park` 一次都没调），主臂那条路径**一行都没验**。
+- **急停的失能后果**（§2.3(d)）—— 没测，也不该在 spike 里测。
+
+⇒ 所以：**§2.3(b) 与 §5.3 里没有 `[源码]` 标记可改** —— 标记只挂在 §2.2 / §2.3 的
+**节标题**上（grep 可查）。本次唯一该改的是 **§2.3(a) 那条「`dq=0` 冻结」**，
+从 `[源码]` 升级为 `[实测]`，并在 §2.3(a) 处加一行指向本报告。
+**主臂收尾与刚度表留待另一次真机验证**（阶段二，或单独一轮）—— 在 spec 里显式记一笔，
+不要让它静默地一直挂着 `[源码]` 而没人知道。
 
 - [ ] **Step 6: 提交**
 
@@ -568,7 +629,6 @@ import pytest
 
 from liteteleop import wire
 
-
 def test_golden_bytes_n7():
     """n=7 的黄金字节 —— 小端、字段顺序、70 B 全长，全部钉死。"""
     q = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
@@ -584,14 +644,12 @@ def test_golden_bytes_n7():
     )
     assert len(got) == 70
 
-
 def test_golden_bytes_n1():
     """变长关节数：n=1 也成立（1J 台架/单轴测试用）。"""
     got = wire.encode([0.25], [0.5], ts=1.0, seq=7)
     assert got == struct.pack("<BB1f1fdI", 1, 1, 0.25, 0.5, 1.0, 7)
     assert got.hex() == "01010000803e0000003f000000000000f03f07000000"
     assert len(got) == 22
-
 
 def test_roundtrip_values():
     q = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7]
@@ -603,20 +661,17 @@ def test_roundtrip_values():
     assert f.ts == 99.25
     assert f.seq == 65535
 
-
 def test_reject_bad_version():
     bad = bytearray(wire.encode([0.0] * 7, [0.0] * 7, ts=0.0, seq=0))
     bad[0] = 2                                   # version 改成不认识的
     with pytest.raises(wire.WireError, match="协议版本"):
         wire.decode(bytes(bad), expect_n=7)
 
-
 def test_reject_n_mismatch():
     """帧里 n=3、本端 7 ⇒ 必须拒收，不许照 n 去解一帧垃圾。"""
     payload = wire.encode([0.0] * 3, [0.0] * 3, ts=0.0, seq=0)
     with pytest.raises(wire.WireError, match="关节数不符"):
         wire.decode(payload, expect_n=7)
-
 
 def test_reject_short_frame():
     payload = wire.encode([0.0] * 7, [0.0] * 7, ts=0.0, seq=0)
@@ -625,13 +680,11 @@ def test_reject_short_frame():
     with pytest.raises(wire.WireError, match="帧太短"):
         wire.decode(b"\x01", expect_n=7)
 
-
 def test_reject_bad_n_at_encode():
     with pytest.raises(wire.WireError, match="关节数"):
         wire.encode([], [], ts=0.0, seq=0)
     with pytest.raises(wire.WireError, match="长度不符"):
         wire.encode([0.0] * 7, [0.0] * 6, ts=0.0, seq=0)
-
 
 def test_bad_n_in_frame():
     """帧里 n=0 / n=200 ⇒ 拒收（防越界与畸形头）。"""
@@ -690,10 +743,8 @@ VERSION = 1
 #: 关节数上界 —— 防畸形头导致的越界分配。7 关节臂 + 余量。
 MAX_JOINTS = 32
 
-
 class WireError(ValueError):
     """帧不合法（版本不符 / 长度不符 / 关节数不符）。"""
-
 
 @dataclass(frozen=True)
 class Frame:
@@ -708,15 +759,12 @@ class Frame:
     def n(self) -> int:
         return len(self.q)
 
-
 def _fmt(n: int) -> str:
     return f"<BB{n}f{n}fdI"
-
 
 def frame_size(n: int) -> int:
     """按关节数算帧长（收端用来校验长度）。"""
     return struct.calcsize(_fmt(n))
-
 
 def encode(q: Sequence[float], dq: Sequence[float], ts: float, seq: int) -> bytes:
     """编码一帧。`q`/`dq` 长度必须相等且在 `1..MAX_JOINTS`。"""
@@ -726,7 +774,6 @@ def encode(q: Sequence[float], dq: Sequence[float], ts: float, seq: int) -> byte
     if not 1 <= n <= MAX_JOINTS:
         raise WireError(f"关节数 {n} 越界 (1..{MAX_JOINTS})")
     return struct.pack(_fmt(n), VERSION, n, *q, *dq, float(ts), int(seq) & 0xFFFFFFFF)
-
 
 def decode(payload: bytes, expect_n: int | None = None) -> Frame:
     """解码一帧。
@@ -768,10 +815,16 @@ Expected: 全绿（`passed`，无 `failed`/`error`）
 ```bash
 # 把字节序从 '<' 改成 '>'，测试必须红 —— 这正是往返测试抓不到的那个错
 sed -i 's/return f"<BB{n}f{n}fdI"/return f">BB{n}f{n}fdI"/' liteteleop/wire.py
+find . -name __pycache__ -prune -exec rm -rf {} +      # ⚠ 见下方说明
 python3 -m pytest tests/test_wire.py -q
 sed -i 's/return f">BB{n}f{n}fdI"/return f"<BB{n}f{n}fdI"/' liteteleop/wire.py
+find . -name __pycache__ -prune -exec rm -rf {} +
 python3 -m pytest tests/test_wire.py -q
 ```
+
+> ⚠ **改完必须清 `__pycache__`**：CPython 的 `.pyc` 头部存的是 mtime（**整秒**）+ 文件大小。
+> 同尺寸的就地修改（如 `<` → `>`）若落在与上次编译**同一秒**内，变异**不会被发现**，
+> 测试照样全绿（实测复现过）。不要用"看起来红了"当证据。
 
 Expected: 第一次 **FAILED**（黄金字节与变长测试都红），第二次全绿。
 **这一步不能省** —— 它证明这组判据真的在测字节序，而不是自我印证。
@@ -815,7 +868,6 @@ from liteteleop import link
 
 KEY = "litearm/teleop/test"
 
-
 def _free_port() -> int:
     import socket
     s = socket.socket()
@@ -823,7 +875,6 @@ def _free_port() -> int:
     p = s.getsockname()[1]
     s.close()
     return p
-
 
 def test_roundtrip_bytes():
     """端到端收发：100 帧逐字节全等。"""
@@ -844,7 +895,6 @@ def test_roundtrip_bytes():
     finally:
         s.close()
         m.close()
-
 
 def test_sustained_100hz_no_loss():
     """100 Hz 持续 2 s 零丢包 —— spec §2.1 实测过的能力，回归钉住。"""
@@ -875,7 +925,6 @@ def test_sustained_100hz_no_loss():
         s.close()
         m.close()
 
-
 def test_matching_flag():
     """主臂端能拿到 matching 布尔（⚠ 是布尔不是计数，spec §8）。"""
     port = _free_port()
@@ -892,7 +941,6 @@ def test_matching_flag():
             s.close()
     finally:
         m.close()
-
 
 @pytest.mark.slow
 def test_close_is_mandatory_for_exit():
@@ -959,7 +1007,6 @@ __all__ = ["DEFAULT_KEY", "Listener", "Connector"]
 #: 默认 key —— 主臂发布、从臂订阅，两端必须一致（界面可改）。
 DEFAULT_KEY = "litearm/teleop/isomorphic"
 
-
 def _base_config() -> zenoh.Config:
     """纯点对点的公共配置：**关掉全部广播发现**。"""
     c = zenoh.Config()
@@ -967,7 +1014,6 @@ def _base_config() -> zenoh.Config:
     c.insert_json5("scouting/gossip/enabled", "false")
     c.insert_json5("mode", '"peer"')
     return c
-
 
 class _Endpoint:
     def __init__(self) -> None:
@@ -992,7 +1038,6 @@ class _Endpoint:
     def __exit__(self, *exc) -> bool:
         self.close()
         return False
-
 
 class Listener(_Endpoint):
     """主臂端：监听端口，等从臂连进来。"""
@@ -1024,7 +1069,6 @@ class Listener(_Endpoint):
         """
         return self._matching
 
-
 class Connector(_Endpoint):
     """从臂端：连到主臂的 IP:端口，订阅其流。
 
@@ -1052,7 +1096,6 @@ class Connector(_Endpoint):
     def latest(self) -> int:
         """已收帧数（供界面显示频率）。"""
         return self.received
-
 
 class LatestSlot:
     """latest-wins 槽 —— zenoh 回调与伺服环之间的唯一交接面（spec §3.2）。
@@ -1092,11 +1135,10 @@ class LatestSlot:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-先在 `pyproject.toml` 注册 marker（未注册的 mark 会产生警告；用 `--strict-markers` 时直接报错）：
+`slow` marker 已在 Task 1 的 `pyproject.toml` 里注册好（本步只确认，别再改那个文件）：
 
-```toml
-[tool.pytest.ini_options]
-markers = ["slow: 慢测（起子进程 / 数十秒），用 -m \"not slow\" 跳过"]
+```bash
+grep -q "slow:" pyproject.toml && echo "marker 已注册" || echo "⚠ marker 缺失，回 Task 1 补"
 ```
 
 ```bash
@@ -1145,7 +1187,6 @@ import pytest
 
 from liteteleop import safety
 
-
 # ── 参照实现：从 pylitearm/control/joint_follow.py:45-88 抄成独立副本 ──────────
 # ⚠ 这份副本是**测试的对照组**，刻意与实现分开写。两边都错才可能同时通过。
 def _ref_slew(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
@@ -1177,14 +1218,12 @@ def _ref_slew(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
             dq_cmd[i] = v
     return q_cmd, dq_cmd
 
-
 def _traj(t, q0):
     """确定的合成轨迹 —— 固定输入，对拍才可复现。"""
     tgt = list(q0)
     tgt[1] += 0.30 * math.sin(2 * math.pi * 0.5 * t)
     tgt[2] += 0.20 * math.sin(2 * math.pi * 0.3 * t + 0.7)
     return tgt
-
 
 def test_slew_matches_pylitearm_reference():
     """⭐ 移植版与原版**逐拍全等**（60 拍 × 3 组参数 = 180 次比对）。"""
@@ -1200,7 +1239,6 @@ def test_slew_matches_pylitearm_reference():
             assert a_cmd == pytest.approx(b_cmd, abs=1e-15), f"sp={sp} ac={ac} 第 {k} 拍 q_cmd 分叉"
             assert a_dq == pytest.approx(b_dq, abs=1e-15), f"sp={sp} ac={ac} 第 {k} 拍 dq_cmd 分叉"
 
-
 def test_slew_speed_limited():
     """|dq_cmd| 恒 ≤ speed_limit —— spec §5.1 那条「accel_limit 不抬高天花板」的依据。"""
     n, dt, sp, ac = 7, 0.01, 0.5, 20.0
@@ -1208,7 +1246,6 @@ def test_slew_speed_limited():
     for k in range(200):
         q_cmd, dq_cmd = safety.slew_target([3.0] * n, q_cmd, dq_cmd, [sp] * n, [ac] * n, dt)
         assert all(abs(v) <= sp + 1e-12 for v in dq_cmd), f"第 {k} 拍越过 speed_limit"
-
 
 def test_slew_converges_and_stops():
     """收敛且到目标即停（不超冲、不振荡）。"""
@@ -1219,221 +1256,39 @@ def test_slew_converges_and_stops():
     assert q_cmd == pytest.approx([1.0] * n, abs=1e-6)
     assert dq_cmd == pytest.approx([0.0] * n, abs=1e-9)
 
+def test_slew_brakes_before_target():
+    """⭐ 制动距离减速**真的生效** —— 判据是「最长减速连跑」拍数。
 
-def test_slew_does_not_overshoot():
-    """制动距离减速生效：全程不过冲（这是原版比"朴素限速"强的地方）。"""
-    n, dt = 7, 0.01
-    tgt = 0.5
+    为什么不用"有没有过冲"当判据：**过冲为 0 是被别的东西挡住的**（见下方模块注释与
+    Task 5 Step 5 的实测），去掉制动距离后过冲**依然是 0** ⇒ 用过冲当判据是**没有判别力**的。
+
+    实测（本计划作者量化过）：`sp=2.0, ac=14.0` 下 ——
+    原版最长减速连跑 **14 拍**；去掉制动距离 **0 拍**；去掉吸附 **14 拍**。
+    """
+    n, dt, tgt = 7, 0.01, 0.5
     q_cmd, dq_cmd = [0.0] * n, [0.0] * n
-    worst = 0.0
+    seq, worst = [], 0.0
     for _ in range(400):
         q_cmd, dq_cmd = safety.slew_target([tgt] * n, q_cmd, dq_cmd, [2.0] * n, [14.0] * n, dt)
+        seq.append(abs(dq_cmd[0]))
         worst = max(worst, max(q_cmd) - tgt)
+    run = best = 0
+    prev = None
+    for v in seq:
+        run = run + 1 if (prev is not None and 0.0 < v < prev) else 0
+        best = max(best, run)
+        prev = v
+    assert best >= 5, f"没有减速段（最长连跑 {best} 拍）—— 制动距离减速没生效"
+    # 顺带：不过冲。⚠ 这条**单独没有判别力**（制动与吸附都去掉才为假），
+    # 只作为上面那条强判据的附带检查，别当成独立覆盖。
     assert worst <= 1e-9, f"过冲 {worst}"
-```
-
-- [ ] **Step 2: 跑测试确认失败**
-
-```bash
-cd /home/llx/litearm-teleop-isomorphic
-python3 -m pytest tests/test_safety.py -q
-```
-
-Expected: `ModuleNotFoundError: No module named 'liteteleop.safety'`
-
-- [ ] **Step 3: 实现 `safety.py` 第一部分（`slew_target` + 软限位 + 钳位）**
-
-`liteteleop/safety.py`：
-
-```python
-"""遥操的纯逻辑层 —— 不 import litearm / zenoh，不碰硬件，可整段离线 TDD。
-
-分四块（都在这一个文件里，因为它们耦合成一条链：限位 → 钳位 → 参考生成 → 状态机）:
-
-1. `slew_target` —— **从 `pylitearm/control/joint_follow.py:45-88` 逐字移植**
-   的梯形速度曲线参考生成器（spec §5.1）。它不是新设计，是既有验证实现的搬运。
-   ⛔ 不要"改进"它；任何偏离都先报用户裁决。
-2. `read_limits` / `clamp_to_limits` —— 软限位闸门与钳位（spec §7.1）。
-3. `speed_limit_from_kd` —— 逐轴速度上限的 kd 预算闸门（spec §5.1）。
-4. `TeleopState` —— 从臂状态机与 watchdog（spec §5）。
-"""
-from __future__ import annotations
-
-import math
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
-
-__all__ = [
-    "clamp", "slew_target", "clamp_to_limits", "LimitsError",
-    "read_limits_ok", "speed_limit_from_kd",
-]
 
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    """与 `pylitearm/hal/hardware.py:52` 的 `clamp` 同义。"""
-    return max(lo, min(hi, v))
-
-
-# ────────────────────────── 1. slew_target（逐字移植） ──────────────────────────
-
-def slew_target(raw_target: Sequence[float],
-                q_cmd: List[float],
-                dq_cmd: List[float],
-                speed_limit: Sequence[float],
-                accel_limit: Sequence[float],
-                dt: float) -> Tuple[List[float], List[float]]:
-    """速度/加速度限制的目标位置平滑（梯形速度曲线）。
-
-    **逐字移植自 `pylitearm/control/joint_follow.py:45-88`**（spec §5.1）。
-    唯一的形式改动：把原版的模块级全局 `N` 换成 `len(raw_target)`，
-    以支持变长关节数（线协议是变长的，spec §4.2）。
-
-    对每个关节：限最大速度 `speed_limit[i]`、限最大加速度 `accel_limit[i]`、
-    接近目标时**按制动距离 `v²/(2a)` 自动减速**。
-
-    ⚠ **`|dq_cmd|` 恒 ≤ `speed_limit`**（原版 `v = clamp(v, -v_limit, v_limit)`）
-    ⇒ `accel_limit` 只决定爬到上限有多快，**不抬高天花板**（spec §5.1）。
-
-    Args:
-        raw_target: 原始目标位置 [n] (rad)
-        q_cmd: 当前指令位置 [n]，**就地修改**
-        dq_cmd: 当前指令速度 [n]，**就地修改**
-        speed_limit: 每关节最大速度 [n] (rad/s)
-        accel_limit: 每关节最大加速度 [n] (rad/s^2)
-        dt: 控制周期 (s)
-
-    Returns:
-        (q_cmd, dq_cmd)
-    """
-    dt = max(dt, 1e-4)
-    for i in range(len(raw_target)):
-        v_limit = max(1e-4, speed_limit[i])
-        a_limit = max(1e-4, accel_limit[i])
-        dv_max = a_limit * dt
-
-        diff = raw_target[i] - q_cmd[i]
-        v = dq_cmd[i]
-
-        # 已到达目标
-        if abs(diff) < 1e-5 and abs(v) < dv_max:
-            q_cmd[i] = raw_target[i]
-            dq_cmd[i] = 0.0
-            continue
-
-        # 期望速度（考虑制动距离）
-        stopping_dist = (v * v) / (2.0 * a_limit) if a_limit > 0.0 else 0.0
-        moving_toward = diff * v > 0.0
-        if moving_toward and abs(diff) <= stopping_dist:
-            desired_v = 0.0  # 开始减速
-        else:
-            desired_v = math.copysign(v_limit, diff)
-
-        # 限加速度
-        v += clamp(desired_v - v, -dv_max, dv_max)
-        v = clamp(v, -v_limit, v_limit)
-
-        # 更新位置
-        step = v * dt
-        if diff * step > 0.0 and abs(step) >= abs(diff):
-            q_cmd[i] = raw_target[i]
-            dq_cmd[i] = 0.0
-        else:
-            q_cmd[i] += step
-            dq_cmd[i] = v
-
-    return q_cmd, dq_cmd
-
-
-# ────────────────────────── 2. 软限位闸门与钳位 ──────────────────────────
-
-class LimitsError(RuntimeError):
-    """软限位不可用 —— **必须拒绝启动跟随**，不许静默退化（spec §7.1）。"""
-
-
-@dataclass(frozen=True)
-class Limits:
-    lo: Tuple[float, ...]
-    hi: Tuple[float, ...]
-
-    @property
-    def n(self) -> int:
-        return len(self.lo)
-
-
-def read_limits_ok(lo: Sequence[float], hi: Sequence[float], n: int) -> Limits:
-    """校验并封装软限位。任何一处不合法 ⇒ 抛 `LimitsError`。
-
-    ⚠ **不学 litearm-server 的 ±9 兜底告警**（spec §7.1）：它拿不到限位时用一个哨兵值
-    继续跑并只打一条 warning，等于把位置护栏降级成"看起来在工作"。
-    本工具**拒绝启动**。
-
-    限位来源：`arm.params.all_joint_params()` 的 `q_min`/`q_max`
-    （= 固件 `ctrl_accept_move_js` 里钳位用的**同一个** `g_params.joint[].q_min/q_max`
-    ⇒ 与固件同源，比 pylitearm 的 `kin.q_min/q_max` 更权威。spec §9.2）
-    """
-    if len(lo) != n or len(hi) != n:
-        raise LimitsError(f"软限位长度不符: lo={len(lo)} hi={len(hi)} 关节数={n}")
-    for i, (a, b) in enumerate(zip(lo, hi)):
-        if not (math.isfinite(a) and math.isfinite(b)):
-            raise LimitsError(f"J{i + 1} 软限位非有限值: lo={a} hi={b}")
-        if a >= b:
-            raise LimitsError(f"J{i + 1} 软限位上下界反了: lo={a} >= hi={b}")
-    return Limits(lo=tuple(float(x) for x in lo), hi=tuple(float(x) for x in hi))
-
-
-def clamp_to_limits(q: Sequence[float], lim: Limits) -> Tuple[List[float], List[bool]]:
-    """把目标钳到软限位，并返回**哪些轴被钳住了**。
-
-    被钳住的轴必须把 `dq` 置 0（抗饱和）—— 否则它以 `kd·dq` 持续顶进硬限位（spec §5.1）。
-    这不是边角情况：本机 **J4 上端只有 +0.0175 rad**。
-    """
-    if len(q) != lim.n:
-        raise LimitsError(f"目标长度不符: {len(q)} vs {lim.n}")
-    out, sat = [], []
-    for i, x in enumerate(q):
-        c = clamp(x, lim.lo[i], lim.hi[i])
-        out.append(c)
-        sat.append(x < lim.lo[i] or x > lim.hi[i])
-    return out, sat
-
-
-# ────────────────────────── 3. kd 预算闸门 ──────────────────────────
-
-def speed_limit_from_kd(kd: Sequence[float], tau_max: Sequence[float],
-                        kd_budget: float = 0.30) -> List[float]:
-    """由 kd 预算反推逐轴速度上限（spec §5.1）。
-
-    为什么需要它：`dq` 进的是 τ 域的 `kd·(dq_ref − dq)`，而 `move_js` **给不了 `K`/`B`**
-    —— 刚度/阻尼由固件定死（`kp=mit_kp`，有效阻尼 `mit_kd + kd_extra`；`kd_extra`
-    在 τ 域叠加，`control_loop.c:2443`）。本机 J4 的 `kd` 是 **11.0**，
-    而 litearm-server 自己发 MIT 帧时用的是 `B=1.0` ⇒ **差 11 倍**。
-    τ 最终钳到 `±tau_max` ⇒ 前馈吃不坏硬件，但会**吃掉整个力矩预算**。
-
-    ⇒ `speed_limit_j = kd_budget · tau_max_j / kd_j`
-    """
-    if len(kd) != len(tau_max):
-        raise LimitsError(f"kd/tau_max 长度不符: {len(kd)} vs {len(tau_max)}")
-    if not 0.0 < kd_budget <= 1.0:
-        raise LimitsError(f"kd_budget 需 ∈ (0, 1]（给的是 {kd_budget}）")
-    out = []
-    for i, (k, t) in enumerate(zip(kd, tau_max)):
-        if not (math.isfinite(k) and math.isfinite(t)) or k <= 0.0 or t <= 0.0:
-            raise LimitsError(f"J{i + 1} 的 kd/tau_max 非法: kd={k} tau_max={t}")
-        out.append(kd_budget * t / k)
-    return out
-```
-
-- [ ] **Step 4: 补限位与闸门的测试，并跑**
-
-把下面这些**追加**到 `tests/test_safety.py` 末尾：
-
-```python
 # ── 软限位闸门 ──────────────────────────────────────────────────────────────
 
 def test_limits_ok():
     lim = safety.read_limits_ok([-1.0] * 7, [1.0] * 7, 7)
     assert lim.n == 7
-
 
 @pytest.mark.parametrize("lo,hi,n,match", [
     ([-1.0] * 6, [1.0] * 7, 7, "长度不符"),
@@ -1447,7 +1302,6 @@ def test_limits_reject(lo, hi, n, match):
     with pytest.raises(safety.LimitsError, match=match):
         safety.read_limits_ok(lo, hi, n)
 
-
 def test_clamp_flags_saturated_axes():
     """被钳住的轴要被标出来（抗饱和的输入）。"""
     lim = safety.read_limits_ok([-1.0] * 7, [1.0] * 7, 7)
@@ -1455,13 +1309,28 @@ def test_clamp_flags_saturated_axes():
     assert q == pytest.approx([0.5, 1.0, -0.3, -1.0, 0.0, 1.0, 0.9])
     assert sat == [False, True, False, True, False, False, False]
 
+def test_saturate_dq_zeroes_clamped_axes():
+    """spec §5.1：被钳位的轴 `dq` 必为 0（这条不变量的具名载体）。"""
+    dq = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    sat = [False, True, False, True, False, False, False]
+    assert safety.saturate_dq(dq, sat) == [1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0]
+    assert safety.saturate_dq([2.0] * 7, [False] * 7) == [2.0] * 7, "没被钳的不许动"
+
+def test_saturate_dq_in_j4_upper_limit_case():
+    """⚠ J4 上端只有 +0.0175 rad —— 主臂一拖过零就吃到，不是边角情况。"""
+    lim = safety.read_limits_ok([-3.0] * 7, [3.0] * 7, 7)
+    lim = safety.Limits(lo=lim.lo[:3] + (0.0175,) + lim.lo[4:],
+                        hi=lim.hi[:3] + (0.0175,) + lim.hi[4:])
+    q, sat = safety.clamp_to_limits([0.0, 0.0, 0.0, 0.20, 0.0, 0.0, 0.0], lim)
+    assert sat[3] is True, "J4 超出 0.0175 应被判被钳"
+    dq = safety.saturate_dq([1.0] * 7, sat)
+    assert dq[3] == 0.0, "被钳的 J4 必须把 dq 置 0（否则 kd·dq 持续顶限位）"
 
 def test_clamp_uses_range_not_float_equality():
     """⚠ 判据用区间比较，不用浮点 `!=`（spec §5.1 的 `saturated` 定义）。"""
     lim = safety.read_limits_ok([0.0] * 7, [1.0] * 7, 7)
     _, sat = safety.clamp_to_limits([0.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5], lim)
     assert sat == [False, False, False, False, False, False, False], "边界值不应算被钳"
-
 
 # ── kd 预算闸门 ─────────────────────────────────────────────────────────────
 
@@ -1472,7 +1341,6 @@ def test_speed_limit_from_kd_matches_spec_table():
     got = safety.speed_limit_from_kd(kd, tau, kd_budget=0.30)
     assert got == pytest.approx([2.127, 2.127, 0.63, 0.573, 1.2, 1.2, 1.2], abs=0.01)
 
-
 def test_speed_limit_j4_is_the_binding_case():
     """⛔ J4 是全局最紧的轴 —— 它决定了「高速跟随」到底多快。"""
     kd = [11.0, 11.0, 10.0, 11.0, 2.5, 2.5, 2.5]
@@ -1481,12 +1349,10 @@ def test_speed_limit_j4_is_the_binding_case():
     assert min(got) == pytest.approx(got[3]), "最紧的应是 J4"
     assert min(got) < 0.7, "J4 的上限必须明显低于它的 speed_limit=1.75"
 
-
 @pytest.mark.parametrize("budget", [0.0, -0.1, 1.5])
 def test_speed_limit_rejects_bad_budget(budget):
     with pytest.raises(safety.LimitsError, match="kd_budget"):
         safety.speed_limit_from_kd([1.0] * 7, [1.0] * 7, kd_budget=budget)
-
 
 def test_speed_limit_rejects_bad_kd():
     with pytest.raises(safety.LimitsError, match="非法"):
@@ -1499,10 +1365,14 @@ python3 -m pytest tests/test_safety.py -q
 
 Expected: 全绿（`passed`，无 `failed`/`error`）
 
-- [ ] **Step 5: 确认对拍判据有判别力（临时"改进"移植版，测试必须红）**
+- [ ] **Step 5: 确认判据的判别力 —— 并**如实记下哪条其实没有****
+
+> ⚠ **本节第一版把判别力说错了两次**（一次靠推断没实测、一次张冠李戴）。
+> 下面每个数字都是**量化过的**，不是推断。**别凭感觉写"这条会红"。**
+
+**变异 A：去掉制动距离减速** ⇒ 该红的是 **parity** 与 **brakes_before_target** 两条：
 
 ```bash
-# 把制动距离减速去掉（这正是"朴素限速"与"原版"的差别），对拍必须红
 cp liteteleop/safety.py /tmp/safety.bak
 python3 - <<'PY'
 p="liteteleop/safety.py"; s=open(p,encoding="utf-8").read()
@@ -1510,13 +1380,43 @@ s=s.replace("if moving_toward and abs(diff) <= stopping_dist:\n            desir
             "if False:\n            desired_v = 0.0\n        else:")
 open(p,"w",encoding="utf-8").write(s)
 PY
-python3 -m pytest tests/test_safety.py -q -k "matches_pylitearm or overshoot"
+find . -name __pycache__ -prune -exec rm -rf {} +
+python3 -m pytest tests/test_safety.py -q -k "matches_pylitearm or brakes_before_target"
 cp /tmp/safety.bak liteteleop/safety.py
+find . -name __pycache__ -prune -exec rm -rf {} +
+```
+
+Expected: **两条都红**（`2 failed`）。
+
+**变异 B：去掉"吸附"** ⇒ ⛔ **本套件里没有任何一条会红**（实测：parity 红、其余全绿；
+`converges_and_stops` 仍绿，因为最终吸附是**死区分支**做的，不是这句吸附做的）。
+**这不是缺陷，是覆盖边界** —— 记下来，别以为它被覆盖了：
+
+```bash
+cp liteteleop/safety.py /tmp/safety.bak
+python3 - <<'PY'
+p="liteteleop/safety.py"; s=open(p,encoding="utf-8").read()
+s=s.replace("if diff * step > 0.0 and abs(step) >= abs(diff):", "if False:")
+open(p,"w",encoding="utf-8").write(s)
+PY
+find . -name __pycache__ -prune -exec rm -rf {} +
+python3 -m pytest tests/test_safety.py -q -k "matches_pylitearm"       # 应当只有这条红
+cp /tmp/safety.bak liteteleop/safety.py
+find . -name __pycache__ -prune -exec rm -rf {} +
 python3 -m pytest tests/test_safety.py -q
 ```
 
-Expected: 中间那次 **FAILED**（对拍与过冲两条都红），最后一次全绿。
-**这一步证明这组判据真的在测"逐字移植"，不是在自我印证。**
+**⇒ 结论（写进这个 Task 的提交信息或注释里）**：
+
+| 判据 | 对变异 A | 对变异 B | 真实判别力 |
+| --- | --- | --- | --- |
+| `test_slew_matches_pylitearm_reference`（parity） | 红 | 红 | ⭐ **唯一**能守住"逐字移植"的那条 |
+| `test_slew_brakes_before_target` | 红 | 绿 | ⭐ 独立于对照实现，守住制动段 |
+| `test_slew_speed_limited` | 绿 | 绿 | 弱（不变量真实，但这两个变异都碰不到它） |
+| `test_slew_converges_and_stops` | 绿 | 绿 | 弱（最终吸附由死区分支做） |
+
+**⇒ "逐字移植"的守卫是 parity 那一条，不是这一堆。** 别用后三条的绿去论证移植正确；
+它们绿是因为它们测的是别的东西。
 
 - [ ] **Step 6: 记录移植已知边界**
 
@@ -1571,23 +1471,19 @@ def _sm(**kw):
     defaults.update(kw)
     return safety.TeleopState(**defaults)
 
-
 def test_starts_idle():
     assert _sm().state == safety.IDLE
-
 
 def test_start_goes_to_align_fast():
     sm = _sm()
     sm.start(now=0.0)
     assert sm.state == safety.ALIGN_FAST
 
-
 def test_align_done_goes_to_following():
     sm = _sm()
     sm.start(now=0.0)
     sm.align_done(now=1.0)
     assert sm.state == safety.FOLLOWING
-
 
 def test_watchdog_trips_to_holding():
     sm = _sm()
@@ -1596,7 +1492,6 @@ def test_watchdog_trips_to_holding():
     assert sm.tick(now=1.0 + 0.1, frame_age=0.1) is safety.FOLLOWING
     # 200 ms 无新帧 ⇒ HOLDING
     assert sm.tick(now=1.0 + 0.35, frame_age=0.35) is safety.HOLDING
-
 
 def test_hold_escalates_once_after_2s():
     """HOLDING ≥ 2 s ⇒ 升级 movej(q_now) **一次**，且**仍留在 HOLDING**。"""
@@ -1615,7 +1510,6 @@ def test_hold_escalates_once_after_2s():
     sm.tick(now=4.0, frame_age=2.0)
     assert sm.wants_stop_command() is False, "升级只做一次"
 
-
 def test_hold_recovers_to_align_fast_not_following():
     """恢复必须重走 ALIGN_FAST —— 主臂在断链期间可能已经动了（spec §5.2）。"""
     sm = _sm()
@@ -1626,7 +1520,6 @@ def test_hold_recovers_to_align_fast_not_following():
     for k in range(5):                              # 连续 5 拍收到帧
         sm.tick(now=2.0 + 0.01 * k, frame_age=0.01)
     assert sm.state == safety.ALIGN_FAST
-
 
 def test_hold_recovery_needs_consecutive_frames():
     """不足 5 拍不许恢复（防抖动来回切）。"""
@@ -1641,6 +1534,15 @@ def test_hold_recovery_needs_consecutive_frames():
     sm.tick(now=2.20, frame_age=0.01)
     assert sm.state == safety.HOLDING
 
+def test_align_failed_stays_put():
+    """对齐失败必须停在 ALIGN_FAST —— 且 tick 永远不把它推进 FOLLOWING（spec §5.1）。"""
+    sm = _sm()
+    sm.start(now=0.0)
+    sm.align_failed(now=1.0)
+    assert sm.state == safety.ALIGN_FAST
+    for k in range(20):
+        sm.tick(now=1.0 + 0.01 * k, frame_age=0.01)
+        assert sm.state == safety.ALIGN_FAST, "只有 align_done() 才能进 FOLLOWING"
 
 def test_user_stop_from_any_state():
     for prep in (None, "align", "following", "holding"):
@@ -1656,7 +1558,6 @@ def test_user_stop_from_any_state():
         sm.user_stop(now=9.0)
         assert sm.state == safety.IDLE, f"prep={prep}"
         assert sm.wants_stop_command() is True
-
 
 def test_state_missing_q_blocks_dispatch():
     """拿不到实测 q 就不许下发（spec §5.1 第 4 点）—— 不许拿 0 去猜 err。"""
@@ -1678,7 +1579,17 @@ Expected: `AttributeError: module 'liteteleop.safety' has no attribute 'TeleopSt
 
 - [ ] **Step 3: 实现**
 
-追加到 `liteteleop/safety.py` 末尾：
+**先把文件顶部的 `__all__` 换成完整版**（否则 `import *` 拿不到状态机）：
+
+```python
+__all__ = [
+    "clamp", "slew_target", "clamp_to_limits", "LimitsError", "Limits",
+    "read_limits_ok", "saturate_dq", "speed_limit_from_kd",
+    "IDLE", "ALIGN_FAST", "FOLLOWING", "HOLDING", "TeleopState",
+]
+```
+
+然后追加到 `liteteleop/safety.py` 末尾：
 
 ```python
 # ────────────────────────── 4. 从臂状态机与 watchdog ──────────────────────────
@@ -1688,7 +1599,6 @@ IDLE = "IDLE"
 ALIGN_FAST = "ALIGN_FAST"
 FOLLOWING = "FOLLOWING"
 HOLDING = "HOLDING"
-
 
 class TeleopState:
     """从臂状态机 + watchdog（spec §5）。**纯逻辑，不碰硬件**。
@@ -1741,6 +1651,18 @@ class TeleopState:
         """`ALIGN_FAST` 的 `movej` 已到位（含 spec §5.1 的交接补丁）。"""
         if self.state == ALIGN_FAST:
             self.state = FOLLOWING
+
+    def align_failed(self, now: float) -> None:
+        """`ALIGN_FAST` 的 `movej` 失败/超时 ⇒ **保持原地**，不自动进 `FOLLOWING`（spec §5.1）。
+
+        刻意比 server 严格：server 的对齐失败只 `log.warning` 一句就继续进 `joint_follow`
+        （`teleop_manager.py` 的 `_do_align`，注释写「跟随会逐步修正」）。本仓停住 ——
+        因为那一步失败意味着 `q_cmd` **没有同步到对齐位**（server 补丁的前提不成立），
+        进 `FOLLOWING` 就是带着一个未知的大误差起步。
+        **这是本设计唯一一处刻意比 server 严格的地方**（spec §5.1）。
+        """
+        self.state = ALIGN_FAST
+        self._stop_pending = False
 
     def user_stop(self, now: float) -> None:
         """用户点「停止」⇒ 收尾 `movej(q_now)`，回 IDLE（spec §5.3）。"""
@@ -1886,8 +1808,12 @@ git commit -m "docs: add teleop known-traps section to readme"
 
 - [ ] `python3 -m pytest tests -q` 全绿（含 `slow`）
 - [ ] `wire.py` 的字节序有**判别力**证据：改 `>` 后测试变红（Task 3 Step 5 的输出）
-- [ ] `slew_target` 有**逐拍全等**对拍证据，且"去掉制动距离"后测试变红（Task 5 Step 5 的输出）
+- [ ] `slew_target` 有**逐拍全等**对拍证据；**变异 A（去制动距离）打红 parity 与
+      `brakes_before_target` 两条**（Task 5 Step 5 的输出）；并已知**变异 B 本套件抓不到**，
+      该覆盖边界已记入计划 —— **"逐字移植"的守卫是 parity 那一条，不是那一堆**
 - [ ] 真机 spike S1~S5 的**原始输出**在 `docs/spike-2026-09-28-move-js.md` 里，**板卡与固件版本串已写明**
+- [ ] Step 5 的来源升级**只动了 §2.3(a) 那条**；§2.3(b) 刚度表与 §5.3 主臂收尾**仍标 `[源码]`**，
+      并在 spec 里显式记了一笔"留待另一次真机验证"（**没测的不许升**）
 - [ ] 若 S3 未过 ⇒ **已停下来报用户**，未继续实现
 - [ ] `git log main..HEAD` 的提交信息全为 Conventional Commits，**无 `claude` 字样**
 - [ ] **未 push、未开 PR**
