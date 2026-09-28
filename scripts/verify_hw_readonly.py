@@ -27,6 +27,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+#: ⚠⚠ SDK 的**唯一入口**（用户裁决）。本机 `sys.path` 上还挂着另一份 `litearm`
+#: （`/home/llx/gitee/litearm-python/src`，停在 `chore/sync-repo-standards` 分支）
+#: —— 它会被**静默**import 到。本行把 SDK 路径顶到最前，压掉那份。
+#: 判据不是"我设过 PYTHONPATH"，而是**导入后打印出来核**（见下方 `实际导入`）。
+SDK_SRC = "/home/llx/litearm-python/src"
+sys.path.insert(0, SDK_SRC)
+
 import litearm as pa                                            # noqa: E402
 from litearm.arm import MIN_FW                                  # noqa: E402
 from liteteleop import safety                                   # noqa: E402
@@ -53,6 +60,11 @@ def main() -> int:
     if not port:
         print("⛔ 找不到 STM32 CDC 口（VID:PID 1d50:606f）。检查 USB 与权限。")
         return 2
+    # ⚠ 把**实际导入到的那份**打出来核 —— 别信"我应该设对了"
+    print(f"SDK: {pa.__file__}")
+    if not pa.__file__.startswith(SDK_SRC):
+        print(f"⛔ 导入到的不是 {SDK_SRC} —— 环境里有另一份 litearm 抢先了。")
+        return 5
     print(f"端口: {port}")
     print("=" * 78)
 

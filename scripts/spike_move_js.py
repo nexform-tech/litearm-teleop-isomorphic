@@ -17,7 +17,17 @@ import statistics
 import sys
 import time
 
-import litearm as pa
+#: ⚠⚠ SDK 的**唯一入口**（用户裁决）。本机 `sys.path` 上还挂着另一份 `litearm`
+#: （`/home/llx/gitee/litearm-python/src`，停在 `chore/sync-repo-standards` 分支）
+#: —— 它会被**静默**import 到。顶到最前压掉它，并**断言**导入来源。
+#: 记忆：旧 editable 会把漏改名静默兜住 ⇒ 唯一硬判据是把旧仓从 `sys.path` 剥掉。
+SDK_SRC = "/home/llx/litearm-python/src"
+sys.path.insert(0, SDK_SRC)
+
+import litearm as pa                                            # noqa: E402
+
+assert pa.__file__.startswith(SDK_SRC), (
+    f"⛔ litearm 导入自 {pa.__file__}，不是 {SDK_SRC} —— 环境里有另一份抢先了")
 
 # ⚠ spike 必须用**出货的** `safety.slew_target`，不许内联副本 ——
 # 内联过一版取**标量**上限的 `_slew`，与出货版（逐轴 `speed_limit[i]`）不是同一个函数，
@@ -368,6 +378,7 @@ def main(argv=None) -> int:
     arm.connect()
     assert arm.move_timeout == 3.0, f"move_timeout 被改成 {arm.move_timeout} —— 见 spec §5.3"
     print(f"已连接: n={arm.n}", flush=True)
+    print(f"SDK: {pa.__file__}", flush=True)      # ⚠ 每次都核，别信"我应该设对了"
     if arm.n != 7:
         print(f"⛔ 本 spike 只对 7 关节整臂有效，当前 n={arm.n} —— 疑似 1J 台架，退出", flush=True)
         _hard_close()
