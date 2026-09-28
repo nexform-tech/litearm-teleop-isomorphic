@@ -153,7 +153,6 @@ class ArmWorker:
         self._sub = None            # slave: link.Connector
         self._slot = link.LatestSlot()
         self._limits = None
-        self._gains = None
 
         self._lock = threading.Lock()
         self._snap = Snapshot(role=role)
@@ -361,10 +360,6 @@ class ArmWorker:
                 self._teleop_want = False
         finally:
             self._teleop_want = False
-        try:
-            self._restore_gains()                        # ⚠ 必须排在下面那句 movej 之前
-        except Exception:                                # noqa: BLE001
-            log.exception("还原增益失败")
         if self._arm is not None:
             try:
                 servo.hold_at_current(self._arm)         # ⛔ 绝不 disable
@@ -398,20 +393,11 @@ class ArmWorker:
                 self._snap.error = str(e)
         finally:
             self._teleop_want = False
-            # ⚠⚠ **先还原增益再 movej**：跟随期间 `mit_kp` 是 25，`movej` 的到位环撑不住。
-            self._restore_gains()
             try:
                 servo.hold_at_current(self._arm)         # 受控接管
             except Exception as e:                       # noqa: BLE001
                 self._log(f"⚠ 收尾 movej 失败: {e}")
 
-
-    def _restore_gains(self) -> None:
-        """还原出厂增益。**幂等**；**任何 `movej` 之前都必须先调它**。"""
-        if self._gains is not None and self._arm is not None:
-            servo.restore_joint_gains(self._arm, self._gains)
-            self._gains = None
-            self._log("已还原出厂增益（movej 要用它）")
 
     def _run_master(self) -> None:
         """主臂：零重力拖动 → 定频采样 → 发布（spec §6）。**主臂不做任何钳位。**"""
@@ -469,7 +455,7 @@ class ArmWorker:
         # ⚠ 这份配置**本来就是配 `B=0.5` 的** —— K/B 随帧下发之后，它才第一次名副其实。
         sl = list(servo.DEFAULT_SPEED_LIMIT)
         self._log(f"从臂跟随：K={servo.SETUP_K} B={servo.SETUP_B}"
-                  f"（照搬 joint_follow，随 send_mit_all 下发）")
+                  f"（litearm.yaml 默认档，随 send_mit_all 下发）")
         self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
         self._log("⚠ 每拍 2 次往返（get_gravity + send_mit_all，实测各 3.333 ms）"
                   "⇒ 上限 ~150 Hz")

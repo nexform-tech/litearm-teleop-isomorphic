@@ -203,8 +203,8 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
     断轴 J2/J4**（真机 24 s 后 `FAULT FB_STALE POS_VIOL`）。
     ⇒ 用固件出厂刚度，抖动靠 kd 预算收紧限速去压。
 
-    判别力：谁要是把 `apply_joint_gains` 加回来，本用例会红（`_NoWriteArm` 没有它、
-    而且顺序数组会多一项）。
+    判别力：谁要是让从臂去**写固件参数**（`set_joint_param` / `set_ff_vec`），本用例会红
+    —— `_NoWriteArm` 只放行**读**，一写就抛（`save_params` 更是直接 AssertionError）。
     """
     order = []
     seen = {}

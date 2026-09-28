@@ -180,8 +180,8 @@ def test_follow_sends_the_server_gains_on_every_frame():
     _run(arm, [0.1] * N_JOINTS)
     assert arm.mit_calls, "一帧都没发出去"
     for _q, _dq, kp, kd, _tau in arm.mit_calls:
-        assert kp == [servo.SETUP_K] * N_JOINTS, f"K 不是 server 的 {servo.SETUP_K}"
-        assert kd == [servo.SETUP_B] * N_JOINTS, f"B 不是 server 的 {servo.SETUP_B}"
+        assert kp == list(servo.SETUP_K), f"K 不是 server 的 {servo.SETUP_K}"
+        assert kd == list(servo.SETUP_B), f"B 不是 server 的 {servo.SETUP_B}"
 
 
 def test_follow_clamps_gravity_to_tau_max():
@@ -324,42 +324,26 @@ def test_default_payload_is_the_gripper_the_user_gave():
     assert servo.DEFAULT_PAYLOAD_COM == (0.0, 0.0, 0.03)  # 质心 3 cm 在 Z 轴
 
 
-# ────────────────────────── 跟随增益的写入 / 还原 ──────────────────────────
+# ────────────── 增益必须是 server 默认配置的那一份 ──────────────
 
-def test_apply_writes_kb_and_zeroes_kd_extra():
-    """⚠ **必须清零 `kd_extra`**：`move_js` 的有效阻尼 = `mit_kd + kd_extra`。
+def test_setup_gains_are_the_server_default_config():
+    """⛔ 逐值比对 `litearm.yaml` 的 `joint_follow:` 段 —— **server 默认加载的就是它**。
 
-    不清的话 J1~J4 是 0.5+6.0 = 6.5（13 倍），`kd·dq` 在 5 rad/s 时 32.5 Nm，
-    而 J4 的 `tau_max` 只有 21 ⇒ 力矩预算被吃光 ⇒ 抖。
+    ⚠⚠ **别抄 `litearm_balanced.yaml`**：那份是 `[25]×7 / [0.5]×7`，而它的历史注释写着
+    「从 25 全一律**提高**以改善主从遥操的**滞后/追不上**手感（2026-08-13）」
+    ⇒ 25 是**已知会滞后**的档。真机实测复现了：用户报「明显延迟，而且会很软」。
+
+    判别力：把 `SETUP_K` 改回 25（或换成任何别的档），本用例立刻红。
     """
-    arm = FakeArm()
-    servo.apply_joint_gains(arm)
-    assert [p.kp for p in arm.jp] == [25.0] * N_JOINTS
-    assert [p.kd for p in arm.jp] == [0.5] * N_JOINTS
-    assert arm.kd_extra == [0.0] * N_JOINTS
+    assert servo.SETUP_K == [60.0, 60.0, 60.0, 60.0, 40.0, 40.0, 40.0]
+    assert servo.SETUP_B == [1.0, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8]
 
 
-def test_apply_keeps_tau_max():
-    arm = FakeArm()
-    before = [p.tau_max for p in arm.jp]
-    servo.apply_joint_gains(arm)
-    assert [p.tau_max for p in arm.jp] == before
+def test_engage_gains_are_softer_than_the_follow_gains():
+    """接管瞬间刚度**明显更软** —— `joint_follow.engage(engage_kp=15.0, engage_kd=0.8)`。
 
-
-def test_restore_is_verbatim_and_idempotent():
-    arm = FakeArm()
-    kp0, kd0, ex0 = ([p.kp for p in arm.jp], [p.kd for p in arm.jp], list(arm.kd_extra))
-    saved = servo.apply_joint_gains(arm)
-    assert [p.kp for p in arm.jp] != kp0, "改之前得真的改了"
-    servo.restore_joint_gains(arm, saved)
-    assert [p.kp for p in arm.jp] == kp0
-    assert [p.kd for p in arm.jp] == kd0
-    assert arm.kd_extra == ex0
-    servo.restore_joint_gains(arm, saved)          # 幂等：再来一次不该炸/不该改坏
-    assert [p.kp for p in arm.jp] == kp0
-
-
-def test_verified_setup_values():
-    """真机验证过的那一组（2026-09-28：150 拍 / 2 s 最大偏移 0.0004 rad）。"""
-    assert servo.SETUP_K == 25.0
-    assert servo.SETUP_B == 0.5
+    ⚠ 只对 `K` 断言"严格更小"：`SETUP_B` 的**腕部值就是 0.8**，与 engage 的 0.8 相同，
+    拿它比"更小"会假红（我第一版正是这么写的，测试当场抓出来了）。
+    """
+    assert servo.ENGAGE_KP < min(servo.SETUP_K), "接管刚度必须比跟随刚度软"
+    assert servo.ENGAGE_KD <= max(servo.SETUP_B)

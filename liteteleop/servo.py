@@ -12,7 +12,7 @@ litearm-server 的从臂是 `joint_follow` → `send_mit(K, B, q_cmd, dq_cmd, G(
 唯一能改它的办法是写固件参数，而**那条路已证伪**（见 `SETUP_K` 上面那段）。
 
 **执行器是 `send_mit_all`（MIT 透传），K/B 随帧下发** —— 与 litearm-server 的
-`joint_follow` **逐值一致**（`K=25 / B=0.5`，见 `SETUP_K` 那段的对照表）。
+`joint_follow` **逐值一致**（`litearm.yaml` 的 60/40 与 1.0/0.8，见 `SETUP_K` 那段）。
 
 ## 与 `joint_follow` 的已知差异（用户已知悉并接受）
 
@@ -43,7 +43,6 @@ __all__ = [
     "align_to_master", "DEFAULT_PAYLOAD_MASS", "DEFAULT_PAYLOAD_COM",
     "read_payload", "apply_payload",
     "SETUP_K", "SETUP_B", "ENGAGE_KP", "ENGAGE_KD",
-    "JointGains", "apply_joint_gains", "restore_joint_gains",
     "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
 ]
@@ -155,70 +154,31 @@ _FF_ITEM_PAYLOAD_COM = 5
 #:
 #: ⚠ 这一趟**省不掉**：固件对 MIT 透传**不会**自己加 G（`control_loop.c`：
 #:   「`move_mit` / `move_js+tau_ff` 永不叠加内置」）⇒ **G 必须 PC 送**。
-SETUP_K = 25.0
-SETUP_B = 0.5
+#: **从臂跟随增益 —— 照抄 litearm-server 默认配置 `litearm.yaml` 的 `joint_follow:` 段。**
+#:
+#: ⚠⚠ **别抄 `litearm_balanced.yaml`**：那份是 `[25]×7 / [0.5]×7`，而它自己的历史注释
+#:   写着「从 25 全一律**提高**以改善主从遥操的**滞后/追不上**手感（2026-08-13）」
+#:   ⇒ **25 就是已知会"滞后、追不上"的那一档**。真机实测（2026-09-28）复现了同一现象：
+#:   用户报「跟随性比较差，明显延迟，而且会很软」。
+#:
+#: ⚠ server 的取值链：`TeleopManager(K=None)` → `arm.joint_follow(K=None)` →
+#:   `from_params` → `cfg["joint_follow"]["K"]`；而 server **没有传 config** ⇒
+#:   走 SDK 默认（`pylitearm.default_config_path()` = `config/litearm.yaml`）⇒ **就是这份**。
+#:   ⚠ 当初我只比对了 `speed_limit`/`accel_limit`（所有 yaml 都一样）就**想当然**把 K/B
+#:   也记成了 balanced 的值。**教训：跨仓取"真值"必须把那份文件打开看到数字本身。**
+#:
+#: 与**写固件参数**那条已证伪的路**完全不同的通道**：
+#:     写 `mit_kp`/`mit_kd`      → **固件全局参数** ⇒ `movej` 也用 ⇒ 改坏 `movej`（真机踩过）
+#:     `send_mit_all(kp=,kd=)`   → **只对这一帧生效** ⇒ `movej` **完全不受影响** ✓
+#:
+#: 分配理由（配置原文）：大关节 J1~J4 承重多、刚度给大；腕部 J5~J7 适中防啸叫。
+SETUP_K = [60.0, 60.0, 60.0, 60.0, 40.0, 40.0, 40.0]
+SETUP_B = [1.0, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8]
 
 #: `joint_follow.engage()` 的托举增益（`engage_kp=15.0, engage_kd=0.8`）——
-#: 比跟随增益**更软**：接管瞬间"轻轻接住"，而不是猛拉过去。
+#: ⚠ **比跟随增益软得多**（跟随是 60/40）：接管瞬间"轻轻接住"，而不是猛拉过去。
 ENGAGE_KP = 15.0
 ENGAGE_KD = 0.8
-
-# ⛔ 以下两个函数**当前未被调用**，见上面那段。
-
-#: `kd_extra` 在 0x26 **向量表**（`FF_VEC_ITEMS[15]`）—— ⚠ **不是** 0x28 标量表，
-#: `get_ff_scalar(15, ·)` 取到的是 `zg_engage_kp`（见 spec §10 陷阱 #8）。
-_FF_VEC_KD_EXTRA = 15
-
-
-@dataclass
-class JointGains:
-    """改参数前**存下的原值**，用于逐字还原。"""
-
-    kp: List[float] = field(default_factory=list)
-    kd: List[float] = field(default_factory=list)
-    tau_max: List[float] = field(default_factory=list)
-    kd_extra: List[float] = field(default_factory=list)
-    applied: bool = False
-
-
-def apply_joint_gains(arm, K: float = SETUP_K, B: float = SETUP_B) -> JointGains:
-    """把跟随增益写进固件：`mit_kp=K`、`mit_kd=B`、**`kd_extra=0`**。
-
-    ⚠ **必须清零 `kd_extra`**：`move_js` 的有效阻尼是 `mit_kd + kd_extra`，
-    本机 `kd_extra = [6,6,6,6,0,0,0]`。只设 `kd=0.5` 的话 J1~J4 实际是 **6.5（13 倍）**，
-    `kd·dq` 在 5 rad/s 时是 32.5 Nm，而 J4 的 `tau_max` 只有 21 ⇒ 力矩预算被吃光。
-
-    ⛔ 只写 RAM。**绝不调 `save_params()`**（整扇区擦写、不可逆）。
-    """
-    jp = arm.params.all_joint_params()
-    saved = JointGains(
-        kp=[float(p.kp) for p in jp],
-        kd=[float(p.kd) for p in jp],
-        tau_max=[float(p.tau_max) for p in jp],
-        kd_extra=[float(x) for x in arm.get_ff_vec(_FF_VEC_KD_EXTRA).value])
-    for i in range(N_JOINTS):
-        arm.params.set_joint_param(i, float(K), float(B), saved.tau_max[i])
-    arm.set_ff_vec(_FF_VEC_KD_EXTRA, [0.0] * N_JOINTS)
-    saved.applied = True
-    log.info("已写入跟随增益 mit_kp=%.1f mit_kd=%.1f，并清零 kd_extra", K, B)
-    return saved
-
-
-def restore_joint_gains(arm, saved) -> None:
-    """把 `apply_joint_gains` 存下的原值逐字写回。**幂等**。
-
-    ⚠ **任何 `movej` 之前都必须先调它** —— 跟随期间 `mit_kp` 是 25，`movej` 撑不住。
-    """
-    if saved is None or not getattr(saved, "applied", False):
-        return
-    try:
-        for i in range(N_JOINTS):
-            arm.params.set_joint_param(i, saved.kp[i], saved.kd[i], saved.tau_max[i])
-        arm.set_ff_vec(_FF_VEC_KD_EXTRA, saved.kd_extra)
-        saved.applied = False
-        log.info("已还原出厂增益 mit_kp/kd 与 kd_extra")
-    except Exception:
-        log.exception("⚠ 还原增益失败 —— 参数会留在改过的值上，直到断电或手工还原！")
 
 
 def read_payload(arm):
@@ -320,8 +280,8 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         sp = list(speed_limit or DEFAULT_SPEED_LIMIT)
         ac = list(accel_limit or DEFAULT_ACCEL_LIMIT)
         dt_nom = 1.0 / max(hz, 1.0)
-        kp = [float(x) for x in (K if K is not None else [SETUP_K] * N_JOINTS)]
-        kd = [float(x) for x in (B if B is not None else [SETUP_B] * N_JOINTS)]
+        kp = [float(x) for x in (K if K is not None else SETUP_K)]
+        kd = [float(x) for x in (B if B is not None else SETUP_B)]
         tau_max = _read_tau_max(arm)
 
         # ── prime：托住实测位姿（`joint_follow.prime`）──
