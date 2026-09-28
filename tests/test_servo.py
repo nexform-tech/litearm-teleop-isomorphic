@@ -42,6 +42,7 @@ class FakeArm:
         self.jp = [_JP(kp=400.0, kd=5.0, tau_max=78.0) for _ in range(N_JOINTS)]
         self.kd_extra = [6.0, 6.0, 6.0, 6.0, 0.0, 0.0, 0.0]
         self.move_js_calls: list = []
+        self.move_timeout = 3.0
         self.movej_calls: list = []
         self.reject_at = set(reject_at)
         self._sent = 0
@@ -274,3 +275,54 @@ def test_hold_at_current_uses_measured_pose():
     arm = FakeArm(q=[0.3] * N_JOINTS)
     servo.hold_at_current(arm)
     assert arm.movej_calls[-1] == [0.3] * N_JOINTS
+
+
+# ────────────────────────── 对齐（照搬 _do_align）──────────────────────────
+
+def _limits():
+    from liteteleop.safety import read_limits_ok
+    return read_limits_ok([-1.0] * N_JOINTS, [1.0] * N_JOINTS, N_JOINTS)
+
+
+def test_align_skips_when_no_frame_arrives():
+    """等不到主臂帧 ⇒ **跳过对齐**（不是卡死、也不是拿垃圾去 movej）。"""
+    arm = FakeArm()
+    got = servo.align_to_master(arm, lambda: (None, None), _limits(), timeout=0.05)
+    assert got is None
+    assert arm.movej_calls == [], "没帧就不该动臂"
+
+
+def test_align_clips_to_limits_and_uses_align_speed():
+    """超限的帧要**钳位**后再 movej，而且速度必须是 `align_speed`（慢）。"""
+    arm = FakeArm(q=[0.0] * N_JOINTS)
+    payload = __import__("liteteleop.wire", fromlist=["x"]).encode_teleop(
+        [5.0] + [0.2] * (N_JOINTS - 1), [0.0] * N_JOINTS, 0.0)
+    got = servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
+    assert got is not None
+    assert got[0] == 1.0, "超出上界的轴必须被钳到上界"
+    assert arm.movej_calls, "应该调了 movej"
+    assert abs(got[1] - 0.2) < 1e-9, "没超限的轴一个数都不许动"
+
+
+def test_align_failure_is_not_fatal():
+    """`movej` 失败**不致命** —— 原版就是"跟随会逐步修正"。"""
+    class _MovejFails(FakeArm):
+        def movej(self, q, speed=1.0):
+            raise RuntimeError("movej 超时")
+
+    arm = _MovejFails()
+    payload = __import__("liteteleop.wire", fromlist=["x"]).encode_teleop(
+        [0.1] * N_JOINTS, [0.0] * N_JOINTS, 0.0)
+    assert servo.align_to_master(arm, lambda: (payload, 0.0), _limits(),
+                                 timeout=0.5) is None
+
+
+def test_align_warns_loudly_on_a_large_slew(caplog):
+    """⚠ 大位移必须**大声预警**：`movej(speed=0.15)` 走大位移会撞上 move_timeout。"""
+    import logging
+    arm = FakeArm(q=[0.0] * N_JOINTS)
+    payload = __import__("liteteleop.wire", fromlist=["x"]).encode_teleop(
+        [0.9] * N_JOINTS, [0.0] * N_JOINTS, 0.0)          # 位移 0.9 > 阈值 0.30
+    with caplog.at_level(logging.WARNING, logger="liteteleop.servo"):
+        servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
+    assert any("过大" in r.message for r in caplog.records), "大位移没预警"

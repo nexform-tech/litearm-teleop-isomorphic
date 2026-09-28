@@ -38,13 +38,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from .safety import slew_target
+from .safety import clamp_to_limits, slew_target
 from .wire import N_JOINTS
+from .wire import decode_teleop as wire_decode
 
 log = logging.getLogger("liteteleop.servo")
 
 __all__ = [
-    "DEFAULT_K", "DEFAULT_B", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
+    "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
+    "align_to_master", "DEFAULT_K", "DEFAULT_B", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "JointGains", "apply_joint_gains",
     "restore_joint_gains", "hold_at_current", "follow", "measure_move_js_cost",
 ]
@@ -67,6 +69,16 @@ DEFAULT_HZ = 250.0
 #: `emit_reason` 的 item：`kd_extra`（τ 域软件微分阻尼）。见 spec §10 陷阱 #8：
 #: 它在 **0x26 向量表**里，要用 `get_ff_vec(15)` 读，**不是** `get_ff_scalar(15,·)`。
 _FF_VEC_KD_EXTRA = 15
+
+#: **对齐**：照搬 `teleop_manager` 的三个默认值。
+#: `align_speed` 是"多快挪到主臂位姿"，不是跟随速度 —— 它必须慢。
+ALIGN_SPEED = 0.15
+#: 等首帧的上限（`_do_align` 里写死 5.0 s）。
+ALIGN_TIMEOUT = 5.0
+#: 对齐位移超过这个值就**大声预警**。理由：`movej(speed=0.15)` 走大位移要很久，
+#: 而本工具 `move_timeout=3 s` ⇒ 会在半路超时；更糟的是位移大意味着**从臂会大幅甩过去**。
+#: ⚠ **等距遥操的正确用法是【先用手把两条臂摆到相近姿态再启动】** —— 对齐只兜小差。
+ALIGN_WARN_DELTA = 0.30
 
 #: 连续被固件拒帧到这个次数 ⇒ 视作"链路/状态坏了"，抛出而不是继续硬撑。
 #: 理由：`move_js` 被拒 ⇒ **没有 kick 看门狗** ⇒ 0.1 s 后固件 fail-soft ⇒ **臂会垂**。
@@ -243,3 +255,57 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
     finally:
         if own_gains:
             restore_joint_gains(arm, saved)
+
+
+# ────────────────────────── 对齐（照搬 `_do_align`）──────────────────────────
+
+def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
+                    timeout: float = ALIGN_TIMEOUT):
+    """等首帧（带超时）→ 钳位 → **低速 `movej` 对齐** → 返回对齐到的位姿。
+
+    逐条照搬 `teleop_manager._do_align()`：
+
+    - 等首帧上限 `timeout`（原版写死 5 s）；等不到就**跳过对齐**并返回 `None`
+      （原版：`log.warning("teleop 对齐：5s 内未收到 master 帧，跳过对齐")`）
+    - `clip` 到软限位；被钳的轴要报出来
+    - `movej(clamped, speed=align_speed)`（原版还有 `settle_s=0.5`，本 SDK 的 `movej`
+      本身阻塞到位，`settle` 是隐含的）
+    - `movej` 失败**不致命**（原版：`对齐 movej 失败（跟随会逐步修正）`）⇒ 返回 `None`
+
+    ⚠ 本仓**多加一条**：位移超过 `ALIGN_WARN_DELTA` 时**大声预警**（原版没有）。
+    理由见那个常量的注释 —— 大位移会让从臂在大幅摆动中撞上 `move_timeout`。
+    """
+    deadline = time.monotonic() + float(timeout)
+    master_q = None
+    while time.monotonic() < deadline:
+        payload, _ts = take_frame()
+        if payload is not None:
+            try:
+                master_q = wire_decode(payload)["q"]
+                break
+            except Exception as e:                        # noqa: BLE001
+                log.warning("对齐：帧解不开（%s），继续等", e)
+        time.sleep(0.01)
+    if master_q is None:
+        log.warning("对齐：%.0f s 内未收到主臂帧，跳过对齐（跟随会逐步修正）", timeout)
+        return None
+
+    clamped, sat = clamp_to_limits(master_q, limits)
+    if any(sat):
+        log.warning("对齐：关节 %s 超限已钳位",
+                    [i + 1 for i, s_ in enumerate(sat) if s_])
+    q_now = _q_meas(arm)
+    delta = max(abs(a - b) for a, b in zip(clamped, q_now))
+    if delta > ALIGN_WARN_DELTA:
+        log.warning(
+            "⚠⚠ 对齐位移 %.3f rad 过大（阈值 %.2f）—— 从臂会**大幅摆动**。"
+            "`movej(speed=%.2f)` 很可能撞上 move_timeout=%.1fs 而在半路超时；"
+            "**正确做法是先用手把两条臂摆到相近姿态再启动遥操**。",
+            delta, ALIGN_WARN_DELTA, speed, arm.move_timeout)
+    try:
+        arm.movej(clamped, speed=speed)
+    except Exception as e:                                # noqa: BLE001
+        log.warning("对齐 movej 失败（跟随会逐步修正）: %s", e)
+        return None
+    log.info("对齐完成（位移 %.3f rad）", delta)
+    return list(clamped)
