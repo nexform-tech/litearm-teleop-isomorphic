@@ -54,7 +54,30 @@ __all__ = [
 #    litearm-server 的 K=25 / B=0.5 走 `send_mit` **随帧下发**；`move_js` **没有那条通道**，
 #    要改只能写固件的 `mit_kp`/`mit_kd`，而那会**连带改坏 `movej`**（`movej` 用的就是
 #    `mit_kp`，软 16 倍的位置环撑不住、到不了位）。用户裁决：**不改刚度，用出厂值**。
-DEFAULT_SPEED_LIMIT = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]
+#: ⛔⛔ **不是 litearm-server 的值** —— 有实测依据（2026-09-28）。
+#:
+#: server 的那份 `[2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]` 来自一个**没有固件安全层**的
+#: 系统：它走 CAN **直连电机**，且 `joint_follow` 每步都主动豁免了检查 ——
+#:
+#:     hw.assert_operational(measured_overspeed_factor=float('inf'),   # 超速检查关掉
+#:                           skip_position=True)                        # 位置检查跳过
+#:
+#: 我们经过 STM32 固件，而固件的超速判据**永久开着、豁免不了**：
+#:
+#:     safety_check.c:  |dq| > jp->vel_max × 1.5   连续 5 拍 ⇒ 锁存 joint_fault
+#:     固件整臂表:      vel_max = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]  ⇒ 阈值 2.6~3.0
+#:
+#: ⇒ 拿 server 的 5/13 rad/s 会**持续越线**：从臂不会更快，只会锁存掉力
+#:   （锁存 ⇒ 固件停发该轴控制帧 ⇒ 达妙电机"收帧才回状态"⇒ 静默 ⇒ 80 ms 后 `FB_STALE`）。
+#:   真机实录（`21:04:17`）：`OVERSPEED` 首拍即报，5 拍后 J3 锁存，J4 随后跟进。
+#:
+#: ⚠ `vel_max` 是**编译期常量**（`defaults.c`）—— SDK 只暴露 `kp/kd/tau_max/q_min/q_max`，
+#:   **没有任何命令能改它**（`set_joint_limit` 只能改限位）⇒ **不改固件就绕不过去**。
+#:
+#: ⇒ 取固件整臂表的 `speed_limit`（与 `vel_max` 同值）。**这不是"变慢"**：`move_js` 路线下
+#:   固件用的就是这张表 ⇒ **这才是从臂本来就有的速度**，只是 MIT 路线的位置命令由 PC 给，
+#:   所以这张表要由我们在 PC 侧执行。
+DEFAULT_SPEED_LIMIT = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]
 DEFAULT_ACCEL_LIMIT = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]
 DEFAULT_ENGAGE_SEC = 0.3
 

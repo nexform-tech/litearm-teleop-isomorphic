@@ -333,6 +333,26 @@ def test_default_payload_is_the_gripper_the_user_gave():
     assert servo.DEFAULT_PAYLOAD_COM == (0.0, 0.0, 0.03)  # 质心 3 cm 在 Z 轴
 
 
+# ────────── 限速：必须落在固件的速度包络之内（绕不过去的硬约束）──────────
+
+def test_speed_limit_stays_within_the_firmware_velocity_envelope():
+    """⛔ `speed_limit` 必须 ≤ 固件整臂表的 `vel_max` —— 否则必然锁存掉力。
+
+    固件 `safety_check.c`：`|dq| > jp->vel_max × 1.5` 连续 5 拍 ⇒ 锁存 `joint_fault`
+    ⇒ 固件**停发该轴控制帧** ⇒ 达妙电机"收帧才回状态"⇒ 静默 ⇒ 80 ms 后 `FB_STALE`。
+    真机实录：`OVERSPEED` 首拍即报，5 拍后锁存。
+
+    ⚠ `vel_max` 是**编译期常量**（`defaults.c`），SDK 只暴露 `kp/kd/tau_max/q_min/q_max`
+    ⇒ **不改固件就绕不过去**。server 能无视它，是因为走 CAN 直连电机。
+
+    判别力：把 `DEFAULT_SPEED_LIMIT` 改回 server 的 `[2.8,3.4,5,5,10,8,13]`，本用例立刻红。
+    """
+    from liteteleop import servo
+    vel_max = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]        # 固件 defaults.c 的整臂表
+    for i, (sl, vm) in enumerate(zip(servo.DEFAULT_SPEED_LIMIT, vel_max)):
+        assert sl <= vm, f"J{i+1} speed_limit={sl} 越过固件 vel_max={vm}"
+
+
 # ────────────── 限位内缩量：必须盖住 CDC 路线的滞后冲过 ──────────────
 
 def test_limit_margin_covers_the_worst_case_overshoot():
