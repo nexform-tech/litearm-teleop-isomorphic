@@ -45,7 +45,7 @@ from .wire import decode_teleop as wire_decode
 log = logging.getLogger("liteteleop.servo")
 
 __all__ = [
-    "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
+    "AlignTooFar", "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
     "align_to_master", "DEFAULT_K", "DEFAULT_B", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "JointGains", "apply_joint_gains",
     "restore_joint_gains", "hold_at_current", "follow", "measure_move_js_cost",
@@ -75,7 +75,11 @@ _FF_VEC_KD_EXTRA = 15
 ALIGN_SPEED = 0.15
 #: 等首帧的上限（`_do_align` 里写死 5.0 s）。
 ALIGN_TIMEOUT = 5.0
-#: 对齐位移超过这个值就**大声预警**。理由：`movej(speed=0.15)` 走大位移要很久，
+class AlignTooFar(RuntimeError):
+    """两臂相距太远，**拒绝启动跟随**（spec §7.1 的精神：宁可拒启动，不要静默退化）。"""
+
+
+#: 对齐位移超过这个值就**拒绝启动**（不是预警）。理由：`movej(speed=0.15)` 走大位移要很久，
 #: 而本工具 `move_timeout=3 s` ⇒ 会在半路超时；更糟的是位移大意味着**从臂会大幅甩过去**。
 #: ⚠ **等距遥操的正确用法是【先用手把两条臂摆到相近姿态再启动】** —— 对齐只兜小差。
 ALIGN_WARN_DELTA = 0.30
@@ -313,7 +317,8 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
 # ────────────────────────── 对齐（照搬 `_do_align`）──────────────────────────
 
 def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
-                    timeout: float = ALIGN_TIMEOUT):
+                    timeout: float = ALIGN_TIMEOUT,
+                    max_delta: float = ALIGN_WARN_DELTA):
     """等首帧（带超时）→ 钳位 → **低速 `movej` 对齐** → 返回对齐到的位姿。
 
     逐条照搬 `teleop_manager._do_align()`：
@@ -325,8 +330,9 @@ def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
       本身阻塞到位，`settle` 是隐含的）
     - `movej` 失败**不致命**（原版：`对齐 movej 失败（跟随会逐步修正）`）⇒ 返回 `None`
 
-    ⚠ 本仓**多加一条**：位移超过 `ALIGN_WARN_DELTA` 时**大声预警**（原版没有）。
-    理由见那个常量的注释 —— 大位移会让从臂在大幅摆动中撞上 `move_timeout`。
+    ⚠ 本仓**多加一条**（原版没有）：位移超过 `max_delta` 时**抛 `AlignTooFar` 拒启动**，
+    而不是硬着头皮 `movej`。理由见下面那段注释 —— 大位移的 `movej` 会在半路超时，
+    而超时返回时臂还在走，紧接着就会把 `prime` 打崩。
     """
     deadline = time.monotonic() + float(timeout)
     master_q = None
@@ -350,12 +356,18 @@ def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
                     [i + 1 for i, s_ in enumerate(sat) if s_])
     q_now = _q_meas(arm)
     delta = max(abs(a - b) for a, b in zip(clamped, q_now))
-    if delta > ALIGN_WARN_DELTA:
-        log.warning(
-            "⚠⚠ 对齐位移 %.3f rad 过大（阈值 %.2f）—— 从臂会**大幅摆动**。"
-            "`movej(speed=%.2f)` 很可能撞上 move_timeout=%.1fs 而在半路超时；"
-            "**正确做法是先用手把两条臂摆到相近姿态再启动遥操**。",
-            delta, ALIGN_WARN_DELTA, speed, arm.move_timeout)
+    if delta > max_delta:
+        # ⚠ **这里【不动臂】**，直接拒启动。理由（真机踩过）：
+        #   `movej(speed=0.15)` 走大位移会撞上 `move_timeout`（本工具 3 s）**在半路超时**，
+        #   而超时返回时**臂还在走** —— 紧接着 prime 发 `move_js` 就会因为
+        #   "目标 ≠ 实测且 dq=0" 被拒，把整个跟随打崩（真机就是这么挂的两次）。
+        #   更根本的是：2+ rad 的位移**本来就不是"对齐"，是一次大幅摆动**。
+        raise AlignTooFar(
+            f"两臂相距 {delta:.3f} rad，超过对齐上限 {max_delta:.2f} rad —— **拒绝启动跟随**。"
+            f"`movej(speed={speed:.2f})` 走这么远会撞上 move_timeout={arm.move_timeout:.1f}s "
+            f"而在半路超时，超时后臂还在走。"
+            f"⚠ 正确做法：**用手把两条臂摆到相近姿态再启动**（对齐只兜小差）；"
+            f"或者检查主臂是不是没扶住、已经垂下去了。")
     try:
         arm.movej(clamped, speed=speed)
     except Exception as e:                                # noqa: BLE001

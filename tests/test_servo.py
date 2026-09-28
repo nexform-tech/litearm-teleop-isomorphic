@@ -292,16 +292,21 @@ def test_align_skips_when_no_frame_arrives():
     assert arm.movej_calls == [], "没帧就不该动臂"
 
 
-def test_align_clips_to_limits_and_uses_align_speed():
-    """超限的帧要**钳位**后再 movej，而且速度必须是 `align_speed`（慢）。"""
-    arm = FakeArm(q=[0.0] * N_JOINTS)
+def test_align_clips_to_limits():
+    """超限的帧要**钳位**后再 movej。
+
+    ⚠ 臂起始位姿刻意取 **0.9**（贴近上界）：这样"钳到 1.0"的位移只有 0.1，
+    不会撞上 `AlignTooFar` 那条。用 0.0 起的话位移 1.0 会被**拒绝启动**，
+    测的就变成另一件事了。
+    """
+    arm = FakeArm(q=[0.9] * N_JOINTS)
     payload = __import__("liteteleop.wire", fromlist=["x"]).encode_teleop(
-        [5.0] + [0.2] * (N_JOINTS - 1), [0.0] * N_JOINTS, 0.0)
+        [5.0] + [0.95] * (N_JOINTS - 1), [0.0] * N_JOINTS, 0.0)
     got = servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
     assert got is not None
     assert got[0] == 1.0, "超出上界的轴必须被钳到上界"
     assert arm.movej_calls, "应该调了 movej"
-    assert abs(got[1] - 0.2) < 1e-9, "没超限的轴一个数都不许动"
+    assert abs(got[1] - 0.95) < 1e-9, "没超限的轴一个数都不许动"
 
 
 def test_align_failure_is_not_fatal():
@@ -317,15 +322,21 @@ def test_align_failure_is_not_fatal():
                                  timeout=0.5) is None
 
 
-def test_align_warns_loudly_on_a_large_slew(caplog):
-    """⚠ 大位移必须**大声预警**：`movej(speed=0.15)` 走大位移会撞上 move_timeout。"""
-    import logging
+def test_align_refuses_when_the_arms_are_far_apart():
+    """⚠⚠ 大位移**拒绝启动**，而且**一个字节都不许发给臂**。
+
+    真机踩过两次：`movej(speed=0.15)` 走大位移撞上 `move_timeout` **在半路超时**，
+    而超时返回时**臂还在走** ⇒ 紧接着的 `prime` 因"目标 ≠ 实测 + dq=0"被拒 ⇒ 整个跟随崩掉。
+
+    判别力：`assert movej_calls == []` 断言"拒绝时不动臂" ——
+    改回"预警后照样 movej"这条会红。
+    """
     arm = FakeArm(q=[0.0] * N_JOINTS)
     payload = __import__("liteteleop.wire", fromlist=["x"]).encode_teleop(
         [0.9] * N_JOINTS, [0.0] * N_JOINTS, 0.0)          # 位移 0.9 > 阈值 0.30
-    with caplog.at_level(logging.WARNING, logger="liteteleop.servo"):
+    with pytest.raises(servo.AlignTooFar, match="拒绝启动"):
         servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
-    assert any("过大" in r.message for r in caplog.records), "大位移没预警"
+    assert arm.movej_calls == [], "拒绝启动时**绝不许动臂**"
 
 
 # ────────────── 固件「目标≠实测 + dq=0 就拒」的退路（真机踩过）──────────────

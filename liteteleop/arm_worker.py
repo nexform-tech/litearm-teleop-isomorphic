@@ -390,7 +390,12 @@ class ArmWorker:
         # ⚠ 少了这一步，从臂会由 `slew_target` 直接拉过去，速度上限是 `speed_limit`
         #    （J1 到 2.8 rad/s），比 `align_speed=0.15` 快近 20 倍 —— 那是**大幅甩动**。
         self._log("等待主臂首帧并对齐 …")
-        aligned = servo.align_to_master(arm, self._slot.take, self._limits)
+        try:
+            aligned = servo.align_to_master(arm, self._slot.take, self._limits)
+        except servo.AlignTooFar as e:
+            # ⛔ **不启动跟随** —— 两臂相距太远时硬跟就是一次大幅摆动。
+            self._log(f"⛔ 拒绝启动：{e}")
+            raise
         self._log("✓ 已对齐" if aligned is not None
                   else "⚠ 未对齐（没收到帧 或 movej 失败）—— 跟随会逐步修正")
 
