@@ -94,7 +94,33 @@ cmd->q_ref = slew_linear(q_s[i], cmd->q_ref, v_lim * LITEARM_CTRL_DT);
   `g_defaults.joint[]`）。
   > ⚠ **别读成 3.5**：`defaults.c:34` 那张 `speed_limit=3.5f` 的表是 **`LITEARM_BENCH_1J` 单电机台架**的，
   > 两张表由条件编译互斥。**这类常量一律按符号定位、不按行号**（§10 陷阱 12）。
-- **这条给了设计一个大便宜**：固件的 `slew_linear` 就是现成的限速器，`dq` 就是旋钮 ⇒ "慢速对齐 / 高速跟随"= **同一个 `move_js` 调用只换 `dq`**，PC 侧不需要手写 ramp。
+- ⚠⚠ **但 `dq` 有第二个角色，别只算第一个**：它**原样**进电机 MIT 帧的速度项 ——
+  `dq_s[i] = clampf(target_dq[i], -jp->vel_max, jp->vel_max)`（`control_loop.c:2109`），
+  而 MIT 控制律是 `τ = kp·(q_ref − q) + kd·(dq_ref − dq) + τ_ff`。
+  ⇒ **给一个拍脑袋的定值 `dq`，等于向电机注入一个编造的速度前馈。**
+  例：J1 的 `kd` 合计 `mit_kd 5.0 + kd_extra 6.0 = 11.0`，若 `dq` 填 6.0（会被钳到
+  `vel_max = 2.0`）⇒ **凭空 22 Nm**。**这条是本设计最早的一版里被漏掉的，见 §5.1 的现写法。**
+
+#### (a′) `dq` 的两个角色与真机实证 `[实测]`
+
+`[实测]` 来源：`litearm-server/scripts/e2e_movejs_real.py` 的负控 / 正控对拍（2026-09-20 真机）：
+
+| 组 | 条件 | 结果 |
+| --- | --- | --- |
+| **负控** | 发 `q_now + 0.06` 偏移、`dq = 0` | `max\|Δq\| = 0.0000`（**纹丝不动**） |
+| **正控** | `dq` 取 `q(t)` 的**解析导数** | 正常跟随，跟踪误差 rms **0.0043 rad** |
+
+⇒ **结论：`dq` 必须是真实的路径速度，逐拍算对 —— 不是"给个上限"。**
+它同时满足两个角色：`|dq|` 给出走位速率，`dq` 本身给出正确的速度前馈。
+
+> ⛔ **既有实证的覆盖边界（本设计必须知道）**：那个脚本**刻意把速度压在 0.5 rad/s 以下**
+> （脚本内写死 `if |dq|.max() > 0.5: raise SystemExit`），实际峰值只有 **0.032 rad/s**。
+> 而遥操跟随会跑到 **1~2 rad/s** —— 该量级下速度前馈的行为**没有任何实证**。
+> **这才是 §11 真正要补的 spike**（S3），不是重做已经验过的 `dq=0` 与低速跟随。
+
+- **这条给了设计一个便宜**：固件的 `slew_linear` 就是现成的限速器，`dq` 就是旋钮 ⇒
+  "慢速对齐 / 高速跟随"= **同一个 `move_js` 调用，只换 `dq` 的幅值上限**。
+  （但 `dq` **仍须逐拍按真实速度算**，见 §5.1。）
 
 > ⚠ **SDK 文档在此处不完整**：`DEVELOPER_GUIDE.md:259` 只写 "`dq` is a velocity reference, not a limit"，**漏掉了"`|dq|` 同时是 `q_ref` 的斜率上限、`dq=0`
 > 冻结该轴"这半句**。它不算错（`dq` 确实是参考值，且 `vel_max` 另有一道钳位），但按它字面推理会写出"臂不动"的代码。登记为陷阱 1（§10），**不改 SDK**。
@@ -263,14 +289,42 @@ n = 7 时共 **70 B**。
 
 | 态 | 下发 | 退出条件 |
 | --- | --- | --- |
-| `ALIGNING` | `move_js(clamp(q_master), dq=[align_rate]*n)` | `max_j \|q_master_j − q_slave实测_j\| ≤ 0.02 rad` 持续 5 拍 |
-| `FOLLOWING` | `move_js(clamp(q_master), dq=[follow_rate]*n)` | watchdog 超时 / 用户停止 |
+| `ALIGNING` | 下方**逐拍公式**（`rate_cap = align_rate`） | `max_j \|q_master_j − q_slave实测_j\| ≤ 0.02 rad` 持续 5 拍 |
+| `FOLLOWING` | 下方**逐拍公式**（`rate_cap = follow_rate`） | watchdog 超时 / 用户停止 |
 | `HOLDING` | 起手 `park()` + **不发** `move_js`；持续 ≥ 2 s 后补一次 `movej(q_now)` | 连续收帧 5 拍 ⇒ `ALIGNING`（**升级后仍是 `HOLDING`**，只是持位机制换成 `ht_on`，回 `ALIGNING` 的条件不变） |
 
-- **`align_rate` 默认 0.3 rad/s**（≈17°/s，界面可调 0.1~1.0）。这就是"慢速对齐"——不需要 PC 侧算 ramp，直接交给固件的 `slew_linear`。
-- **`follow_rate` 默认 6.0 rad/s**，**故意高于各轴 `speed_limit`(1.75~3.5)** ⇒ 固件的 `speed_limit` 成为事实上限，语义就是"跟着主臂，能多快多快"。
+#### 逐拍目标与 `dq`：两个阶段共用一条式子
+
+```text
+每拍 (100 Hz)，逐轴 j：
+  q_tgt_j   = clamp(q_master_j, q_min_j, q_max_j)
+  saturated = (q_master_j != q_tgt_j)          # 该轴被软限位钳住了
+  err_j     = q_tgt_j − q_slave实测_j
+  dq_j      = clamp( k_p · err_j + lpf(dq_master_j), ±rate_cap )
+  if saturated: dq_j = 0.0                     # 抗饱和：不许朝限位里推
+  move_js(q = q_tgt, dq = dq)
+```
+
+**三个要点，缺一不可**（§2.3(a) / (a′) 是它们的依据）：
+
+1. **`dq` 必须逐拍按真实速度算**，不能是拍脑袋的定值 —— 它同时是走位速率**和**速度前馈。
+   - `ALIGNING`：主臂此时应静止 ⇒ `dq_master ≈ 0` ⇒ `dq ≈ k_p·err`，由误差驱动平滑收敛；`err → 0` 时 `dq → 0`，自然到位无冲击。
+   - `FOLLOWING`：`dq_master` 主导（`k_p·err` 只有 ~0.008 rad/s 量级）⇒ 速度前馈 + 一点残余修正。
+2. **`dq_master` 必须一阶低通（截止 ~20 Hz）**。零重力拖动下的实测 `dq` 噪声很大，直接灌进速度前馈会让电机抖。
+3. **抗饱和不许省**。被钳位的轴若仍带着 `dq_master`，会以 `kd·dq_master` **持续顶进硬限位**。
+   ⚠ 这不是边角情况：本机真机软限位里 **J4 上端只有 `+0.0175 rad`**（≈1°，见
+   `e2e_movejs_real.py` 的 `REAL_MAX`），主臂 J4 一拖过零，从臂立刻吃到这个情形。
+
+**参数**（下表即 `safety.py` 的配置面）：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `k_p` | 2.0 /s | 误差→速度增益。`err < 0.15 rad` 时不饱和，收敛平滑 |
+| `align_rate` | 0.3 rad/s（可调 0.1~1.0） | `ALIGNING` 的 `\|dq\|` 上限 ⇒ **这就是"慢速对齐"** |
+| `follow_rate` | 2.0 rad/s | `FOLLOWING` 的 `\|dq\|` 上限。取各轴 `speed_limit`(1.75~2.0) 附近；固件另有 `speed_limit` 封顶 |
+
 - **收敛判据用实测 q**（`get_state().q`），不是指令 q —— 只有实测到位才算对齐。
-- **`ALIGNING → FOLLOWING` 不会造成阶跃**：切换的条件是误差已 ≤ 0.02 rad，此时换多大的 `dq` 都不会跳。
+- **`ALIGNING → FOLLOWING` 不会造成阶跃**：切换条件是误差已 ≤ 0.02 rad，此时换多大的 `rate_cap` 都不会跳。
 - **`ALIGNING` 卡住检测**：连续 >20 s 未收敛 ⇒ 停在 `ALIGNING` + 告警（**不自动进 `FOLLOWING`**）。常见原因：主臂正在被人拖动。界面须显示"对齐中，请勿移动主臂"+ 剩余最大误差 + 已用时。
 
 > **为什么不是 litearm-server 的 `movej` 粗对齐 + `joint_follow`**：`joint_follow` 在 `litearm-python` 上不存在；而 §2.3(a) 一旦成立，`movej` 那一段就完全冗余
@@ -410,7 +464,7 @@ n = 7 时共 **70 B**。
 | litearm-server（pylitearm） | 本仓（litearm-python） |
 | --- | --- |
 | `arm.zero_gravity(on_sample=)` | `zero_g_start()` + 读 `get_state()` 缓存 |
-| `arm.joint_follow(target_provider, K, B, speed_limit, accel_limit)` | **自己写 100 Hz `move_js` 环**，限速交给固件 `slew_linear`（§2.3(a)） |
+| `arm.joint_follow(target_provider, K, B, speed_limit, accel_limit)` | **自己写 100 Hz `move_js` 环**：限速交给固件 `slew_linear`，而 `dq` 按 §5.1 逐拍算真实路径速度（**不是给常数** —— 常数会变成编造的速度前馈，§2.3(a)） |
 | `arm.request_stop()`（就地高刚度持位） | `movej(q_now, speed=0.3)` 受控接管（`park()` 只作瞬态兜底，§2.3(c)） |
 | `arm.kin.q_min/q_max` | `params.all_joint_params()` → `q_min/q_max`（**与固件钳位同源 ⇒ 更权威**） |
 | `pylitearm` 的 `joint_limit_margin_rad` | 不需要：固件软限位本身已含 1° 余量，再减 margin 是双重收紧 |
@@ -418,7 +472,7 @@ n = 7 时共 **70 B**。
 ### 9.3 本设计**结构性消除**的两处 server 已知缺陷
 
 1. **`movej → joint_follow` 交接竞态**：server 在 main 上靠"对齐后把共享目标同步到对齐位置"打补丁（`teleop_manager.py:307-313`）。本设计把交接变成状态机里一个有明确判据（误差 ≤ 0.02
-   rad 持续 5 拍）的**必然阶段**，且 `ALIGNING`/`FOLLOWING` 是**同一个 `move_js` 调用只换 `dq`** ⇒ 不存在模式切换的交接面。
+   rad 持续 5 拍）的**必然阶段**，且 `ALIGNING`/`FOLLOWING` 走**同一条 `move_js` 公式、只换 `rate_cap`**（§5.1）⇒ 不存在模式切换的交接面。
 2. **对齐期间不可中断**：server 的 `_do_align` 阻塞单 worker 最长 5 s，期间只能靠急停中止（relay spec §3.1
    自列为已知限制）。本设计的**伺服环（`ALIGNING`/`FOLLOWING`）完全没有阻塞式等到位** —— 它只是 100 Hz 发 `move_js`，每 10 ms 回一次头，停止随时生效。
    > ⚠ **但收尾路径不是无阻塞的**：两条收尾都要 `movej(q_now)`（§5.3），而 `movej()` 会经 `_arrive()` 阻塞到 `arm.move_timeout`。本工具把它显式设成 3
@@ -431,7 +485,8 @@ n = 7 时共 **70 B**。
 | # | 陷阱 | 等级 |
 | --- | --- | --- |
 | 1 | `move_js` 的 `dq`：**`\|dq\|` 是 `q_ref` 走位速率上限，`dq=0` 冻结该轴**；符号被 `fabsf` 丢弃。SDK `DEVELOPER_GUIDE.md:259` 只说了"不是 limit"，漏了这半句 | `[源码]` |
-| 2 | **别把主臂 `dq` 直接当从臂 `move_js` 的 `dq`** —— 主臂一停（`dq≈0`），从臂立刻冻住 | `[源码]`，由陷阱 1 推出 |
+| 2 | `dq` 是**双角色**：`\|dq\|` 定走位速率，`dq` **本身**还进电机速度前馈（`τ` 里的 `kd·(dq_ref − dq)`）。⇒ ① **填定值 = 编造速度前馈**（J1 填到 2.0 就是凭空 22 Nm）；② 必须**逐拍算真实路径速度**；③ **被限位钳住的轴必须把 `dq` 置 0**，否则以 `kd·dq` 持续顶进硬限位；④ 必须**带 `k_p·err` 误差项**，否则主臂停住时 `\|dq\|→0`、走位速率归零，残余误差永不收敛 | `[实测]`（`e2e_movejs_real.py` 负控/正控） |
+| 2b | 上一条的**实证只覆盖到 0.5 rad/s**（脚本写死上限，实际峰值 0.032 rad/s）。**遥操跟随的 1~2 rad/s 量级无人验过** —— 这是 §11 的 S3 | `[实测]` |
 | 3 | watchdog fail-soft = **0.6× 刚度 + `τ=0` ⇒ 缓慢下垂**（既非自由落体，也非稳住） | `[源码]` |
 | 4 | 只有 `movej` 到位后的 `ht_on` 态才真稳（2× 刚度 + 重力前馈）⇒ **收尾必须 `movej(q_now)`** | `[源码]` |
 | 5 | `park()` 只把 fail-soft 刚度**拉回** 1.0×（阻止 0.6× 那次降刚度），**`tau` 仍为 0 ⇒ 仍会垂 `G/mit_kp`**。不是 `request_stop` 的等价物 | `[源码]` |
@@ -448,26 +503,34 @@ n = 7 时共 **70 B**。
 
 ## 11. 真机 spike（**先于一切实现**）
 
-> **为什么先做**：§2.3(a) 的 `dq` 语义是整个伺服环的地基，而它目前只是 `[源码]`。离线部分（状态机、界面）全都写在这个语义之上 —— 语义若错要返工，而 spike 只接一条臂、几十行、跑几十秒。
+> **为什么先做**：§5.1 的 `dq` 公式是整个伺服环的地基，而它的**高速段没有实证**（§2.3(a′)）。
+> 离线部分（状态机、界面）全都写在这个公式之上 —— 公式若错要返工，而 spike 只接一条臂、跑几十秒。
+> **不是全部从零**：`dq=0 冻结` 与**低速**跟随已被 `e2e_movejs_real.py` 真机验过（含负控）。
 > **唯一例外**：臂此刻接不上时，先做 §12 里**与 `dq` 语义无关**的纯离线三件（`wire.py` / `link.py` / `test_link.py`），它们不会白做。
 >
-> ⛔ **S1~S4 必须在 7 关节整臂固件上做，不许在 `LITEARM_BENCH_1J` 单电机台架上做。**
+> ⛔ **S1~S5 必须在 7 关节整臂固件上做，不许在 `LITEARM_BENCH_1J` 单电机台架上做。**
 > 台架固件的 `.dyn` 初始化器**未设 `hold_kp_gain` ⇒ 取 0**，于是 `ht_on` 下发
 > kp = 0、`tau = 0`；`can_dyn=false` 也让 `ht_tauf = 0`。后果：**台架板上 `movej` 收尾会
-> 逐渐完全失力**，S4 会得出"`movej` 比只停发更差"的结论 —— 那是台架构型造成的，
+> 逐渐完全失力**，S5 会得出"`movej` 比只停发更差"的结论 —— 那是台架构型造成的，
 > 与本设计无关。spike 报告必须写明**板卡与固件版本串**。
 
-| # | 验什么 | 通过判据 |
-| --- | --- | --- |
-| **S1** | **`dq=0` 是否真的冻结该轴** | 发 `move_js(q_now + 0.1, dq=0)` 持续 2 s，臂**不动**（`\|Δq\| < 0.005 rad`） |
-| **S2** | `dq` 与实测走位速率的关系 | 发 `move_js(q_now + 0.2, dq=0.3)`，实测速率 ≈ 0.3 rad/s（±20%）；`dq=6.0` 时实测速率 ≈ 该轴 `speed_limit` |
-| **S3** | 100 Hz `move_js` 连续 30 s 的 **ACK 返回率** | ACK 成功率 ≥ 99.9%，实测下发频率 ≥ 95 Hz，且**无 1.2 s 级卡顿**（`_cmd` 超时上界） |
-| **S4** | 收尾：`movej(q_now)` **vs** 只停发的 **A/B 对照** | 录 30 s 的 `q` 漂移。预期：只停发 ⇒ 下垂后稳定于 `G(q)/kp` 量级的偏移；`movej(q_now)` ⇒ 漂移显著更小。**必须两组都做** |
+| # | 验什么 | 通过判据 | 状态 |
+| --- | --- | --- | --- |
+| **S1** | `dq=0` 冻结 + 低速跟随 —— **不重做，只做回归** | 在**本仓要用的那块 7J 固件**上重跑 `litearm-server/scripts/e2e_movejs_real.py`，全绿 | ⚠ **已验过**（2026-09-20），但可能是在别的固件版本上；本仓依赖它，须在目标固件上复跑 |
+| **S2** | `dq` **幅值** → 实测走位速率，覆盖到中速 | `dq=0.3` ⇒ 实测 ≈0.3 rad/s（±20%）；`dq=1.0` ⇒ ≈1.0；`dq` ≥ `speed_limit` 后饱和 | 低速段已验，中速段未 |
+| **S3** | ⭐ **1~2 rad/s 量级下速度前馈的行为**（`dq` 的第二个角色） | 用 §5.1 的公式跑 `FOLLOWING`：① 实测跟踪误差 rms **≤ 0.05 rad**；② **无自激/抖动**（`dq` 谱无新增高频峰）；③ 单轴堵转时电流/力矩不持续顶满 | ⛔ **真空隙，无人验过** —— 既有实证的上限是 0.5 rad/s（实际峰值 0.032） |
+| **S4** | 100 Hz `move_js` 连续 30 s 的 **ACK 返回率** | ACK 成功率 ≥ 99.9%，实测下发频率 ≥ 95 Hz，且**无 1.2 s 级卡顿**（`_cmd` 超时上界） | 未验 |
+| **S5** | 收尾：`movej(q_now)` **vs** 只停发的 **A/B 对照** | 录 30 s 的 `q` 漂移。预期：只停发 ⇒ 垂到 `G/(0.6·mit_kp)` 量级的偏移；`movej(q_now)` ⇒ 漂移显著更小 | 未验，**必须两组都做** |
 
-**S4 是 A/B 对照，不许只做单工况** —— 本仓外有两次被单工况结论骗过的记录。若 S4 的两组差异不显著，则 §5.3 的 `movej` 收尾**证据不足**，须重新评估而不是照抄本 spec。
+**S3 是本轮的核心未知**：既有实证刻意把速度压在 0.5 rad/s 以下，而遥操跟随必然跑到 1~2 rad/s ——
+那正是速度前馈力矩最长的地方。**S3 不通过 ⇒ §5.1 的 `dq` 公式要改**（候选退路：`dq` 只给走位速率、
+用一个不产生前馈的方式表达，例如改用 `move_mit_all` 显式给 `kd`；或把 `dq` 折中降低并接受跟随滞后）。
 
-**S1~S3 任一不通过时的退路**：S1/S2 不通过 ⇒ `dq` 语义读错，整个伺服环需重设计；S3 不通过 ⇒ 改用 `arm._raw_write(0x03, payload)` 不等 ACK（代价：失去 ACK
- 级的错误上报，须自行补状态帧活性判据）。
+**S5 是 A/B 对照，不许只做单工况** —— 本仓外有两次被单工况结论骗过的记录。若 S5 两组差异不显著，
+则 §5.3 的 `movej` 收尾**证据不足**，须重新评估而不是照抄本 spec。
+
+**S4 不通过时的退路**：改用 `arm._raw_write(0x03, payload)` 不等 ACK（代价：失去 ACK 级的错误上报，
+须自行补状态帧活性判据）。
 
 ---
 
@@ -491,7 +554,7 @@ litearm-teleop-isomorphic/
 | --- | --- |
 | `test_wire.py` | **黄金字节**钉死小端布局（**不用往返测试 —— 往返对字节序无判别力**）；`version` 不符 ⇒ 拒收；`n` 不符 / 短帧 ⇒ 拒收；n = 1 与 n = 7 都覆盖 |
 | `test_link.py` | **真起两个 zenoh session 走回环**（非 mock）：100 帧逐字节全等；100 Hz 持续 2 s 零丢包；**子进程**验证"显式 `close()` ⇒ 能退出 / 不 close ⇒ 挂死"（后者用超时断言，标记为慢测） |
-| `test_safety.py` | 钳位；限位读不到 ⇒ **拒启动**；watchdog 判定；状态机**全部迁移**（含 `HOLDING` 2 s 升级、回 `ALIGNING` 的 5 拍条件、`ALIGNING` 20 s 卡住）；收敛判据用**实测 q** |
+| `test_safety.py` | **§5.1 的 `dq` 公式**（纯函数，逐个可判别）：`dq=0` 冻结分支不再出现；**被钳位的轴 `dq` 必为 0**（抗饱和）；`dq_master` 低通前后行为；`err→0` 时 `dq→0`；`rate_cap` 饱和；钳位；限位读不到 ⇒ **拒启动**；watchdog 判定；状态机**全部迁移**（含 `HOLDING` 2 s 升级、回 `ALIGNING` 的 5 拍条件、`ALIGNING` 20 s 卡住）；收敛判据用**实测 q** |
 | `test_arm_worker.py` | `FakeArm` 驱动：100 Hz 节拍；ACK 连续超时 ⇒ 转 `HOLDING` 且**不终止循环**；**停止序列顺序 + < 100 ms 时限**（假时钟，可判别）；**`connect()` 后 `arm.move_timeout == 3.0`**（防将来 SDK 在 `connect()` 里重置）；**worker 被卡在 `movej` 期间，急停旁路仍能成功发出**（§7.4） |
 | `test_gui_smoke.py` | `QT_QPA_PLATFORM=offscreen` 起窗口；角色切换；闸门锁定/解锁 |
 
@@ -503,7 +566,8 @@ litearm-teleop-isomorphic/
 
 ## 13. 里程碑
 
-1. **真机 spike S1~S4**（§11，**7 关节整臂固件**）—— 证伪优先。产出：`move_js` 的 `dq` 语义实测结论 + 收尾 A/B 结论，回写本 spec 的 §2.3。
+1. **真机 spike S1~S5**（§11，**7 关节整臂固件**）—— 证伪优先。产出：`dq` 公式在遥操速度量级下的实测结论（S3）+ 收尾 A/B 结论（S5），回写本 spec 的 §2.3 / §5.1。
+   ⚠ S1 只需在目标固件上**复跑既有脚本**，不必重写。
 2. **纯离线三件**：`wire.py` + `link.py` + `test_link.py` + `test_wire.py`。
 3. **`safety.py` + `test_safety.py`**：状态机与判据（纯逻辑，不碰硬件）。
 4. **`arm_worker.py` + `test_arm_worker.py`**：接 `FakeArm`，跑通节拍与收尾序列。
