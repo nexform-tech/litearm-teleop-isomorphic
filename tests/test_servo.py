@@ -333,6 +333,24 @@ def test_default_payload_is_the_gripper_the_user_gave():
     assert servo.DEFAULT_PAYLOAD_COM == (0.0, 0.0, 0.03)  # 质心 3 cm 在 Z 轴
 
 
+# ────────────── 限位内缩量：必须盖住 CDC 路线的滞后冲过 ──────────────
+
+def test_limit_margin_covers_the_worst_case_overshoot():
+    """⛔ `DEFAULT_LIMIT_MARGIN` 必须 **≥ 固件锁存死区(0.05) + 本路线的最坏冲过**。
+
+    ⚠ 这是**故意偏离 litearm-server 的 0.01** 的地方：server 走 CAN 直连电机（无 USB
+    往返）⇒ 几乎不滞后 ⇒ 0.01 够用。我们走 USB CDC，每拍 2 次往返（实测各 3.333 ms）
+    ⇒ 6.7 ms 滞后；主臂最快轴 10 rad/s ⇒ 冲过 ≈ 0.067 rad，**落在 0.05 死区之外**
+    ⇒ 目标贴着限位时必然锁存 `joint_fault`（随后停发控制帧、电机静默、报 `FB_STALE`）。
+
+    判别力：谁把 margin 调回 0.01（以"照抄 server"为名），本用例立刻红。
+    """
+    from liteteleop import safety, servo
+    worst = max(servo.DEFAULT_SPEED_LIMIT) * 2 * 0.003333     # 10 rad/s × 2 次往返
+    assert safety.DEFAULT_LIMIT_MARGIN >= 0.05 + worst, (
+        f"margin={safety.DEFAULT_LIMIT_MARGIN} 盖不住 0.05+{worst:.3f}")
+
+
 # ────────────────────── 限位墙（第二道位置护栏）──────────────────────
 
 def test_wall_torque_actually_reaches_the_frame():
