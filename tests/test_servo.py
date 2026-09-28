@@ -326,3 +326,62 @@ def test_align_warns_loudly_on_a_large_slew(caplog):
     with caplog.at_level(logging.WARNING, logger="liteteleop.servo"):
         servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
     assert any("过大" in r.message for r in caplog.records), "大位移没预警"
+
+
+# ────────────── 固件「目标≠实测 + dq=0 就拒」的退路（真机踩过）──────────────
+
+class RuleArm(FakeArm):
+    """模拟固件那条规则：**目标 ≠ 实测位姿 且 dq 全 0 ⇒ 拒帧**。
+
+    ⚠ 实测残差用 `movej` 的到位判据 `q_tol=0.03` 那个量级 —— 真机就是死在这上面：
+    从臂到位后 `slew_target` 给 `dq=0`，而实测与目标差 0.03 ⇒ **每拍都被拒**
+    ⇒ 不 kick 看门狗 ⇒ 0.1 s 后 fail-soft ⇒ 臂会垂。
+    """
+
+    TOL = 0.005
+
+    def move_js(self, q, dq=None):
+        dq = list(dq) if dq is not None else [0.0] * N_JOINTS
+        gap = max(abs(a - b) for a, b in zip(q, self.q))
+        if gap > self.TOL and max(abs(v) for v in dq) == 0.0:
+            self._sent += 1
+            raise RuntimeError("被固件拒绝: ERR [03,2]")
+        super().move_js(q, dq)
+
+
+def test_follow_falls_back_to_holding_when_target_is_unreachable():
+    """目标差 0.03（`q_tol` 量级）且 dq 收敛到 0 ⇒ **退路必须接管，不许升级退出**。
+
+    判别力：去掉那条退路，本用例会因为「连续 20 次被拒」而抛 RuntimeError。
+    """
+    arm = RuleArm(q=[0.0] * N_JOINTS)
+    n = {"i": 0}
+
+    def stop():
+        n["i"] += 1
+        return n["i"] > 120                      # 够 slew_target 收敛
+
+    ok = servo.follow(arm, lambda: [0.03] * N_JOINTS, should_stop=stop,
+                      engage_sec=0.0, hz=200.0, gains=servo.JointGains())
+    assert ok is True, "应该靠退路走完，而不是升级退出"
+    assert arm.move_js_calls, "退路那一帧必须真的发出去"
+
+
+def test_follow_resumes_normal_tracking_after_a_fallback():
+    """退路之后，目标一动就要**恢复**（不是永远托在原地）。"""
+    arm = RuleArm(q=[0.0] * N_JOINTS)
+    targets = [[0.03] * N_JOINTS] * 60 + [[0.5] * N_JOINTS] * 40
+    n = {"i": 0}
+
+    def provider():
+        i = min(n["i"], len(targets) - 1)
+        return targets[i]
+
+    def stop():
+        n["i"] += 1
+        return n["i"] > len(targets)
+
+    servo.follow(arm, provider, should_stop=stop, engage_sec=0.0, hz=200.0,
+                 gains=servo.JointGains())
+    moved = max(max(abs(v) for v in q) for q, _dq in arm.move_js_calls)
+    assert moved > 0.3, f"目标改到 0.5 之后应当恢复跟随，实际最大只到 {moved}"

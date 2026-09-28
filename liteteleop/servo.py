@@ -213,6 +213,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         base = time.monotonic()
         next_tick = base + dt_nom
         rejects = 0
+        holding = False          # 是否正处在「托住实测位姿」的退路里
 
         while not should_stop():
             if duration_s is not None and time.monotonic() - base >= duration_s:
@@ -235,15 +236,41 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             try:
                 arm.move_js(q_cmd, dq_cmd)
                 rejects = 0
+                if holding:
+                    holding = False
+                    log.info("已恢复正常跟随")
             except Exception as e:                   # noqa: BLE001
-                # ⚠ 被拒 ⇒ 这一拍【没有 kick 看门狗】⇒ 0.1 s 后 fail-soft ⇒ 臂会垂。
-                #    零星一两次无妨（下一拍就恢复），连续不停就必须炸出来。
-                rejects += 1
-                log.warning("move_js 被拒（第 %d 次连续）：%s", rejects, e)
-                if rejects >= _REJECT_ESCALATE:
-                    log.error("连续 %d 次被拒 —— 受控接管并上抛", rejects)
-                    hold_at_current(arm)
-                    raise
+                # ⚠⚠ `move_js` 在「目标 ≠ 实测位姿」且「`dq == 0`」时**会被固件拒**
+                # （真机实证）。而从臂到位后 `slew_target` 给的就是 `dq=0`，并且
+                # **实测与目标总有 settle 残差** —— `movej` 的到位判据是 `q_tol=0.03`，
+                # 允许差 0.03 rad。于是**每一拍都被拒** ⇒ 拒帧就**不 kick 看门狗**
+                # ⇒ 0.1 s 后 fail-soft ⇒ **臂会垂**。真机实测：连续 20 次后升级退出。
+                #
+                # 这不是 `send_mit` 的问题（MIT 帧不受这条限制），所以 litearm-server
+                # 碰不到 —— 是 `move_js` 路线的固有短板。
+                #
+                # 退路：**托住实测位姿**。那一帧目标==实测 ⇒ 一定被接受 ⇒ 看门狗照 kick，
+                # 再把参考同步过去，下一拍 `slew_target` 从实测位姿重新起步
+                # ⇒ **主臂一动，目标一变，就立刻恢复正常跟随**。
+                try:
+                    q_hold = _q_meas(arm)
+                    arm.move_js(q_hold, [0.0] * N_JOINTS)
+                except Exception as e2:              # noqa: BLE001
+                    rejects += 1
+                    log.warning("move_js 被拒（第 %d 次连续）：%s", rejects, e)
+                    if rejects >= _REJECT_ESCALATE:
+                        log.error("连续 %d 次被拒 —— 受控接管并上抛", rejects)
+                        hold_at_current(arm)
+                        raise
+                else:
+                    rejects = 0
+                    q_cmd[:] = q_hold
+                    dq_cmd[:] = [0.0] * N_JOINTS
+                    q_target = list(q_hold)
+                    if not holding:
+                        holding = True
+                        log.info("目标不可达（残差在 movej 的 q_tol=0.03 之内）"
+                                 "⇒ 改为托住实测位姿；主臂一动即恢复。原错误: %s", e)
 
             r = next_tick - time.monotonic()
             if r > 0:
