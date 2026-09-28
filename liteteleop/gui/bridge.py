@@ -27,6 +27,9 @@ class WorkerBridge(QtCore.QObject):
     log = QtCore.pyqtSignal(str)
     #: 遥操状态变了（True=已启动）
     teleop_changed = QtCore.pyqtSignal(bool)
+    #: 夹爪快照（每来一帧发一次）。⚠ 与臂的 `state` 是**两条独立信号** ——
+    #: 夹爪链路与臂链路不共享任何对象（spec §2），所以桥接也是分开的。
+    grip_state = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)

@@ -162,9 +162,17 @@ class TeleopPage(QtWidgets.QWidget):
 
     #: (mass_kg, [x, y, z]) —— 由 main_window 接到 `worker.set_payload`
     payload_applied = QtCore.pyqtSignal(float, object)
+    #: 夹爪分区：开/关 —— 由 main_window 接到 `GripWorker.set_teleop`。
+    #: ⚠ 与臂的 `LinkPage.teleop_toggled` 是**两个独立控件**（spec §2）。
+    grip_toggled = QtCore.pyqtSignal(bool)
+    #: 夹爪分区里某个输入变了 —— 由 main_window 存回设置。
+    grip_settings_changed = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, settings: Optional[Settings] = None, parent=None):
         super().__init__(parent)
+        # ⚠ 夹爪分区要回填持久化的值（通道/端口/id/IP）；缺省给一份默认设置，
+        #    这样单独构造本页（测试）也不会炸。
+        self.gs = settings if settings is not None else Settings()
         # ⚠ 套**滚动区**：本页内容（对照表 + 参数 + 载荷组）比默认窗口高，
         #    不套的话底部会被裁掉（离屏量过：内容到 y≈496 而页面只有 476）。
         outer = QtWidgets.QVBoxLayout(self)
@@ -260,6 +268,74 @@ class TeleopPage(QtWidgets.QWidget):
         bl.addWidget(note)
         lay.addWidget(box)
 
+        # ── 夹爪遥操（与臂侧**完全独立**：独立 CAN / 独立 session / 独立端口 / 独立开关）──
+        gbox = QtWidgets.QGroupBox("夹爪遥操（与臂遥操各自独立）")
+        gl = QtWidgets.QVBoxLayout(gbox)
+
+        grow = QtWidgets.QHBoxLayout()
+        self.ed_gcan = QtWidgets.QLineEdit(self.gs.gcan)
+        # ⚠ `can0` 只是**占位提示**，不是默认值 —— 未填通道 ⇒ 不启用夹爪遥操。
+        #    在显示时把 `can0` 写进 `gcan` 会把「默认不启用」静默变成「默认启用」。
+        self.ed_gcan.setPlaceholderText("can0")
+        self.ed_gcan.setMaximumWidth(120)
+        self.sp_gport = QtWidgets.QSpinBox()
+        self.sp_gport.setRange(1, 65535)
+        self.sp_gport.setValue(self.gs.gport)
+        self.ed_grip_id = QtWidgets.QLineEdit(self.gs.grip_id)
+        self.ed_grip_id.setMaximumWidth(120)
+        self.ed_gpeer = QtWidgets.QLineEdit(self.gs.gpeer)
+        grow.addWidget(QtWidgets.QLabel("CAN"))
+        grow.addWidget(self.ed_gcan)
+        grow.addSpacing(10)
+        grow.addWidget(QtWidgets.QLabel("端口"))
+        grow.addWidget(self.sp_gport)
+        grow.addSpacing(10)
+        grow.addWidget(QtWidgets.QLabel("grip_id"))
+        grow.addWidget(self.ed_grip_id)
+        grow.addSpacing(10)
+        grow.addWidget(QtWidgets.QLabel("主端 IP"))
+        grow.addWidget(self.ed_gpeer)
+        gl.addLayout(grow)
+
+        lab_ghint = QtWidgets.QLabel(
+            "⚠ 通道留空 = <b>不启用</b>夹爪遥操。夹爪的 CAN 口与臂的 CDC 口是两回事。")
+        lab_ghint.setWordWrap(True)
+        gl.addWidget(lab_ghint)
+
+        self.btn_grip = QtWidgets.QPushButton("启动夹爪遥操")
+        self.btn_grip.setCheckable(True)
+        # ⚠⚠ **不要在这里 `setEnabled(False)`。** 与臂的 `btn_teleop` 不同：
+        #    臂的 worker 在「连接臂」时就建好了，所以「没连上就禁用」成立；
+        #    而夹爪的 `GripWorker` **只能由点这个按钮来创建**
+        #    （`main_window._ensure_grip_worker`）⇒ 若初始禁用、且 `apply_grip`
+        #    又只按 `connected` 启停，就**永远点不了**（死锁，只能重启应用）。
+        self.chk_align = QtWidgets.QCheckBox("启动时对齐")
+        self.chk_align.setChecked(True)
+        grow2 = QtWidgets.QHBoxLayout()
+        grow2.addWidget(self.btn_grip)
+        grow2.addWidget(self.chk_align)
+        grow2.addStretch(1)
+        gl.addLayout(grow2)
+
+        self.lab_grip = QtWidgets.QLabel("未启动")
+        self.lab_grip.setWordWrap(True)
+        gl.addWidget(self.lab_grip)
+
+        self.lab_grip_mismatch = QtWidgets.QLabel("")
+        self.lab_grip_mismatch.setWordWrap(True)
+        self.lab_grip_mismatch.setStyleSheet("color:#b02020;")
+        gl.addWidget(self.lab_grip_mismatch)
+        lay.addWidget(gbox)
+
+        # ⚠⚠ 与臂的 `btn_teleop` 同一纪律：`clicked` 发出时按钮状态**已经切换**，
+        #     `isChecked()` **就是**用户想要的新值 —— 不要加 `not`。
+        self.btn_grip.clicked.connect(
+            lambda: self.grip_toggled.emit(self.btn_grip.isChecked()))
+        for w in (self.ed_gcan, self.ed_grip_id, self.ed_gpeer):
+            w.editingFinished.connect(self.grip_settings_changed.emit)
+        self.sp_gport.valueChanged.connect(self.grip_settings_changed.emit)
+        self.chk_align.toggled.connect(self.grip_settings_changed.emit)
+
     def _preset_gripper(self) -> None:
         self.sp_mass.setValue(servo.DEFAULT_PAYLOAD_MASS)
         for k, v in enumerate(servo.DEFAULT_PAYLOAD_COM):
@@ -269,6 +345,51 @@ class TeleopPage(QtWidgets.QWidget):
         self.payload_applied.emit(
             float(self.sp_mass.value()),
             [float(sp.value()) for sp in self.sp_com])
+
+    # ────────────────────────── 夹爪分区 ──────────────────────────
+
+    def gripper_values(self) -> dict:
+        """把夹爪分区的当前值读出来。
+
+        ⚠ `gcan` **不做默认值回填** —— 空串就是「不启用夹爪遥操」这个安全默认
+        （spec §9.1）。`can0` 只在输入框里当占位提示，不进设置。
+        """
+        return {
+            "gcan": self.ed_gcan.text().strip(),
+            "gpeer": self.ed_gpeer.text().strip() or "127.0.0.1",
+            "gport": int(self.sp_gport.value()),
+            "grip_id": self.ed_grip_id.text().strip() or "gripA",
+            "align": bool(self.chk_align.isChecked()),
+        }
+
+    def apply_grip(self, g) -> None:
+        """夹爪快照 → 界面。
+
+        ⚠ 与 `apply()` **分开**：夹爪状态由**另一条**信号
+        （`WorkerBridge.grip_state`）送来，两条链路不共享任何对象（spec §2）。
+        """
+        if g.error:
+            self.lab_grip.setText(f"⛔ {g.error}")
+        elif not g.connected:
+            self.lab_grip.setText("未启动")
+        elif g.role == ROLE_MASTER:
+            self.lab_grip.setText(
+                f"主端夹爪：零重力 · {g.topic} · 发 {g.frames_sent} 帧 · "
+                f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm · "
+                + ("已匹配订阅者" if g.matching else "⚠ 未匹配（发了没人在收）"))
+        else:
+            age = "—" if g.frame_age is None else f"{g.frame_age * 1000:.0f} ms"
+            self.lab_grip.setText(
+                f"从端夹爪：{'持位（watchdog 超时）' if g.stale else '跟随中'} · "
+                f"环频 {g.loop_hz:.0f} Hz · 收 {g.frames_received} 帧 · 帧龄 {age} · "
+                f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm")
+        self.lab_grip_mismatch.setText(g.mismatch)
+        # ⚠ 按钮文本/勾选按**真实状态**刷新，不是按点击 ——
+        #    与 `LinkPage.apply()` 对 `btn_teleop` 的做法同款（`pages.py:143-144`）。
+        # ⚠⚠ 但**不碰 `setEnabled`**：见 `__init__` 里那段死锁说明。
+        #    链路挂了也必须能点「停止」，否则用户没有退路。
+        self.btn_grip.setText("停止夹爪遥操" if g.teleop_active else "启动夹爪遥操")
+        self.btn_grip.setChecked(bool(g.teleop_active))
 
     def apply(self, s: Snapshot) -> None:
         # 状态行：**没有状态机** —— litearm-server 用 `is_running` 派生 active

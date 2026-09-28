@@ -152,3 +152,132 @@ def test_payload_label_shows_the_readback_not_the_input(qapp):
     txt = w.page_teleop.lab_payload.text()
     assert "0.000 kg" in txt and "没设上" in txt, txt
     w.close()
+
+
+# ────────────────────────── 夹爪遥操分区 ──────────────────────────
+
+def test_grip_panel_defaults_to_disabled_and_independent(qapp):
+    """⚠ 夹爪默认**不启用**（通道空），与臂是**两个独立控件**，端口也是分开的。
+
+    判别力：
+      · 若谁把默认填成 `can0`（或在显示时写回），「默认不启用」的安全默认被静默丢掉；
+      · 若 `sp_gport` 忘了 `setValue`，QSpinBox 会被钳到 **1**（特权端口），
+        主端 `link.Listener(1, …)` 根本绑不上 —— 本用例会红。
+    """
+    w = MainWindow(Settings())
+    v = w.page_teleop.gripper_values()
+    assert v["gcan"] == "", f"通道默认必须是空（不启用），实际 {v['gcan']!r}"
+    assert w.page_teleop.chk_align.isChecked() is True
+    assert w.page_teleop.btn_grip is not w.page_link.btn_teleop
+    assert v["gport"] == 17448, f"夹爪端口必须独立于臂的 17447，实际 {v['gport']}"
+    assert v["gport"] != 1, "⚠ 端口 1 是特权端口 —— QSpinBox 忘 setValue 就是这个症状"
+    w.close()
+
+
+def test_grip_button_is_clickable_from_construction(qapp):
+    """⚠⚠ 死锁回归：夹爪按钮**不能**初始禁用。
+
+    夹爪的 `GripWorker` **只能由点这个按钮创建**，而 `apply_grip` 只在
+    `connected` 时才启用按钮 ⇒ 一旦初始禁用就**永远点不了**（只能重启应用）。
+    判别力：在 `__init__` 里加回 `setEnabled(False)` 时本用例必红。
+    """
+    w = MainWindow(Settings())
+    assert w.page_teleop.btn_grip.isEnabled() is True, \
+        "夹爪按钮必须从构造起就可点，否则没有任何路径能创建 GripWorker"
+    w.close()
+
+
+def test_grip_button_emits_the_state_the_user_clicked(qapp):
+    """⚠ 与臂那条同款的回归：`clicked` 在按钮状态**切换之后**才发出
+    ⇒ 必须直接发 `isChecked()`，不能加 `not`。
+
+    判别力：写成 `not isChecked()` 时"启动"会发成"停止" —— 表现为"点了没反应"。
+
+    ⚠ 这里用**独立的 TeleopPage**（不过 MainWindow）：过了主窗口的话，
+    `_toggle_grip` 会因「没填通道」把按钮弹回未勾选，第二次点击又从 False→True，
+    于是测到 `[True, True]` —— 那测的是弹回行为，不是本用例要钉的信号语义。
+    """
+    from liteteleop.gui.pages import TeleopPage
+
+    p = TeleopPage(Settings())
+    got = []
+    p.grip_toggled.connect(got.append)
+
+    p.btn_grip.click()
+    assert got == [True], f"第一次点击应发 True（启动），实际 {got}"
+    p.btn_grip.click()
+    assert got == [True, False], f"第二次点击应发 False（停止），实际 {got}"
+
+
+def test_grip_click_without_channel_bounces_back_and_creates_nothing(qapp):
+    """⚠ 没填通道 ⇒ **不建** `GripWorker`（不启用夹爪遥操的安全默认），
+    并且按钮**弹回未勾选** —— 否则界面会显示"正在遥操"而实际什么都没发生。
+    """
+    w = MainWindow(Settings())
+
+    w.page_teleop.btn_grip.click()
+    assert w.grip is None, "没填通道就不该建 GripWorker"
+    assert w.page_teleop.btn_grip.isChecked() is False, \
+        "没建起来时必须弹回未勾选，不能停在「已启动」的样子"
+    w.close()
+
+
+def test_grip_snapshot_renders_master_slave_and_stale(qapp):
+    """三种夹爪快照都要能吃下而不炸，且 stale 要**看得见**。"""
+    from liteteleop.grip_worker import GripSnapshot
+
+    w = MainWindow(Settings())
+
+    m = GripSnapshot(role="master", connected=True, topic="litearm/v4/gripA/gripper_teleop",
+                     frames_sent=10, openness=0.5, position_mm=60.0, matching=True)
+    w._on_grip_state(m)
+    assert "主端夹爪" in w.page_teleop.lab_grip.text()
+    assert "已匹配订阅者" in w.page_teleop.lab_grip.text()
+
+    m.matching = False
+    w._on_grip_state(m)
+    assert "未匹配" in w.page_teleop.lab_grip.text()
+
+    s = GripSnapshot(role="slave", connected=True, frames_received=5, stale=False,
+                     openness=0.5, position_mm=60.0, frame_age=0.01, loop_hz=50.0)
+    w._on_grip_state(s)
+    assert "跟随中" in w.page_teleop.lab_grip.text()
+
+    s.stale = True
+    w._on_grip_state(s)
+    assert "持位" in w.page_teleop.lab_grip.text(), "watchdog 超时必须看得见"
+
+    # ⚠ 刷新按钮**不该**回头再发一次 `grip_toggled` —— 那会让界面自激。
+    #    （`apply_grip` 用的是 `setChecked()`，它只发 `toggled`，
+    #     而我们接的是 `clicked`。这里就是钉住这一点。）
+    got = []
+    w.page_teleop.grip_toggled.connect(got.append)
+    s.teleop_active = True
+    w._on_grip_state(s)
+    assert w.page_teleop.btn_grip.text() == "停止夹爪遥操"
+    assert w.page_teleop.btn_grip.isChecked() is True
+    s.teleop_active = False
+    w._on_grip_state(s)
+    assert w.page_teleop.btn_grip.text() == "启动夹爪遥操"
+    assert got == [], f"刷新按钮不该发 toggled（自激），实际 {got}"
+    w.close()
+
+
+def test_grip_mismatch_and_error_are_visible(qapp):
+    """主从标定不一致与夹爪报错都要在界面上看得见（不能静默）。"""
+    from liteteleop.grip_worker import GripSnapshot
+
+    w = MainWindow(Settings())
+    g = GripSnapshot(role="slave", connected=True)
+    g.mismatch = "主从夹爪标定可能不一致：主端 travel≈60.0 mm，本端 120.1 mm"
+    w._on_grip_state(g)
+    assert "不一致" in w.page_teleop.lab_grip_mismatch.text()
+
+    g.error = "夹爪未标定"
+    w._on_grip_state(g)
+    assert "未标定" in w.page_teleop.lab_grip.text()
+
+    g2 = GripSnapshot(role="slave", connected=True)
+    w._on_grip_state(g2)
+    assert w.page_teleop.lab_grip_mismatch.text() == "", "没告警时必须清空，不能留旧的"
+    w.close()
