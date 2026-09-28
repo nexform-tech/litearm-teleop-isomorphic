@@ -383,7 +383,10 @@ class TeleopPage(QtWidgets.QWidget):
                 f"从端夹爪：{'持位（watchdog 超时）' if g.stale else '跟随中'} · "
                 f"环频 {g.loop_hz:.0f} Hz · 收 {g.frames_received} 帧 · 帧龄 {age} · "
                 f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm")
-        self.lab_grip_mismatch.setText(g.mismatch)
+        self.lab_grip_mismatch.setText("　".join(x for x in (
+            (f"⚠ 已丢弃 {g.rejected} 条非有限值帧（NaN/Inf）—— 保持不动"
+             if g.rejected else ""),
+            g.mismatch) if x))
         # ⚠ 按钮文本/勾选按**真实状态**刷新，不是按点击 ——
         #    与 `LinkPage.apply()` 对 `btn_teleop` 的做法同款（`pages.py:143-144`）。
         # ⚠⚠ 但**不碰 `setEnabled`**：见 `__init__` 里那段死锁说明。

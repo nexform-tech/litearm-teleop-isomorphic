@@ -281,3 +281,17 @@ def test_grip_mismatch_and_error_are_visible(qapp):
     w._on_grip_state(g2)
     assert w.page_teleop.lab_grip_mismatch.text() == "", "没告警时必须清空，不能留旧的"
     w.close()
+
+
+def test_grip_rejected_frames_are_visible(qapp):
+    """⚠ 丢弃非有限值帧（NaN/Inf）必须**看得见** —— 静默丢弃就是静默失败。"""
+    from liteteleop.grip_worker import GripSnapshot
+
+    w = MainWindow(Settings())
+    g = GripSnapshot(role="slave", connected=True, rejected=7)
+    g.mismatch = "主从标定可能不一致"
+    w._on_grip_state(g)
+    txt = w.page_teleop.lab_grip_mismatch.text()
+    assert "7" in txt and "非有限值" in txt, txt
+    assert "不一致" in txt, "两条告警要能同时显示，不能互相顶掉"
+    w.close()

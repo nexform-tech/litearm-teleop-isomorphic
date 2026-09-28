@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import math
 import sys
 import threading
 import time
@@ -193,6 +193,7 @@ class GripSnapshot:
     stale: bool = False                 # 从端：watchdog 超时、正在持位
     watchdog_trips: int = 0
     teleop_active: bool = False         # 由 snapshot() 从 _want 填（供界面按钮刷新）
+    rejected: int = 0                   # 被**协议边界**丢弃的帧（非有限值，见 §8 rule 9）
     mismatch: str = ""                  # 主从标定不一致告警（§7.3），空 = 无
     error: str = ""
 
@@ -241,6 +242,8 @@ class GripWorker:
         self._watchdog_trips = 0
         self._mismatch = ""
         self._mismatch_checked = False
+        self._rejected = 0                  # 边界丢弃的帧数（非有限值）
+        self._reject_warned = False
         self._loops = 0
         self._loop_hz = 0.0
         self._hz_t0 = 0.0
@@ -275,6 +278,7 @@ class GripWorker:
             s.watchdog_trips = self._watchdog_trips
             s.loop_hz = self._loop_hz
             s.mismatch = self._mismatch
+            s.rejected = self._rejected
             s.teleop_active = bool(self._want)
             if self._pub is not None:
                 s.matching = self._pub.matching
@@ -416,13 +420,23 @@ class GripWorker:
             g.poll(timeout_s=0.0)
             st = g.get_state(wait=False)
             openness = mm_to_openness(self._cfg, st.position_mm)
-            self._pub.put(encode_gripper_teleop(openness, st.position_mm,
-                                                st.force_n, time.monotonic()))
-            self._frames_sent += 1
-            with self._lock:
-                self._snap.openness = openness
-                self._snap.position_mm = float(st.position_mm)
-                self._snap.force_n = float(st.force_n)
+            if not (math.isfinite(openness) and math.isfinite(st.position_mm)):
+                # ⚠⚠ 主端也守在边界上（§8 rule 9）：读数坏掉时**不发帧**。
+                #    发出去的话从端会照单全收（见从端那段的说明）；
+                #    不发 ⇒ 从端的 watchdog 超时 ⇒ **持位**，是安全那一侧。
+                self._rejected += 1
+                if not self._reject_warned:
+                    self._reject_warned = True
+                    self._log(f"⚠ 读数非有限值（openness={openness!r}）—— 停止发帧，"
+                              "由从端的 watchdog 转持位")
+            else:
+                self._pub.put(encode_gripper_teleop(openness, st.position_mm,
+                                                    st.force_n, time.monotonic()))
+                self._frames_sent += 1
+                with self._lock:
+                    self._snap.openness = openness
+                    self._snap.position_mm = float(st.position_mm)
+                    self._snap.force_n = float(st.force_n)
             self._publish_state()
             nxt = self._pace(t0, nxt, dt)
 
@@ -470,14 +484,28 @@ class GripWorker:
             payload, _ts = slot.take()
             if payload is not None and len(payload) == GRIP_FRAME_BYTES:
                 openness, position_mm, force_n, _t = decode_gripper_teleop(payload)
-                q_cmd = openness_to_rad(self._cfg, _clamp01(openness))
-                stale = False
-                self._frames_received += 1
-                self._check_mismatch(_clamp01(openness), float(position_mm))
-                with self._lock:
-                    self._snap.openness = _clamp01(openness)
-                    self._snap.position_mm = float(position_mm)
-                    self._snap.force_n = float(force_n)
+                if not (math.isfinite(openness) and math.isfinite(position_mm)):
+                    # ⚠⚠ **协议边界：非有限值一律拒收**（§8 rule 9），与臂侧
+                    #    `safety.clamp_to_limits` 的 `NonFiniteTarget`（`safety.py:142-144`）
+                    #    同款纪律。
+                    #    不拒的话实测是这样：`_clamp01(NaN)` 返回 NaN、
+                    #    `clamp_to_calibrated` 里 `min(hi, NaN)` **返回 hi**
+                    #    ⇒ 一条 NaN 帧把从端命令到**全闭限位**，而且 `error` 是空的。
+                    #    `±inf` 同样被折成端点。⇒ **错在危险一侧且静默**，必须拦。
+                    self._rejected += 1
+                    if not self._reject_warned:
+                        self._reject_warned = True
+                        self._log(f"⚠ 丢弃非有限值帧（openness={openness!r}）—— "
+                                  "保持当前位置不动，**不是**折成某个端点")
+                else:
+                    q_cmd = openness_to_rad(self._cfg, _clamp01(openness))
+                    stale = False
+                    self._frames_received += 1
+                    self._check_mismatch(_clamp01(openness), float(position_mm))
+                    with self._lock:
+                        self._snap.openness = _clamp01(openness)
+                        self._snap.position_mm = float(position_mm)
+                        self._snap.force_n = float(force_n)
             else:
                 # `peek_age` 对「从未收到」返回 None（`link.py:170-183`）
                 # ⇒ `is not None` 正好等于「收到过首帧之后 watchdog 才生效」
@@ -588,7 +616,3 @@ class GripWorker:
         with self._lock:
             self._snap.connected = False
         self._publish_state()
-
-
-# `os` 只在类型注解/路径判断里可能用到；显式引用一下避免 linter 误删。
-_ = os.sep

@@ -346,6 +346,7 @@ stale = False
 | 6 | ⚠⚠ **构造时必须显式传 `disable_on_disconnect=False`** —— 否则 rule 4 与 rule 5 自相矛盾 | `LiteGrip.__init__` 的默认值是 **`True`**（`gripper.py:205`）⇒ `disconnect()` 会走 `self._can.disconnect(disable=True)`（`gripper.py:338-339`）⇒ `can_bus.disconnect` 里的 `self.disable()`（`src/litegrip/protocols/can_bus.py:92`）⇒ **掉力、松开**。这会让收尾那帧持位帧白做，并产生 rule 4 明令禁止的结果。**两端都要传** |
 | 7 | ⛔ **绝不调 `lg.close()`** —— 那是**合爪**不是断开（`gripper.py:1103`） | 断开只有 `disconnect()`（`gripper.py:329`）。这是 SDK 的真实命名陷阱 |
 | 8 | 主端零重力期间不调任何 `open`/`close`/`grasp` | 那些会走自己的 MIT 斜坡流，与我们的零力矩帧抢 CAN |
+| 9 | ⚠⚠ **协议边界必须拒非有限值**（`NaN` / `±inf`）：从端**拒收该帧并保持不动**，主端读数非有限时**不发帧** | 不拒的实测后果：`_clamp01(NaN)` 返回 `NaN`，而 `clamp_to_calibrated` 里 `min(hi, NaN)` **返回 `hi`** ⇒ 一条 `NaN` 帧把从端命令到**全闭限位**，且 `error` 是空的；`±inf` 同样被折成端点。**错在危险一侧且静默**。臂侧本来就是这么做的 —— `safety.clamp_to_limits` 逐值判 `math.isfinite` 并抛 `NonFiniteTarget`（`safety.py:142-144`），本条与它同款纪律 |
 
 ## §9 配置与界面
 

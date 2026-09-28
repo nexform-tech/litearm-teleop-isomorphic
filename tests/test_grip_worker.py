@@ -7,6 +7,7 @@ import types
 import pytest
 
 from liteteleop import grip_worker as gw
+from liteteleop import link
 from liteteleop.grip_worker import (ROLE_MASTER, ROLE_SLAVE, GripNotReady,
                                     GripWorker, check_ready,
                                     clamp_to_calibrated, mm_to_openness,
@@ -213,6 +214,81 @@ def test_uncalibrated_error_is_recorded_and_loop_never_started():
         time.sleep(0.35)
         assert "未标定" in w.snapshot().error
         assert w._pub is None, "拒绝启动时不该已经占住端口"
+    finally:
+        w.stop(timeout=5.0)
+
+
+# ════════════════════ §8 rule 9：协议边界必须拒非有限值 ════════════════════
+
+def _listen_and_publish(port, key):
+    """起一个裸发布端（模拟"坏主端"）。"""
+    return link.Listener(port, key)
+
+
+def test_slave_rejects_non_finite_frames_and_holds():
+    """⚠⚠ 一条 `openness=NaN` 的帧**必须**被拒，且**保持不动**。
+
+    不拒的话实测后果（危险一侧且静默）：
+
+        _clamp01(NaN)            = nan
+        openness_to_rad(cfg,NaN) = nan
+        clamp_to_calibrated(NaN) = pos_closed_rad   ← min(hi, NaN) 返回 hi
+
+    ⇒ 一条 NaN 帧把从端命令到**全闭限位**，而 `error` 是空的。
+    `±inf` 同样会被折成端点。
+
+    判别力：去掉 `_slave_loop` 里那个 `math.isfinite` 分支时，本用例会因为
+    `q` 变成全闭限位而红。
+    """
+    from liteteleop import link as _link
+    from liteteleop import grip_wire as _gw
+
+    port = _free_port()
+    sg = FakeGrip(position_rad=-0.7)
+    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
+                   rate_hz=100.0, align=False, gripper_factory=lambda _c: sg)
+    pub = _link.Listener(port, _gw.gripper_teleop_topic("gA"))
+    try:
+        s.start()
+        time.sleep(0.3)
+        s.set_teleop(True)
+        time.sleep(0.3)
+        sg.clear_sent()
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            for _ in range(5):
+                pub.put(_gw.encode_gripper_teleop(bad, bad, 0.0, time.monotonic()))
+                time.sleep(0.01)
+        time.sleep(0.3)
+        qs = [f["q"] for f in sg.sent]
+        assert qs, "从端必须在持续发帧（持位）"
+        assert all(abs(q - (-0.7)) < 1e-9 for q in qs), \
+            f"收到非有限值帧后**必须保持不动**（-0.7），实际 q={sorted(set(round(q, 4) for q in qs))}"
+        assert s.snapshot().rejected >= 1, "被拒的帧要计数（不静默）"
+        assert s.snapshot().frames_received == 0, "非有限值帧不算收到有效帧"
+    finally:
+        s.stop(timeout=5.0)
+        pub.close()
+
+
+def test_master_refuses_to_publish_non_finite():
+    """主端读数坏掉时**不发帧** ⇒ 从端 watchdog 超时转持位（安全那一侧）。"""
+    class _BadRead(FakeGrip):
+        def get_state(self, wait: bool = True):
+            from tests.fake_grip import FakeState
+            return FakeState(position_rad=float("nan"), position_mm=float("nan"),
+                             force_n=0.0)
+
+    g = _BadRead()
+    w = GripWorker(ROLE_MASTER, "can0", grip_id="gA", gport=_free_port(),
+                   rate_hz=100.0, gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.35)
+        w.set_teleop(True)
+        time.sleep(0.4)
+        snap = w.snapshot()
+        assert snap.frames_sent == 0, f"读数非有限值就不该发帧，实际发了 {snap.frames_sent}"
+        assert snap.rejected >= 1, "被拒的帧要计数（不静默）"
     finally:
         w.stop(timeout=5.0)
 
