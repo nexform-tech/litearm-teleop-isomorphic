@@ -52,10 +52,13 @@ class LinkPage(QtWidgets.QWidget):
         self.btn_connect = QtWidgets.QPushButton("连接臂")
         self.btn_teleop = QtWidgets.QPushButton("启动遥操")
         self.btn_teleop.setEnabled(False)
+        self.btn_teleop.setCheckable(True)          # ⚠ 必须在 connect 之前
         self.btn_connect.clicked.connect(self.connect_clicked.emit)
+        # ⚠⚠ 不要写 `not isChecked()`：Qt 的 `clicked` 是在按钮状态**已经切换之后**
+        #     才发出的 ⇒ 此刻 `isChecked()` **就是**用户想要的新值。
+        #     加 `not` 会把"启动"发成"停止"（我这么错过一次，真机上表现为"点了没反应"）。
         self.btn_teleop.clicked.connect(
-            lambda: self.teleop_toggled.emit(not self.btn_teleop.isChecked()))
-        self.btn_teleop.setCheckable(True)
+            lambda: self.teleop_toggled.emit(self.btn_teleop.isChecked()))
         row3.addWidget(self.btn_connect); row3.addWidget(self.btn_teleop)
         form.addRow("动作", self._wrap(row3))
 

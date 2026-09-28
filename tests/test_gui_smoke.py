@@ -101,3 +101,22 @@ def test_joint_table_tolerates_empty_snapshot(qapp):
     w._on_state(Snapshot(role=ROLE_MASTER))
     assert w.page_joints.table.item(0, 1).text() == "—"
     w.close()
+
+
+def test_teleop_button_emits_the_state_the_user_clicked(qapp):
+    """⚠ 回归：`clicked` 在按钮状态**切换之后**才发出 ⇒ 必须直接发 `isChecked()`。
+
+    判别力：若有人写成 `not isChecked()`，"启动"会发成"停止"——
+    真机表现是"点了启动但臂不变软"，而**界面上看不出任何异常**。
+    """
+    w = MainWindow(Settings())
+    got = []
+    w.page_link.teleop_toggled.connect(got.append)
+    btn = w.page_link.btn_teleop
+    btn.setEnabled(True)
+
+    btn.click()
+    assert got == [True], f"第一次点击应发 True（启动），实际 {got}"
+    btn.click()
+    assert got == [True, False], f"第二次点击应发 False（停止），实际 {got}"
+    w.close()
