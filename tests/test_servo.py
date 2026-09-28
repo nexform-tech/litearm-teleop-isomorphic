@@ -247,24 +247,24 @@ def test_align_failure_is_not_fatal():
                                  timeout=0.5) is None
 
 
-def test_align_refuses_when_the_arms_are_far_apart():
-    """⚠⚠ 大位移**拒绝启动**，而且**一个字节都不许发给臂**。
+def test_align_warns_but_still_moves_on_a_large_slew(caplog):
+    """⚠ 大位移**只预警、照样对齐**（用户裁决 2026-09-28：超时 3 s → 30 s）。
 
-    真机踩过两次：`movej(speed=0.15)` 走大位移撞上 `move_timeout` **在半路超时**，
-    而超时返回时**臂还在走** ⇒ 紧接着的 `prime` 因"目标 ≠ 实测 + dq=0"被拒 ⇒ 整个跟随崩掉。
+    30 s 在 J1 上约能走 9 rad ⇒ **限位内任何位移都够**，再"拒绝启动"就没意义了。
+    但仍要**大声预警** —— 大位移意味着从臂会大幅摆动。
 
-    判别力：`assert movej_calls == []` 断言"拒绝时不动臂" ——
-    改回"预警后照样 movej"这条会红。
+    判别力：`assert arm.movej_calls` 断言"还是动了" —— 改回"拒绝就不动"这条会红。
     """
+    import logging
     arm = FakeArm(q=[0.0] * N_JOINTS)
     payload = __import__("liteteleop.wire", fromlist=["x"]).encode_teleop(
         [0.9] * N_JOINTS, [0.0] * N_JOINTS, 0.0)          # 位移 0.9 > 阈值 0.30
-    with pytest.raises(servo.AlignTooFar, match="拒绝启动"):
-        servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
-    assert arm.movej_calls == [], "拒绝启动时**绝不许动臂**"
+    with caplog.at_level(logging.WARNING, logger="liteteleop.servo"):
+        got = servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
+    assert got is not None, "不该拒绝"
+    assert arm.movej_calls, "应当**照样**执行 movej（只是先预警）"
+    assert any("偏大" in r.message for r in caplog.records), "大位移没预警"
 
-
-# ────────────── 固件「目标≠实测 + dq=0 就拒」的退路（真机踩过）──────────────
 
 class RuleArm(FakeArm):
     """模拟固件那条规则：**目标 ≠ 实测位姿 且 dq 全 0 ⇒ 拒帧**。

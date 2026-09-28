@@ -226,3 +226,13 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
     w._run_slave()
     assert order == ["align", "follow"], f"顺序必须是 对齐 → 跟随，实际 {order}"
 
+
+
+def test_align_move_timeout_is_thirty_seconds():
+    """用户裁决 2026-09-28：**同步时间 3 s → 30 s**。
+
+    ⚠ 它是 `Arm(move_timeout=)`，SDK 明说**连接后不许改** ⇒ 只能在构造时定。
+    ⚠ 但 `movej` **到位就立刻返回**，所以这只是**上限**、不是固定等待 —— 到点就跟。
+    """
+    assert arm_worker.ALIGN_MOVE_TIMEOUT == 30.0
+    assert ArmWorker(role=ROLE_SLAVE).move_timeout == 30.0

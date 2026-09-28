@@ -58,7 +58,7 @@ from .wire import decode_teleop as wire_decode
 log = logging.getLogger("liteteleop.servo")
 
 __all__ = [
-    "AlignTooFar", "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
+    "ALIGN_SPEED", "ALIGN_TIMEOUT", "ALIGN_WARN_DELTA",
     "align_to_master", "DEFAULT_PAYLOAD_MASS", "DEFAULT_PAYLOAD_COM",
     "read_payload", "apply_payload", "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
@@ -87,11 +87,7 @@ DEFAULT_HZ = 250.0
 ALIGN_SPEED = 0.15
 #: 等首帧的上限（`_do_align` 里写死 5.0 s）。
 ALIGN_TIMEOUT = 5.0
-class AlignTooFar(RuntimeError):
-    """两臂相距太远，**拒绝启动跟随**（spec §7.1 的精神：宁可拒启动，不要静默退化）。"""
-
-
-#: 对齐位移超过这个值就**拒绝启动**（不是预警）。理由：`movej(speed=0.15)` 走大位移要很久，
+#: 对齐位移超过这个值就**大声预警**（不拒绝 —— 30 s 足以覆盖限位内的任何移动）。理由：`movej(speed=0.15)` 走大位移要很久，
 #: 而本工具 `move_timeout=3 s` ⇒ 会在半路超时；更糟的是位移大意味着**从臂会大幅甩过去**。
 #: ⚠ **等距遥操的正确用法是【先用手把两条臂摆到相近姿态再启动】** —— 对齐只兜小差。
 ALIGN_WARN_DELTA = 0.30
@@ -321,9 +317,9 @@ def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
       本身阻塞到位，`settle` 是隐含的）
     - `movej` 失败**不致命**（原版：`对齐 movej 失败（跟随会逐步修正）`）⇒ 返回 `None`
 
-    ⚠ 本仓**多加一条**（原版没有）：位移超过 `max_delta` 时**抛 `AlignTooFar` 拒启动**，
-    而不是硬着头皮 `movej`。理由见下面那段注释 —— 大位移的 `movej` 会在半路超时，
-    而超时返回时臂还在走，紧接着就会把 `prime` 打崩。
+    ⚠ **本函数会阻塞到 `arm.move_timeout`** —— 用户裁决把它设成 **30 s**，
+    但 `movej` **一旦到位就立刻返回**（`_arrive` 是"到位/超时/故障"三者先到为准）
+    ⇒ 这只是上限，不是固定等待。
     """
     deadline = time.monotonic() + float(timeout)
     master_q = None
@@ -348,17 +344,15 @@ def align_to_master(arm, take_frame, limits, *, speed: float = ALIGN_SPEED,
     q_now = _q_meas(arm)
     delta = max(abs(a - b) for a, b in zip(clamped, q_now))
     if delta > max_delta:
-        # ⚠ **这里【不动臂】**，直接拒启动。理由（真机踩过）：
-        #   `movej(speed=0.15)` 走大位移会撞上 `move_timeout`（本工具 3 s）**在半路超时**，
-        #   而超时返回时**臂还在走** —— 紧接着 prime 发 `move_js` 就会因为
-        #   "目标 ≠ 实测且 dq=0" 被拒，把整个跟随打崩（真机就是这么挂的两次）。
-        #   更根本的是：2+ rad 的位移**本来就不是"对齐"，是一次大幅摆动**。
-        raise AlignTooFar(
-            f"两臂相距 {delta:.3f} rad，超过对齐上限 {max_delta:.2f} rad —— **拒绝启动跟随**。"
-            f"`movej(speed={speed:.2f})` 走这么远会撞上 move_timeout={arm.move_timeout:.1f}s "
-            f"而在半路超时，超时后臂还在走。"
-            f"⚠ 正确做法：**用手把两条臂摆到相近姿态再启动**（对齐只兜小差）；"
-            f"或者检查主臂是不是没扶住、已经垂下去了。")
+        # ⚠ 只**预警**、不拒绝：`move_timeout` 已放到 30 s（用户裁决 2026-09-28），
+        #   而 `movej(speed=0.15)` 在 J1 上约 0.3 rad/s ⇒ 30 s 能走 ~9 rad，
+        #   **限位内的任何位移都够**。但仍要说一声 —— 大位移意味着从臂会大幅摆动。
+        est = delta / max(speed * 2.0, 1e-6)
+        log.warning(
+            "⚠ 对齐位移 %.3f rad 偏大（>%.2f）—— 从臂会**大幅摆动**，"
+            "按 speed=%.2f 估计约需 %.1f s（上限 %.0f s，到位即提前返回）。"
+            "⚠ 确认从臂周围清空、且不会撞到主臂。",
+            delta, max_delta, speed, est, arm.move_timeout)
     try:
         arm.movej(clamped, speed=speed)
     except Exception as e:                                # noqa: BLE001

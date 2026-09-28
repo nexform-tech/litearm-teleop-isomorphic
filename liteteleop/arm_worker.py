@@ -47,6 +47,15 @@ PUB_HZ = 200.0
 #: 从臂伺服环 = litearm-server 的 `control_loop_hz`（`litearm_balanced.yaml:32`）。
 SLAVE_HZ = servo.DEFAULT_HZ
 
+#: 「同步/对齐」允许的最长时间。**用户裁决 2026-09-28：3 s → 30 s。**
+#: `movej` **一旦到位就立刻返回**（`_arrive` 是"到位/超时/故障"三者先到为准）
+#: ⇒ 这只是上限，不是固定等待。
+#: ⚠ 它是 `Arm(move_timeout=)`，而 SDK 明说**连接后不许改**（改会让"等待窗口"与
+#: `_CartPending` 的额度有效期分叉，且两个方向都不安全）⇒ **只能在构造时定**。
+#: ⚠ 代价：链路真断时，收尾那句 `movej` 也会阻塞到 30 s（不是 3 s）。
+#:    界面不会冻（状态帧走钩子）、急停走旁路 ⇒ 可接受。
+ALIGN_MOVE_TIMEOUT = 30.0
+
 #: 从臂 watchdog（照搬 `TeleopManager.watchdog_ms` 默认值）。**收到首帧之后才生效。**
 WATCHDOG_MS = 200.0
 
@@ -126,7 +135,7 @@ class ArmWorker:
                  peer: Optional[str] = None, jport: int = 0,
                  on_state: Optional[Callable[[Snapshot], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None,
-                 move_timeout: float = 3.0):
+                 move_timeout: float = ALIGN_MOVE_TIMEOUT):
         if role not in (ROLE_MASTER, ROLE_SLAVE):
             raise ValueError(f"role 必须是 {ROLE_MASTER}/{ROLE_SLAVE}，收到 {role!r}")
         self.role = role
@@ -428,12 +437,7 @@ class ArmWorker:
         #    （J1 到 2.8 rad/s），比 `align_speed=0.15` 快近 20 倍 —— 那是**大幅甩动**。
         #
         self._log("等待主臂首帧并对齐 …")
-        try:
-            aligned = servo.align_to_master(arm, self._slot.take, self._limits)
-        except servo.AlignTooFar as e:
-            # ⛔ **不启动跟随** —— 两臂相距太远时硬跟就是一次大幅摆动。
-            self._log(f"⛔ 拒绝启动：{e}")
-            raise
+        aligned = servo.align_to_master(arm, self._slot.take, self._limits)
         self._log("✓ 已对齐（仍用出厂刚度）" if aligned is not None
                   else "⚠ 未对齐（没收到帧 或 movej 失败）—— 跟随会逐步修正")
 
