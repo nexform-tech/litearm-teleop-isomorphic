@@ -1006,6 +1006,34 @@ def test_matching_flag():
     finally:
         m.close()
 
+def test_latest_slot_keeps_only_newest():
+    """latest-wins：迟到帧覆盖、不排队（spec §3.2）。被覆盖的帧要计数，不静默。"""
+    slot = link.LatestSlot()
+    slot.put(b"a", now=1.0)
+    slot.put(b"b", now=2.0)
+    assert slot.take() == (b"b", 2.0)
+    assert slot.dropped == 1, "被覆盖的那帧要计入 dropped（不静默）"
+
+
+def test_latest_slot_take_clears():
+    slot = link.LatestSlot()
+    assert slot.take() == (None, 0.0), "空槽取回 (None, 0.0)"
+    slot.put(b"x", now=5.0)
+    assert slot.take() == (b"x", 5.0)
+    assert slot.take() == (None, 0.0), "取走后槽必须清空"
+
+
+def test_latest_slot_age_is_local_and_zero_when_never_received():
+    """⚠ `peek_age` 是**本机**时间差，与帧里的 `ts`（主臂时钟）无关（spec §4.2）。
+
+    从未收到过时返回 0.0 —— **不是** `now`（那会让 watchdog 以为"刚收到"）。
+    """
+    slot = link.LatestSlot()
+    assert slot.peek_age(now=100.0) == 0.0, "从未收到 ⇒ 0.0"
+    slot.put(b"x", now=10.0)
+    assert slot.peek_age(now=10.25) == pytest.approx(0.25)
+
+
 @pytest.mark.slow
 def test_close_is_mandatory_for_exit():
     """⚠ 不 close ⇒ 进程永久挂死（spec §2.1 `[实测]`）。
@@ -1042,7 +1070,9 @@ cd /home/llx/litearm-teleop-isomorphic
 python3 -m pytest tests/test_link.py -q
 ```
 
-Expected: `ModuleNotFoundError: No module named 'liteteleop.link'`
+Expected: **collection error** —— 模块尚不存在。实测文案随 pytest 版本而异
+（`ModuleNotFoundError: No module named ...` 或 `ImportError: cannot import name 'link' from 'liteteleop'`）
+⇒ **两者都算通过**；判据是「收集期就失败」，不是那条具体文案。
 
 - [ ] **Step 3: 实现**
 
