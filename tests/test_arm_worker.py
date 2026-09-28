@@ -10,8 +10,10 @@ import time
 
 import pytest
 
+from liteteleop import arm_worker, servo
 from liteteleop.arm_worker import (
     ROLE_MASTER,
+    ROLE_SLAVE,
     ArmWorker,
     Snapshot,
     StateHookMissing,
@@ -170,3 +172,53 @@ def test_bad_role_rejected():
 def test_teleop_topic_matches_server_convention():
     w = ArmWorker(role=ROLE_MASTER, arm_id="armB")
     assert w.key == "litearm/v4/armB/teleop"
+
+
+# ────────────── 调用顺序（真机踩过：movej 用了被改软的 mit_kp）──────────────
+
+class _FakeEndpoint:
+    def close(self):
+        pass
+
+
+class _FakeLimits:
+    lo = [-1.0] * 7
+    hi = [1.0] * 7
+
+
+class _ArmedForSlave:
+    move_timeout = 3.0
+
+    def get_state(self, refresh=False):
+        return type("M", (), {"value": type("S", (), {"q": [0.0] * 7})()})()
+
+    def movej(self, q, speed=1.0):
+        pass
+
+
+def test_slave_aligns_BEFORE_writing_the_follow_gains(monkeypatch):
+    """⚠⚠ **对齐必须排在 `apply_joint_gains` 之前。**
+
+    本路线把 K/B **写进固件**（`move_js` 没有随帧下发的通道），而那会把 `mit_kp`
+    从出厂的 400 降到 25 —— 而 `movej` 用的就是 `mit_kp`。软 16 倍的位置环
+    **撑不住、到不了位**，`movej` 会撞 `move_timeout` 报「未到位, 超时 3.0s」（真机踩过）。
+
+    判别力：把两句对调，本用例会红。
+    """
+    order = []
+    monkeypatch.setattr(servo, "align_to_master",
+                        lambda *a, **k: (order.append("align"), [0.0] * 7)[1])
+    monkeypatch.setattr(servo, "apply_joint_gains",
+                        lambda *a, **k: (order.append("gains"), servo.JointGains())[1])
+    monkeypatch.setattr(servo, "follow",
+                        lambda *a, **k: (order.append("follow"), True)[1])
+    monkeypatch.setattr(arm_worker.link, "Connector",
+                        lambda *a, **k: _FakeEndpoint())
+    monkeypatch.setattr(arm_worker, "read_safe_limits", lambda arm, **k: _FakeLimits())
+
+    w = ArmWorker(role=ROLE_SLAVE)
+    w._arm = _ArmedForSlave()
+    w._run_slave()
+
+    assert order == ["align", "gains", "follow"], (
+        f"顺序必须是 对齐 → 改刚度 → 跟随，实际 {order}")

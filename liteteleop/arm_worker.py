@@ -307,12 +307,11 @@ class ArmWorker:
         finally:
             self._teleop_want = False
         # 参数还原（move_js 路线的 K/B 是写进固件的，退出必须还原）
-        if self._arm is not None and self._gains is not None:
-            try:
-                servo.restore_joint_gains(self._arm, self._gains)
-                self._gains = None
-            except Exception:                            # noqa: BLE001
-                log.exception("还原关节增益失败")
+        # ⚠ 必须排在下面的 `hold_at_current()` 之前 —— 那也是一句 `movej`。
+        try:
+            self._restore_gains()
+        except Exception:                                # noqa: BLE001
+            log.exception("还原关节增益失败")
         if self._arm is not None:
             try:
                 servo.hold_at_current(self._arm)         # ⛔ 绝不 disable
@@ -346,10 +345,20 @@ class ArmWorker:
                 self._snap.error = str(e)
         finally:
             self._teleop_want = False
+            # ⚠⚠ **先还原刚度再 movej**：跟随时 `mit_kp` 被降到 25，而 `movej` 用的就是它
+            #     —— 软 16 倍的位置环撑不住、到不了位，收尾 `movej` 会撞 `move_timeout`。
+            self._restore_gains()
             try:
                 servo.hold_at_current(self._arm)         # 受控接管
             except Exception as e:                       # noqa: BLE001
                 self._log(f"⚠ 收尾 movej 失败: {e}")
+
+    def _restore_gains(self) -> None:
+        """还原出厂刚度。**幂等**；任何 `movej` 之前都必须先调它。"""
+        if self._gains is not None and self._arm is not None:
+            servo.restore_joint_gains(self._arm, self._gains)
+            self._gains = None
+            self._log("已还原出厂刚度（movej 要用它）")
 
     def _run_master(self) -> None:
         """主臂：零重力拖动 → 定频采样 → 发布（spec §6）。**主臂不做任何钳位。**"""
@@ -384,11 +393,15 @@ class ArmWorker:
         self._log(f"软限位 {list(zip(self._limits.lo, self._limits.hi))}")
         self._sub = link.Connector(self._peer_host(), self.jport, self.key,
                                    on_frame=self._on_wire)
-        self._gains = servo.apply_joint_gains(arm, servo.DEFAULT_K, servo.DEFAULT_B)
-
         # ── 对齐（照搬 `_do_align`）：等首帧 → 钳位 → **低速 movej** ──
         # ⚠ 少了这一步，从臂会由 `slew_target` 直接拉过去，速度上限是 `speed_limit`
         #    （J1 到 2.8 rad/s），比 `align_speed=0.15` 快近 20 倍 —— 那是**大幅甩动**。
+        #
+        # ⚠⚠ **对齐必须排在 `apply_joint_gains` 之前。** 本路线把 K/B **写进固件**
+        #    （`move_js` 没有随帧下发的通道），而那会把 `mit_kp` 从出厂的 400 降到 25。
+        #    `movej` 用的正是 `mit_kp` —— 软 16 倍的位置环**撑不住、到不了位**，
+        #    于是 `movej` 撞 `move_timeout` 报「未到位, 超时 3.0s」（真机踩过）。
+        #    litearm-server 不会遇到：它的 K/B 走 `send_mit` 随帧下发，**从不改 `mit_kp`**。
         self._log("等待主臂首帧并对齐 …")
         try:
             aligned = servo.align_to_master(arm, self._slot.take, self._limits)
@@ -396,8 +409,13 @@ class ArmWorker:
             # ⛔ **不启动跟随** —— 两臂相距太远时硬跟就是一次大幅摆动。
             self._log(f"⛔ 拒绝启动：{e}")
             raise
-        self._log("✓ 已对齐" if aligned is not None
+        self._log("✓ 已对齐（仍用出厂刚度）" if aligned is not None
                   else "⚠ 未对齐（没收到帧 或 movej 失败）—— 跟随会逐步修正")
+
+        # ⚠ 对齐【之后】才改刚度（改完 `movej` 就撑不住了，所以此后一律先还原再 movej）
+        self._gains = servo.apply_joint_gains(arm, servo.DEFAULT_K, servo.DEFAULT_B)
+        self._log(f"已写入跟随增益 K={servo.DEFAULT_K[0]} B={servo.DEFAULT_B[0]}，"
+                  f"并清零 kd_extra（⚠ 此后 movej 必须先把刚度还原）")
 
         def provider():
             payload, _ts = self._slot.take()
