@@ -15,7 +15,7 @@ from typing import Callable, Optional
 
 import zenoh
 
-__all__ = ["DEFAULT_KEY", "Listener", "Connector"]
+__all__ = ["DEFAULT_KEY", "Listener", "Connector", "LatestSlot"]
 
 #: 默认 key —— 主臂发布、从臂订阅，两端必须一致（界面可改）。
 DEFAULT_KEY = "litearm/teleop/isomorphic"
@@ -81,7 +81,9 @@ class Listener(_Endpoint):
         """是否有订阅者匹配。
 
         ⚠ **是布尔不是计数** —— `zenoh.MatchingStatus` 只有 `.matching`
-        （已核 1.7.2：`dir(zenoh.MatchingStatus) == ['matching']`）。界面显示「已匹配/未匹配」。
+        （在**跑测试的那个解释器**上核过：`dir(zenoh.MatchingStatus) == ['matching']`；
+        ⚠ 本机 `pip` 与 `python3 -m pip` 指向**不同解释器**，版本也不同 —— 别用裸 `pip` 量版本）。
+        界面显示「已匹配/未匹配」。
         """
         return self._matching
 
@@ -101,7 +103,9 @@ class Connector(_Endpoint):
         cfg.insert_json5("connect/endpoints", f'["tcp/{host}:{int(port)}"]')
         self._session = zenoh.open(cfg)
         cb = on_frame or (lambda _b: None)
-        #: 计数（只读，供界面显示；累加只在 zenoh 线程内，GIL 下原子）
+        #: 计数（只读，供界面显示）。
+        #: ⚠ 安全性来自**同一个 subscriber 的回调在同一条 zenoh 线程上串行**，
+        #:   不是「GIL 下 `+=` 原子」—— 属性 `+=` 本身不是原子字节码，别照这句去推广。
         self.received = 0
 
         def _handler(sample) -> None:

@@ -3,7 +3,7 @@
 > 日期：2026-09-28
 > 状态：待评审
 > 目标仓：`litearm-teleop-isomorphic`
-> 依赖：`litearm-python`（直连 CDC，**零 SDK 改动**）、`litearm-stm32` 固件（`Litearm1.5.x`）、`eclipse-zenoh` 1.7.2、PyQt5
+> 依赖：`litearm-python`（直连 CDC，**零 SDK 改动**）、`litearm-stm32` 固件（`Litearm1.5.x`）、`eclipse-zenoh` 1.6.2（**按 `python3 -m pip` 量**）、PyQt5
 > 参考实现：litearm-server 遥操（`docs/superpowers/specs/2026-08-13-teleop-relay-design.md`）
 > —— **只参考结构，执行路径必须换**，见 §9
 
@@ -42,7 +42,8 @@
 
 ### 2.1 Zenoh 点对点 `[实测]`
 
-在 `zenoh 1.7.2` 上实测（本机回环）：
+在 `zenoh 1.6.2` 上实测（本机回环；⚠ **量的是 `python3 -m pip` 那个解释器** —— 本机裸 `pip` 指向另一个
+python3.10 环境、装的是 1.7.2，用裸 `pip` 量版本会得到错的那个）：
 
 | 项 | 结果 |
 | --- | --- |
@@ -526,7 +527,7 @@ J3/J4 也能跑到 server 那个量级。
 **从臂端**额外显示"主臂 vs 本臂"对照与跟踪误差（数据免费，已在手上）；**主臂端**显示发布频率与已发帧数。
 
 > ⚠ **`matching` 是布尔，不是计数** —— `zenoh.MatchingStatus` 只有 `.matching` 一个属性
-> （已核 1.7.2：`dir(zenoh.MatchingStatus)` == `['matching']`）。要做「几个订阅者」得自己数
+> （在**跑测试的那个解释器**上核过：`dir(zenoh.MatchingStatus)` == `['matching']`）。要做「几个订阅者」得自己数
 > `declare_matching_listener` 的回调边沿，**本设计不做**（YAGNI）。界面就显示「已匹配 / 未匹配」。
 
 ---

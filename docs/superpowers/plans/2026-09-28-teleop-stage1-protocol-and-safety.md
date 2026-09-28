@@ -11,7 +11,7 @@
 `pylitearm` 逐字移植**的 —— 见 spec §5.1，它不是新设计，是既有验证实现的搬运。层次上 `wire.py` / `link.py` / `safety.py` **互不依赖**，可以并行做；三者都**不 import
  `litearm`**（`safety.py` 只用 stdlib `math`），这样离线测试不需要硬件也不需要 SDK。
 
-**Tech Stack:** Python 3.13、`eclipse-zenoh` 1.7.2、`pytest`；spike 脚本额外需要
+**Tech Stack:** Python 3.13、`eclipse-zenoh` 1.6.2（**按 `python3 -m pip` 量**）、`pytest`；spike 脚本额外需要
  `litearm-python`（`PYTHONPATH=/home/llx/litearm-python/src`）与一条 7 关节整臂。
 
 **Spec:** `docs/superpowers/specs/2026-09-28-isomorphic-teleop-design.md`（**唯一权威**；本计划与 spec 冲突时以 spec 为准）
@@ -131,7 +131,7 @@ name = "liteteleop"
 version = "0.0.0"
 description = "LiteArm 同构遥操上位机（主臂零重力拖动 → zenoh 点对点 → 从臂 move_js 跟随）"
 requires-python = ">=3.10"
-dependencies = ["zenoh>=1.7", "PyQt5>=5.15"]      # PyQt5 阶段二才用，先声明
+dependencies = ["zenoh>=1.6", "PyQt5>=5.15"]      # PyQt5 阶段二才用，先声明
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
@@ -1096,7 +1096,7 @@ from typing import Callable, Optional
 
 import zenoh
 
-__all__ = ["DEFAULT_KEY", "Listener", "Connector"]
+__all__ = ["DEFAULT_KEY", "Listener", "Connector", "LatestSlot"]
 
 #: 默认 key —— 主臂发布、从臂订阅，两端必须一致（界面可改）。
 DEFAULT_KEY = "litearm/teleop/isomorphic"
@@ -1162,7 +1162,9 @@ class Listener(_Endpoint):
         """是否有订阅者匹配。
 
         ⚠ **是布尔不是计数** —— `zenoh.MatchingStatus` 只有 `.matching`
-        （已核 1.7.2：`dir(zenoh.MatchingStatus) == ['matching']`）。界面显示「已匹配/未匹配」。
+        （在**跑测试的那个解释器**上核过：`dir(zenoh.MatchingStatus) == ['matching']`；
+        ⚠ 本机 `pip` 与 `python3 -m pip` 指向**不同解释器**，版本也不同 —— 别用裸 `pip` 量版本）。
+        界面显示「已匹配/未匹配」。
         """
         return self._matching
 
@@ -1182,7 +1184,9 @@ class Connector(_Endpoint):
         cfg.insert_json5("connect/endpoints", f'["tcp/{host}:{int(port)}"]')
         self._session = zenoh.open(cfg)
         cb = on_frame or (lambda _b: None)
-        #: 计数（只读，供界面显示；累加只在 zenoh 线程内，GIL 下原子）
+        #: 计数（只读，供界面显示）。
+        #: ⚠ 安全性来自**同一个 subscriber 的回调在同一条 zenoh 线程上串行**，
+        #:   不是「GIL 下 `+=` 原子」—— 属性 `+=` 本身不是原子字节码，别照这句去推广。
         self.received = 0
 
         def _handler(sample) -> None:
@@ -1904,7 +1908,7 @@ git commit -m "feat: add teleop state machine and watchdog to safety layer"
 
 - [ ] **Step 2: 补依赖**
 
-确认 `pyproject.toml` 里有 `zenoh>=1.7`。缺则补，**不要重排既有内容**：
+确认 `pyproject.toml` 里有 `zenoh>=1.6`。缺则补，**不要重排既有内容**：
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
