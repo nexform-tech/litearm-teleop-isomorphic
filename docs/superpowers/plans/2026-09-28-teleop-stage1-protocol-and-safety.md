@@ -59,17 +59,19 @@
 
 - Create: `liteteleop/__init__.py`
 - Create: `tests/__init__.py`（空文件，让 pytest 稳定发现）
-- Create: `pyproject.toml` 的补充（若已存在则只加依赖，不重写）
+- Create: `pyproject.toml`（**本仓当前没有此文件**，本步新建）
 
-- [ ] **Step 1: 建分支**
+- [ ] **Step 1: 确认在正确的分支上**
+
+> ⚠ 分支 `feat/teleop-stage1-protocol` **由控制器（主会话）预先建好**，执行者**不要再建** ——
+> `git switch -c` 会报 `already exists`。
 
 ```bash
 cd /home/llx/litearm-teleop-isomorphic
-git switch -c feat/teleop-stage1-protocol
 git branch --show-current
 ```
 
-Expected: 输出 `feat/teleop-stage1-protocol`
+Expected: 输出 `feat/teleop-stage1-protocol`。若不是 ⇒ **停下来报 BLOCKED**，别自己切分支。
 
 - [ ] **Step 2: 建包骨架**
 
