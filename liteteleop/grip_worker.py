@@ -213,6 +213,14 @@ class GripWorker:
                  on_log: Optional[Callable[[str], None]] = None):
         if role not in (ROLE_MASTER, ROLE_SLAVE):
             raise ValueError(f"role 必须是 {ROLE_MASTER}/{ROLE_SLAVE}，收到 {role!r}")
+        # ⚠ 退化的构造参数在**这里**就拒掉，不要留到线程里才崩：
+        #    `rate_hz <= 0` 会在环里 `1.0 / rate_hz` 抛 ZeroDivisionError；
+        #    `watchdog_ms <= 0` 不崩，但会让从端**永远**判 stale ⇒ 一动不动，
+        #    是个"能启动、但什么都不做"的静默无用配置。
+        if not float(rate_hz) > 0.0:
+            raise ValueError(f"rate_hz 必须 > 0，收到 {rate_hz!r}")
+        if not float(watchdog_ms) > 0.0:
+            raise ValueError(f"watchdog_ms 必须 > 0，收到 {watchdog_ms!r}")
         self.role = role
         self.gcan = gcan
         self.grip_id = grip_id

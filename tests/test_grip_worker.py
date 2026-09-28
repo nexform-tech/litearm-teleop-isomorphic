@@ -61,6 +61,29 @@ def test_clamp_to_calibrated_handles_both_mounts():
     assert clamp_to_calibrated(r, -99.0) == pytest.approx(r.pos_closed_rad)
 
 
+# ════════════════════ 构造期就拒退化参数（别留到线程里才崩）════════════════════
+
+@pytest.mark.parametrize("kw,match", [
+    (dict(rate_hz=0.0), "rate_hz"),
+    (dict(rate_hz=-1.0), "rate_hz"),
+    (dict(watchdog_ms=0.0), "watchdog_ms"),
+    (dict(watchdog_ms=-5.0), "watchdog_ms"),
+])
+def test_degenerate_construction_params_are_rejected(kw, match):
+    """⚠ `rate_hz <= 0` 会在环里 `1.0 / rate_hz` 抛 ZeroDivisionError；
+    `watchdog_ms <= 0` 不崩但会让从端**永远**判 stale ⇒ 一动不动（静默无用）。
+
+    判别力：去掉 `__init__` 里那两条 `ValueError` 时本用例必红。
+    """
+    with pytest.raises(ValueError, match=match):
+        GripWorker(ROLE_MASTER, "can0", **kw)
+
+
+def test_bad_role_is_rejected():
+    with pytest.raises(ValueError, match="role"):
+        GripWorker("bogus", "can0")
+
+
 # ════════════════════ §8.1 前置：拒启动 ════════════════════
 
 def test_check_ready_rejects_uncalibrated():
