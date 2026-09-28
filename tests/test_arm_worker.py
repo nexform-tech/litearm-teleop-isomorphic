@@ -197,22 +197,18 @@ class _ArmedForSlave:
 
 
 def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch):
-    """⚠⚠ 从臂的顺序必须是 **对齐 → 写增益 → 跟随**。
+    """⚠⚠ 从臂的顺序是 **对齐 → 跟随**，而且**不写任何固件参数**（用户裁决 2026-09-28）。
 
-    写增益会把 `mit_kp` 从出厂的 400 改成 25，而 **`movej` 用的就是 `mit_kp`** ——
-    对齐那句 `movej` 若排在写增益**之后**，位置环软 16 倍、撑不住、到不了位，
-    会撞 `move_timeout` 报「未到位, 超时 3.0s」（**真机踩过**）。
+    写 `mit_kp` 那条路已经**证伪**：静态托得住（0.0004 rad），但**动态跟随会位置越界
+    断轴 J2/J4**（真机 24 s 后 `FAULT FB_STALE POS_VIOL`）。
+    ⇒ 用固件出厂刚度，抖动靠 kd 预算收紧限速去压。
 
-    （2026-09-28 真机验证：写完之后 kp=25 的臂**稳稳托住**，最大偏移 0.0004 rad，
-      ⇒ "软而稳"就是 litearm-server 的手感，不是故障。之前我误判成"垂下去"。）
-
-    判别力：把前两句对调，本用例会红。
+    判别力：谁要是把 `apply_joint_gains` 加回来，本用例会红（`_NoWriteArm` 没有它、
+    而且顺序数组会多一项）。
     """
     order = []
     monkeypatch.setattr(servo, "align_to_master",
                         lambda *a, **k: (order.append("align"), [0.0] * 7)[1])
-    monkeypatch.setattr(servo, "apply_joint_gains",
-                        lambda *a, **k: (order.append("gains"), servo.JointGains())[1])
     monkeypatch.setattr(servo, "follow",
                         lambda *a, **k: (order.append("follow"), True)[1])
     monkeypatch.setattr(arm_worker.link, "Connector",
@@ -252,9 +248,7 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
     w = ArmWorker(role=ROLE_SLAVE)
     w._arm = _NoWriteArm()
     w._run_slave()
-    assert order == ["align", "gains", "follow"], (
-        f"顺序必须是 对齐 → 写增益 → 跟随，实际 {order}\n"
-        "⛔ 写增益会改 `mit_kp`，而 `movej` 用的就是它 —— 对齐必须排在写增益之前。")
+    assert order == ["align", "follow"], f"顺序必须是 对齐 → 跟随，实际 {order}"
 
 
 

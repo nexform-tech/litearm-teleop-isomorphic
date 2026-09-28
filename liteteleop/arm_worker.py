@@ -459,24 +459,23 @@ class ArmWorker:
         # ⚠⚠ 但**速度上限必须按 kd 预算收紧**：`move_js` 的 `dq` 进电机速度前馈
         #      （`τ += kd_eff·dq`，kd_eff 出厂 J1~J4 = 11），照抄 server 那份配 B=0.5 的
         #      `speed_limit` 会让 J4 的 `kd·dq` = 55 Nm 顶满 tau_max=21 ⇒ **抖**。
+        # ⚠ 对齐成败**必须报出来**（这行曾被误删 ⇒ 出了故障却看不出对齐成没成、差多少）
         if aligned is None:
-            self._log("⚠ 未对齐（没收到帧 或 movej 失败）—— 跟随会逐步修正")
+            self._log("⚠ 未对齐（5 s 内没收到主臂帧，或 movej 失败）—— 跟随会逐步修正")
+        else:
+            self._log(f"✓ 已对齐 → {[round(v, 3) for v in aligned]}")
 
-        # ⚠⚠ 对齐**之后**才写增益：写进去 `mit_kp` 变 25，`movej` 会撑不住（见 servo.SETUP_K）。
-        self._gains = servo.apply_joint_gains(arm)
-        self._log(f"已写跟随增益 mit_kp={servo.SETUP_K} mit_kd={servo.SETUP_B}、清零 kd_extra"
-                  f"（⛔ 此后任何 movej 之前都必须先还原）")
+        # ⛔ **不改刚度**（用户裁决 2026-09-28）：写 `mit_kp` 那条路**只验证了静态、
+        #    动态跟随会位置越界断轴**（见 servo.SETUP_K 那段注释）。用固件出厂值。
 
-        # 速度上限：跟随期间 kd_eff 就是 B（很小）⇒ 预算**不会**成为瓶颈，
-        # 但仍算出来打日志 —— 哪天有人改了 SETUP_B，这条会立刻显形。
-        kd_pre, tau_max = servo.effective_kd(arm)
-        kd_post = [servo.SETUP_B] * N_JOINTS
-        sl_budget = servo.speed_limit_from_kd(kd_post, tau_max)
+        # ⚠⚠ 速度上限**必须**按 kd 预算收紧（见上面那段）。
+        # ⚠ 先读、再打日志 —— 早先写成"先写增益再读"，两行都显示改后的值，是 bug。
+        kd, tau_max = servo.effective_kd(arm)
+        sl_budget = servo.speed_limit_from_kd(kd, tau_max)
         sl = [min(a, b) for a, b in zip(servo.DEFAULT_SPEED_LIMIT, sl_budget)]
-        self._log(f"出厂 kd_eff={[round(x, 1) for x in kd_pre]} ⇒ 写后 kd_eff="
-                  f"{[round(x, 1) for x in kd_post]}")
-        self._log(f"speed_limit 预算={[round(x, 2) for x in sl_budget]}"
-                  f" ⇒ 实取(=配置值)={[round(x, 2) for x in sl]}")
+        self._log(f"出厂 kd_eff={[round(x, 1) for x in kd]}  tau_max={[round(x, 1) for x in tau_max]}")
+        self._log(f"speed_limit 配置={servo.DEFAULT_SPEED_LIMIT}")
+        self._log(f"speed_limit 预算={[round(x, 3) for x in sl_budget]}  ⇒ 实取={[round(x, 3) for x in sl]}")
 
         def provider():
             payload, _ts = self._slot.take()
