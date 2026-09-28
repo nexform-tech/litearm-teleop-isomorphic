@@ -5,7 +5,7 @@
 本模块**不 import litearm / pylitearm，不碰硬件**：它是可以在无臂机器上单测的纯函数层。
 状态机与 watchdog 是第二部分（见 spec §5.2），本文件只放第一步的纯逻辑。
 
-⚠ `slew_target` 是**从既有验证实现逐字移植**的（`pylitearm/control/joint_follow.py:45-88`），
+⚠ `slew_target` 是**从既有验证实现逐字移植**的（`pylitearm/src/pylitearm/control/joint_follow.py:45-88`），
 ⛔ **不是**重新设计。理由：跟随手感与制动距离是**整条从臂跟随行为**的唯一来源，
 "照抄"才有既有真机行为的可预期性；任何"改进"都必须先报用户裁决（spec §11 S3）。
 """
@@ -162,7 +162,7 @@ def speed_limit_from_kd(
 def slew_target(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
     """速度/加速度限制的目标位置平滑（梯形速度曲线）。
 
-    ⚠ **逐字移植自 `pylitearm/control/joint_follow.py:45-88`**（唯一偏离：原版循环
+    ⚠ **逐字移植自 `pylitearm/src/pylitearm/control/joint_follow.py:45-88`**（唯一偏离：原版循环
     上界是模块常量 `N = 7`，这里取 `len(raw_target)`；7 轴输入下两者**完全等价**）。
     对每个关节：
 

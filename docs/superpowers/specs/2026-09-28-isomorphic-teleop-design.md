@@ -318,7 +318,7 @@ n = 7 时共 **70 B**。
   move_js(q = q_cmd, dq = dq_cmd)
 ```
 
-`slew_target`（`pylitearm/control/joint_follow.py:45-88`）是一个**梯形速度曲线参考生成器**：
+`slew_target`（`pylitearm/src/pylitearm/control/joint_follow.py:45-88`）是一个**梯形速度曲线参考生成器**：
 逐轴限速 `speed_limit`、限加速 `accel_limit`，并**按制动距离 `v²/(2a)` 提前减速**，
 到目标即 `q_cmd = q_target`、`dq_cmd = 0`。**它永远收敛，且完全不依赖主臂的速度。**
 

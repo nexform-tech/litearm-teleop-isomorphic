@@ -9,7 +9,7 @@ import pytest
 
 from liteteleop import safety
 
-# ── 参照实现：从 pylitearm/control/joint_follow.py:45-88 抄成独立副本 ──────────
+# ── 参照实现：从 pylitearm/src/pylitearm/control/joint_follow.py:45-88 抄成独立副本 ──────────
 # ⚠ 这份副本是**测试的对照组**，刻意与实现分开写。两边都错才可能同时通过。
 
 

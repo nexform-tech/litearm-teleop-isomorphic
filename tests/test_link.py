@@ -42,7 +42,7 @@ def test_roundtrip_bytes():
 
 
 def test_sustained_100hz_no_loss():
-    """100 Hz 持续 2 s 零丢包 —— 实测过的能力，回归钉住。"""
+    """100 Hz 持续 2 s 零丢包 —— spec §2.1 实测过的能力，回归钉住。"""
     port = _free_port()
     m = link.Listener(port, KEY)
     got = []
@@ -72,7 +72,7 @@ def test_sustained_100hz_no_loss():
 
 
 def test_matching_flag():
-    """主臂端能拿到 matching 布尔（⚠ 是布尔不是计数）。"""
+    """主臂端能拿到 matching 布尔（⚠ 是布尔不是计数，spec §8）。"""
     port = _free_port()
     m = link.Listener(port, KEY)
     try:
@@ -88,9 +88,8 @@ def test_matching_flag():
     finally:
         m.close()
 
-
 def test_latest_slot_keeps_only_newest():
-    """latest-wins：迟到帧覆盖、不排队。被覆盖的帧要计数，不静默。"""
+    """latest-wins：迟到帧覆盖、不排队（spec §3.2）。被覆盖的帧要计数，不静默。"""
     slot = link.LatestSlot()
     slot.put(b"a", now=1.0)
     slot.put(b"b", now=2.0)
@@ -107,7 +106,7 @@ def test_latest_slot_take_clears():
 
 
 def test_latest_slot_age_is_local_and_zero_when_never_received():
-    """⚠ `peek_age` 是**本机**时间差，与帧里的 `ts`（主臂时钟）无关。
+    """⚠ `peek_age` 是**本机**时间差，与帧里的 `ts`（主臂时钟）无关（spec §4.2）。
 
     从未收到过时返回 0.0 —— **不是** `now`（那会让 watchdog 以为"刚收到"）。
     """
@@ -119,7 +118,7 @@ def test_latest_slot_age_is_local_and_zero_when_never_received():
 
 @pytest.mark.slow
 def test_close_is_mandatory_for_exit():
-    """⚠ 不 close ⇒ 进程永久挂死。
+    """⚠ 不 close ⇒ 进程永久挂死（spec §2.1 `[实测]`）。
 
     用**子进程**验证，因为症状是"解释器退不出去"，同进程测不到。
     """
