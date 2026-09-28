@@ -42,6 +42,10 @@ def main(argv=None) -> int:
     ap.add_argument("--peer", default=None, help="从臂填：主臂的 IP")
     ap.add_argument("--jport", type=int, default=None, help="zenoh 端口")
     ap.add_argument("--arm-id", default=None, help="topic 里的 arm_id（两端必须一致）")
+    ap.add_argument("--gcan", default=None, help="夹爪 CAN 通道（空=不启用夹爪遥操）")
+    ap.add_argument("--gpeer", default=None, help="从臂夹爪填：主臂的 IP")
+    ap.add_argument("--gport", type=int, default=None, help="夹爪 zenoh 端口")
+    ap.add_argument("--grip-id", default=None, help="夹爪 topic 里的 grip_id（两端须一致）")
     a = ap.parse_args(argv)
 
     from .settings import load_settings
@@ -52,6 +56,17 @@ def main(argv=None) -> int:
     if a.peer: s.peer = a.peer
     if a.jport: s.jport = a.jport
     if a.arm_id: s.arm_id = a.arm_id
+    if a.gcan: s.gcan = a.gcan
+    if a.gpeer: s.gpeer = a.gpeer
+    if a.gport: s.gport = a.gport
+    if a.grip_id: s.grip_id = a.grip_id
+    # ⚠⚠ 钉死必须排在**上面那 4 行赋值之后** —— 否则 `s.gcan` 还是空串，
+    #    这段就永远不跑（本计划的初稿就写错成了「load_settings() 之后」）。
+    if s.gcan:
+        # ⚠⚠ 必须在任何人 import litegrip **之前**钉死，否则本机那份 editable 的
+        #    gitee 克隆会被静默抢先（实测：裸 import 落在 moduangongju/lite-grip）。
+        from .grip_worker import pin_grip_sdk
+        print(f"夹爪 SDK: {pin_grip_sdk()}")
     import sys as _sys
     # ⚠ 只把程序名交给 Qt：`--role`/`--cdc` 这些是**我们的**参数，Qt 不认识。
     return run([_sys.argv[0]], settings=s)
