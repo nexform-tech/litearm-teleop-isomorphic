@@ -328,6 +328,8 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
 
         base = time.monotonic()
         next_tick = base + dt_nom
+        # ⚠ 固件状态监视的上一拍快照（见循环里那段）
+        _prev_fw = None
 
         while not should_stop():
             if duration_s is not None and time.monotonic() - base >= duration_s:
@@ -356,6 +358,24 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                 log.exception("send_mit_all 失败，受控接管")
                 hold_at_current(arm)
                 raise
+
+            # ── 固件状态监视：**一变就记一行**（读缓存，实测 0.001 ms，不进循环开销）──
+            # ⚠⚠ 故障的**先后顺序**只能从这里看出来。前几次排查我都是**杀完进程**才查状态，
+            #    看到的是"结果"，还混进了我自己 kill 造成的 `WD_TRIPPED` —— **永远抓不到现场**。
+            #    这一段让故障**发生的那一拍**就留下 `flags`/`joint_fault`/`err` 与跟踪误差。
+            _snap = arm.get_state(refresh=False).value
+            if _snap is not None and hasattr(_snap, "joints"):
+                _cur = (tuple(getattr(_snap, "flag_names", ()) or ()),
+                        int(getattr(_snap, "joint_fault", 0) or 0),
+                        tuple(int(j.err) for j in _snap.joints))
+                if _cur != _prev_fw:
+                    _e = max(abs(a - b) for a, b in zip(q_cmd, _snap.q))
+                    log.warning(
+                        "⚠ 固件状态变化 flags=%s joint_fault=0x%X err=%s  "
+                        "最大跟踪误差=%.4f rad  q=%s",
+                        list(_cur[0]), _cur[1], list(_cur[2]), _e,
+                        [round(v, 3) for v in _snap.q])
+                    _prev_fw = _cur
 
             r = next_tick - time.monotonic()
             if r > 0:
