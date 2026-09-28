@@ -108,7 +108,7 @@ def main() -> int:
                 else:
                     seqs.append(st.seq)
                     dq_peak = max(dq_peak, max(abs(x) for x in st.dq))
-                    pub.put(wire.encode(st.q, st.dq, time.time(), st.seq))
+                    pub.put(wire.encode_teleop(st.q, st.dq, time.time()))
                     sent += 1
                     ticks.append(time.monotonic())
                 r = nxt - time.monotonic()
@@ -142,9 +142,9 @@ def main() -> int:
         print(f"  zenoh 收到    {len(recv)} / {sent}"
               f"{'  ✓ 无丢失' if len(recv) == sent else '  ⚠ 有丢失'}")
         if recv:
-            f = wire.decode(recv[-1], expect_n=ARM_JOINTS)
-            print(f"  解码回读      n={f.n} seq={f.seq} 帧长 "
-                  f"{len(recv[-1])}B (frame_size={wire.frame_size(ARM_JOINTS)})")
+            f = wire.decode_teleop(recv[-1])
+            print(f"  解码回读      q[0]={f['q'][0]:.4f} 帧长 "
+                  f"{len(recv[-1])}B (={wire.TELEOP_FRAME_BYTES})")
         print(f"  拖动速度 dq   峰值 {dq_peak:.4f} rad/s"
               f"   （⚠ 人没拖时接近 0 是正常的）")
         st = arm.get_state(refresh=True).value

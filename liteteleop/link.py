@@ -5,8 +5,9 @@
 
 ⚠ **进程退出前必须 `close()`**，否则**永久挂死**（spec §2.1 `[实测]`：不 close 时
 解释器退不出去，`timeout` 才能杀掉）。
-⚠ key 与 litearm-server 的 `litearm/v4/{arm_id}/teleop` **不可混用**：那边是 `>15d` 120 B，
-本文是 70 B，共用 key 会让两端把对方的帧静默解错。
+⚠ key 现在**与 litearm-server 共用**（`litearm/v4/{arm_id}/teleop`，见 `wire.teleop_topic`）。
+帧格式也已对齐（`>15d` 120 B），所以两端**可以**互通 —— 这是刻意的。
+⚠ 但**仍然不许**跨版本混用：格式一旦分叉，共用 key 会让两端静默解错。
 """
 from __future__ import annotations
 
@@ -15,10 +16,14 @@ from typing import Callable, Optional
 
 import zenoh
 
-__all__ = ["DEFAULT_KEY", "Listener", "Connector", "LatestSlot"]
+__all__ = ["DEFAULT_ARM_ID", "DEFAULT_KEY", "Listener", "Connector", "LatestSlot"]
 
 #: 默认 key —— 主臂发布、从臂订阅，两端必须一致（界面可改）。
-DEFAULT_KEY = "litearm/teleop/isomorphic"
+#: 取自 `wire.teleop_topic`，与 litearm-server 的 `teleop_topic("armA")` 同一个串。
+#: 默认 `arm_id="armA"` 也对齐 server 的 `TeleopController(arm_id="armA")` 默认值。
+from .wire import teleop_topic as _teleop_topic
+DEFAULT_ARM_ID = "armA"
+DEFAULT_KEY = _teleop_topic(DEFAULT_ARM_ID)
 
 
 def _base_config() -> zenoh.Config:

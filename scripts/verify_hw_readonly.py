@@ -36,7 +36,7 @@ sys.path.insert(0, SDK_SRC)
 
 import litearm as pa                                            # noqa: E402
 from litearm.arm import MIN_FW                                  # noqa: E402
-from liteteleop import safety                                   # noqa: E402
+from liteteleop import safety, servo                            # noqa: E402
 
 #: 整臂轴数。⛔ 不是"期望值"而是**判据**：1J 台架板在这里会显形。
 ARM_JOINTS = 7
@@ -134,14 +134,16 @@ def main() -> int:
             kd_extra = [50.0] * arm.n
         kd = [p.kd + e for p, e in zip(jp, kd_extra)]
         tm = [p.tau_max for p in jp]
-        spd = safety.speed_limit_from_kd(kd, tm, kd_budget=safety.DEFAULT_KD_BUDGET)
+        # ⚠ 这里**不再**推导速度上限。旧版算的是 `kd_budget·tau_max/kd`，那是为
+        # `move_js`（刚度由固件定死）造的；litearm-server 用 joint_follow，
+        # 速度限幅是**配置真值** `joint_follow.speed_limit`。列出来只为对照。
+        spd = list(servo.DEFAULT_SPEED_LIMIT)
         print()
         print(f"mit_kd   = {[round(x, 2) for x in (p.kd for p in jp)]}")
         print(f"kd_extra = {[round(x, 2) for x in kd_extra]}")
         print(f"kd_eff   = {[round(x, 2) for x in kd]}")
         print()
-        print(f"speed_limit (kd_budget={safety.DEFAULT_KD_BUDGET}) "
-              f"= kd_budget · tau_max / kd_eff:")
+        print("litearm-server 的 joint_follow.speed_limit（配置真值，非本臂推导）:")
         tight = min(range(arm.n), key=lambda i: spd[i])
         for i, s in enumerate(spd):
             mark = "  ← 最紧（决定高速跟随上限）" if i == tight else ""
