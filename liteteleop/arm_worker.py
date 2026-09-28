@@ -427,7 +427,7 @@ class ArmWorker:
             self._log(f"⚠ zero_g_stop 失败: {e}")
 
     def _run_slave(self) -> None:
-        """从臂：订阅 → 钳位 → `slew_target` → `send_mit_all`（spec §5）。"""
+        """从臂：订阅 → 钳位 → `slew_target` → `joint_follow`（0x08）（spec §5）。"""
         arm = self._arm
         self._limits = read_safe_limits(arm)             # 读不到会抛 ⇒ 拒启动
         self._log(f"软限位 {list(zip(self._limits.lo, self._limits.hi))}")
@@ -440,7 +440,7 @@ class ArmWorker:
         self._log("等待主臂首帧并对齐 …")
         aligned = servo.align_to_master(arm, self._slot.take, self._limits)
 
-        # ⚠ **不改任何固件参数** —— K/B 走 `send_mit_all` **随帧下发**，
+        # ⚠ **不改任何固件参数** —— K/B 走 `CMD_JOINT_FOLLOW(0x08)` **随帧下发**，
         #    而不是写固件的全局 `mit_kp`/`mit_kd`（后者会连带改坏 `movej`，真机踩过两次）。
         #    随帧下发**只对这一帧生效** ⇒ `movej` 完全不受影响。
         # ⚠ 对齐成败**必须报出来**（这行曾被误删 ⇒ 出了故障却看不出对齐成没成、差多少）
@@ -468,10 +468,10 @@ class ArmWorker:
         self._log(f"限位墙已接线：margin={wall.margin} rad  "
                   f"stiffness={wall.stiffness}  damping={wall.damping}")
         self._log(f"从臂跟随：K={servo.SETUP_K} B={servo.SETUP_B}"
-                  f"（litearm.yaml 默认档，随 send_mit_all 下发）")
+                  f"（litearm.yaml 默认档，随 0x08 帧下发）")
         self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
-        self._log("⚠ 每拍 2 次往返（get_gravity + send_mit_all，实测各 3.333 ms）"
-                  "⇒ 上限 ~150 Hz")
+        self._log(f"每拍 1 次下发（CMD_JOINT_FOLLOW；G + 限位墙由**固件**算）"
+                  f"⇒ 节拍 {SLAVE_HZ:.0f} Hz（硬件上限 ~300 Hz，150 是保守值）")
 
         def provider():
             payload, _ts = self._slot.take()

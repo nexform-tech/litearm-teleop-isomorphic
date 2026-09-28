@@ -1,11 +1,17 @@
 """关节限位虚拟墙 —— **逐字移植自 `pylitearm/control/joint_limit_wall.py`**。
 
-> ⛔⛔ **当前【未接线】（2026-09-28 用户裁决：从臂执行器用 `move_js`）。**
-> `move_js` **没有力矩通道**（给了 `tau_ff` 反而会关掉固件的内置重力），
-> 所以这道墙的 `tau()` **没有地方叠加**。位置护栏由 `safety.clamp_to_limits`
-> 承担 —— 那也正是 litearm-server 的**主**护栏（`np.clip`），墙是它的**第二道**。
-> 保留本模块的理由：它是逐字移植，若将来走 `send_mit` / 固件侧 `joint_follow`，
-> 这道墙要原样接回去。**现在它不参与遥操。**
+> ⚠ **接线状态（2026-09-28 起）**：这道墙的**力矩**部分已搬进**固件**，
+> PC 侧只保留「进墙区抬高 `kd`」这一步 ——
+>
+>     PC（本模块）   `wall_zone_mask(q_meas)` → 墙区那几轴的 `kd += WALL_FW_KD`
+>     固件           `law_wall(q_meas, dq_meas, …)` → **真正的排斥力矩**，叠进 `τ_ff`
+>
+> ⇒ 本模块的 `tau()` **当前没有调用点**（力矩已在 `control_loop.c` 的
+>   `CMD_JOINT_FOLLOW` 会话里与 `dyn_gravity` 一起算）。**保留它是当参照实现用** ——
+>   固件那份是它的 C 移植，任一侧改动时两边必须对拍。
+>
+> 位置护栏共三层：`safety.clamp_to_limits` 钳**目标**（server 的主护栏也是它）、
+> 本模块的 `kd` 抬高、固件的 `law_wall` 排斥力矩 + `slew_linear(vel_max)` 限速。
 
 ⛔ 不是新设计。litearm-server 的遥操（经真机验证）在手动模式下开这道墙，
 用户裁决「必须严格按照 litearm-server 来写」。算法、符号约定、防抖设计**全部照搬**，
@@ -96,7 +102,12 @@ class JointLimitWall:
         return any(self.wall_zone_mask(q))
 
     def tau(self, q, dq=None):
-        """限位墙排斥力矩 [N]，含力矩变化率限幅（照搬）。"""
+        """限位墙排斥力矩 [N]，含力矩变化率限幅（照搬）。
+
+        ⛔ **当前无调用点** —— 力矩已由固件的 `law_wall` 在 `CMD_JOINT_FOLLOW` 会话里
+        算好并叠进 `τ_ff`（见模块 docstring 的接线状态）。保留作**参照实现**：
+        固件那份是本方法的 C 移植，两侧改动时必须对拍。
+        """
         dq = dq if dq is not None else [0.0] * N_JOINTS
         out = [0.0] * N_JOINTS
         for i in range(N_JOINTS):

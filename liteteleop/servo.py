@@ -1,29 +1,44 @@
-"""从臂伺服环 —— **逻辑与执行器都照 litearm-server 的 `joint_follow`**。
+"""从臂伺服环 —— **逻辑照 litearm-server 的 `joint_follow`，但环本身落在固件里**。
 
 litearm-server 的从臂是 `joint_follow` → `send_mit(K, B, q_cmd, dq_cmd, G(q))`：
-**K/B 随帧下发、重力在 PC 本地算**。本 SDK 没有 `joint_follow`，但这两件事都直接可做：
+K/B **随帧下发**、重力 **PC 本地算**。两条路的分歧**只在"这一环落在谁身上"**：
 
-    τ_ff = clamp(G(q), ±tau_max)                      # get_gravity，一次往返
-    send_mit_all(q_cmd, dq_cmd, K=25, B=0.5, τ_ff)    # 一次往返
+    server :  PC ──SocketCAN──▶ 电机               （中间无固件；K/B 与 G 都由 PC 送）
+    本实现 :  PC ──USB CDC──▶ STM32 ──CAN──▶ 电机   （伺服环在固件的 300 Hz 里）
 
-⚠ **别用 `move_js` 代替**（那是已弃的旧路线）：`move_js` 的 K/B 是**固件出厂参数**
-（`mit_kp`=400、`mit_kd`+`kd_extra`=11），**没有随帧通道** —— 刚度差 16 倍、阻尼差 22 倍，
-手感**不可能**一样。真机判据：「跟随太慢，有明显的延迟」「没有 litearm-server 丝滑」。
-唯一能改它的办法是写固件参数，而**那条路已证伪**（见 `SETUP_K` 上面那段）。
+⇒ 本仓发的是 `arm.joint_follow(q, dq, K, B)`（`CMD_JOINT_FOLLOW 0x08`）：**帧里没有
+`tau`** —— 前馈 `τ_ff = clamp(G(q_meas) + wall, ±tau_max)` 由固件每拍自己算（照
+`joint_follow.compute_tau_ff`），**省掉 PC 的 `get_gravity` 往返**。
 
-**执行器是 `send_mit_all`（MIT 透传），K/B 随帧下发** —— 与 litearm-server 的
-`joint_follow` **逐值一致**（`litearm.yaml` 的 60/40 与 1.0/0.8，见 `SETUP_K` 那段）。
+## 为什么必须把环搬进固件
 
-## 与 `joint_follow` 的已知差异（用户已知悉并接受）
+CDC 每拍有 ~6.7 ms 往返延迟，而 `kp` 弹簧的**控制层瞬态**会让实测 `dq` 冲过
+`vel_max × 1.5` ⇒ 固件锁存 `joint_fault` ⇒ **停发该轴控制帧** ⇒ 达妙电机"收帧才回
+状态" ⇒ 该轴静默 ⇒ 80 ms 后报 `FB_STALE`（次生现象）。**根因是这个"判了并且锁存"的
+动作**，而 server 靠 `assert_operational(measured_overspeed_factor=inf,
+skip_position=True)` **主动豁免**那两条判据 —— 固件没有这个开关，故给它加了一条专用
+通道（豁免范围逐条限定，见 spec §3.4；通用 `move_mit_all` 路径**一条都不放宽**）。
+
+## 与 `joint_follow` 的差异
 
 | # | `joint_follow` | 本实现 | 处置 |
 | --- | --- | --- | --- |
-| ① | K/B **随帧下发**（25 / 0.5） | **同**（走 `send_mit_all` 的 `kp`/`kd`） | ✅ 一致 |
-| ② | 有力矩通道（限位墙叠在 `tau_ff`） | **没有**（`tau_ff` 让给重力项） | 位置护栏靠 `clamp_to_limits`（server 的主护栏也是它） |
-| ③ | 每拍 **1 次**往返 | 每拍 **2 次**（`get_gravity` + `send_mit_all`，各实测 3.333 ms） | ⇒ **~150 Hz**（旧 `move_js` 是 1 次 ⇒ 250 Hz）。用户裁决：先试纯粹版 |
+| ① | K/B **随帧下发** | **同**（`CMD_JOINT_FOLLOW` 的 `kp`/`kd` 字段） | ✅ 一致 |
+| ② | 力矩通道（限位墙叠在 `tau_ff`） | **同**（固件把 `law_wall` 叠进 `τ_ff`） | ✅ 一致 |
+| ③ | 位置护栏 | PC `clamp_to_limits` **+** 固件 `law_wall` | ✅ 更严 |
+| ④ | 超速/位置判据**不判** | 该通道上**豁免那两条**（其余判据一条不动） | ✅ 一致 |
+
+⚠ **别用 `move_js` 代替**（那是已弃的旧路线）：它的 K/B 是**固件出厂参数**
+（`mit_kp`=400、`mit_kd`+`kd_extra`=11），**没有随帧通道** —— 刚度差 16 倍、阻尼差
+22 倍，手感**不可能**一样。真机判据：「跟随太慢，有明显的延迟」。唯一能改它的办法是
+写固件参数，而**那条路已证伪**（见 `SETUP_K` 上面那段）。
 
 控制律的**参考生成**（`slew_target`）、**参数真值**、**watchdog**、**对齐**、**钳位**
-仍然逐条照 litearm-server，见 spec §5、§9.1。
+仍逐条照 litearm-server，见 spec §5、§9.1。
+
+⚠ **PC 侧的 `slew_target` 刻意保留**：固件的 `slew_linear` 用 `vel_max` 兜底，而这里的
+`speed_limit`/`accel_limit` 更保守 —— 两层不冲突（同值时自然退化为一层），且 PC 侧这一
+层交给固件的是**平滑目标**而不是阶跃。由 `test_safety.py` 与 pylitearm 原版逐拍对拍锁定。
 """
 from __future__ import annotations
 
@@ -48,13 +63,7 @@ __all__ = [
 ]
 
 # ── 参数真值 ────────────────────────────────────────────────────────────────
-# ⛔ 限速/限加速逐个照抄 `pylitearm/config/litearm_balanced.yaml` 的 `joint_follow:` 段。
-#
-# ⚠⚠ **K/B 不在这里** —— 见模块 docstring「为什么没有 K/B」。
-#    litearm-server 的 K=25 / B=0.5 走 `send_mit` **随帧下发**；`move_js` **没有那条通道**，
-#    要改只能写固件的 `mit_kp`/`mit_kd`，而那会**连带改坏 `movej`**（`movej` 用的就是
-#    `mit_kp`，软 16 倍的位置环撑不住、到不了位）。用户裁决：**不改刚度，用出厂值**。
-#: ⛔⛔ **不是 litearm-server 的值** —— 有实测依据（2026-09-28）。
+#: ⛔ **不是 litearm-server 的值** —— 有实测依据（2026-09-28）。
 #:
 #: server 的那份 `[2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]` 来自一个**没有固件安全层**的
 #: 系统：它走 CAN **直连电机**，且 `joint_follow` 每步都主动豁免了检查 ——
@@ -62,30 +71,35 @@ __all__ = [
 #:     hw.assert_operational(measured_overspeed_factor=float('inf'),   # 超速检查关掉
 #:                           skip_position=True)                        # 位置检查跳过
 #:
-#: 我们经过 STM32 固件，而固件的超速判据**永久开着、豁免不了**：
+#: 我们经过 STM32 固件，而固件有**独立的**超速判据：
 #:
 #:     safety_check.c:  |dq| > jp->vel_max × 1.5   连续 5 拍 ⇒ 锁存 joint_fault
 #:     固件整臂表:      vel_max = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]  ⇒ 阈值 2.6~3.0
 #:
 #: ⇒ 拿 server 的 5/13 rad/s 会**持续越线**：从臂不会更快，只会锁存掉力
-#:   （锁存 ⇒ 固件停发该轴控制帧 ⇒ 达妙电机"收帧才回状态"⇒ 静默 ⇒ 80 ms 后 `FB_STALE`）。
+#:   （锁存 ⇒ 固件停发该轴控制帧 ⇒ 达妙电机"收帧才回状态" ⇒ 静默 ⇒ 80 ms 后 `FB_STALE`）。
 #:   真机实录（`21:04:17`）：`OVERSPEED` 首拍即报，5 拍后 J3 锁存，J4 随后跟进。
 #:
-#: ⚠ `vel_max` 是**编译期常量**（`defaults.c`）—— SDK 只暴露 `kp/kd/tau_max/q_min/q_max`，
-#:   **没有任何命令能改它**（`set_joint_limit` 只能改限位）⇒ **不改固件就绕不过去**。
+#: ⚠ **那条判据现在可以在 `CMD_JOINT_FOLLOW` 会话里豁免**（S2，照 server 的
+#:   `measured_overspeed_factor=inf`）。但**本表照取不误**，理由与豁免无关：
+#:     · 固件的 `slew_linear` 就是按 `vel_max` 推进参考的 ⇒ **这才是从臂本来就有的
+#:       速度**：PC 给的目标若快于它，多出来的部分只会变成跟踪误差，不会变成速度；
+#:     · `vel_max` 是**编译期常量**（`defaults.c`），SDK 无任何写入口
+#:       （`set_joint_limit` 只改限位）⇒ 想更快必须改固件重烧。
 #:
-#: ⇒ 取固件整臂表的 `speed_limit`（与 `vel_max` 同值）。**这不是"变慢"**：`move_js` 路线下
-#:   固件用的就是这张表 ⇒ **这才是从臂本来就有的速度**，只是 MIT 路线的位置命令由 PC 给，
-#:   所以这张表要由我们在 PC 侧执行。
+#: ⇒ **这不是"变慢"**：它就是从臂的速度上限，只是位置命令由 PC 给，所以这张表要在
+#:   PC 侧一并执行。
 DEFAULT_SPEED_LIMIT = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]
 DEFAULT_ACCEL_LIMIT = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]
 DEFAULT_ENGAGE_SEC = 0.3
 
-#: **从臂伺服环**频率。⚠ **这是"打算跑到多少"，不是"能跑到多少"** ——
-#: MIT 路线每拍 **2 次往返**（`get_gravity` + `send_mit_all`，各实测 **3.333 ms**）
-#: ⇒ **实际上限 ~150 Hz**。`dt_nom = 1/hz` 会**直接进 `slew_target`**，
-#: 所以这个数**必须贴着实际周期填**，否则限速参考本身就算错了。
-#: ⚠ 旧 `move_js` 路线每拍 1 次往返，那时这里填 250（`litearm_balanced.yaml:32`）。
+#: **从臂伺服环**的节拍频率（`follow()` 用 `sleep` 主动对齐到点，不是"能跑多快"）。
+#: `dt_nom = 1/hz` 会**直接进 `slew_target`** ⇒ 这个数**必须等于实际循环周期**，
+#: 否则限速参考按错周期算（每拍推进量 = `speed_limit × dt_nom`）。
+#:
+#: ⚠ **S4 之后每拍只 1 次往返**（`CMD_JOINT_FOLLOW` 一次下发；`get_gravity` 已由固件
+#:   内算取代）⇒ 实测单往返 3.333 ms，硬件上能到 ~300 Hz。**150 是主动选的保守节拍，
+#:   不是上限** —— 要提速改这个数即可（server 的 `control_loop_hz` 是 250）。
 #: ⚠ 与主臂的 `pub_hz = 200` 是两个不同的数，别混。
 DEFAULT_HZ = 150.0
 
@@ -112,7 +126,10 @@ DEFAULT_PAYLOAD_COM = (0.0, 0.0, 0.03)
 _FF_ITEM_PAYLOAD_MASS = 4
 _FF_ITEM_PAYLOAD_COM = 5
 
-#: ⛔⛔ **未接线**（2026-09-28 用户裁决：先回到能跑的状态）。
+#: ⛔⛔ **历史：已证伪的「写固件参数」路线**（2026-09-28 用户裁决停用）。
+#:
+#: ⚠ **以下是过程记录，不是当前实现** —— 当前实现见本段末尾的 `SETUP_K` / `SETUP_B`
+#:   （K/B 随 `0x08` 帧下发）。留这段只为**别再走回去**。
 #:
 #: ## 为什么停用 —— 我只验证了一半就上了
 #:
@@ -152,31 +169,33 @@ _FF_ITEM_PAYLOAD_COM = 5
 #:   「未到位, 超时 3.0s」）。⇒ **凡是要调 `movej` 的地方，必须先把增益还原。**
 #: ⚠ 只写 RAM（不调 `save_params()`）⇒ 断电即还原；但**进程崩溃会留在改过的值上**，
 #:   所以恢复点必须放进 `finally`。
-#: **从臂跟随增益 —— 照抄 `joint_follow` 的 `K=25.0 / B=0.5`，随 `send_mit_all` 每帧下发。**
+#: **从臂跟随增益 —— 照抄 litearm-server 默认配置 `litearm.yaml` 的 `joint_follow:` 段。**
 #:
 #: ⚠⚠ 与**上面那段"写进固件"的路线完全不同**（那条已证伪），两者是**不同通道**：
 #:
-#:     写 `mit_kp`/`mit_kd`      → **固件全局参数** ⇒ `movej` 也用 ⇒ 改坏 `movej`（真机踩过）
-#:     `send_mit_all(kp=,kd=)`   → **只对这一帧生效** ⇒ `movej` **完全不受影响** ✓
+#:     写 `mit_kp`/`mit_kd`                    → **固件全局参数** ⇒ `movej` 也用 ⇒ 改坏 `movej`（真机踩过）
+#:     `CMD_JOINT_FOLLOW(0x08)` 的 `kp`/`kd`   → **只对这一帧生效** ⇒ `movej` **完全不受影响** ✓
 #:
 #: ## 为什么必须换执行器，才拿得到 server 的手感
 #:
 #: 两条路控制律**形式相同、参数差一个数量级**：
 #:
-#:     joint_follow（server）   τ =  25·(q_cmd−q) + 0.5·(dq_cmd−dq) + G(q)
+#:     joint_follow（server）   τ =  60·(q_cmd−q) + 1.0·(dq_cmd−dq) + G(q)   ← J1~J4
 #:     move_js      （旧路线）   τ = 400·(q_cmd−q) +  11·(dq_cmd−dq) + G(q)
-#:                                     ↑ 刚度 16×       ↑ 阻尼 22×
+#:                                     ↑ 刚度 6.7×      ↑ 阻尼 11×
 #:
 #: `move_js` **没有 K/B 通道**（那两个是固件出厂参数）⇒ 手感**不可能**一样。
-#: 真机判据：旧路线用户报「跟随太慢，有明显的延迟」「没有 litearm-server 丝滑」。
+#: 真机判据：旧路线用户报「跟随太慢，有明显的延迟」。
 #:
-#: ## 代价
+#: ## 代价（S4 起已不再是代价）
 #:
-#:     `send_mit_all` + `get_gravity`   每拍 **2 次往返**（各实测 3.333 ms）⇒ **~150 Hz**
-#:     `move_js`                        每拍 1 次往返 ⇒ 250 Hz
+#:     旧 MIT 路线（`send_mit_all` + PC 算 G）  每拍 **2 次往返** ⇒ ~150 Hz
+#:     现在（`CMD_JOINT_FOLLOW`，G 由固件算）    每拍 **1 次往返** ⇒ 与 server 同级
 #:
-#: ⚠ 这一趟**省不掉**：固件对 MIT 透传**不会**自己加 G（`control_loop.c`：
-#:   「`move_mit` / `move_js+tau_ff` 永不叠加内置」）⇒ **G 必须 PC 送**。
+#: ⇒ 固件替 PC 算掉了 `G(q)`（`dyn_gravity` + `law_wall`），那一次往返**省掉了**。
+#: ⚠ 但**通用透传路径**（`move_mit` / `move_js+tau_ff` / `move_mit_all`）**仍然是"永不
+#:   叠加内置"**（`control_loop.c` 的原话）—— 它们不享受这个待遇，G 仍须 PC 送。
+#:   只有 `0x08` 这条**专用通道**由固件补 G。
 #: **从臂跟随增益 —— 照抄 litearm-server 默认配置 `litearm.yaml` 的 `joint_follow:` 段。**
 #:
 #: ⚠⚠ **别抄 `litearm_balanced.yaml`**：那份是 `[25]×7 / [0.5]×7`，而它自己的历史注释
@@ -189,10 +208,6 @@ _FF_ITEM_PAYLOAD_COM = 5
 #:   走 SDK 默认（`pylitearm.default_config_path()` = `config/litearm.yaml`）⇒ **就是这份**。
 #:   ⚠ 当初我只比对了 `speed_limit`/`accel_limit`（所有 yaml 都一样）就**想当然**把 K/B
 #:   也记成了 balanced 的值。**教训：跨仓取"真值"必须把那份文件打开看到数字本身。**
-#:
-#: 与**写固件参数**那条已证伪的路**完全不同的通道**：
-#:     写 `mit_kp`/`mit_kd`      → **固件全局参数** ⇒ `movej` 也用 ⇒ 改坏 `movej`（真机踩过）
-#:     `send_mit_all(kp=,kd=)`   → **只对这一帧生效** ⇒ `movej` **完全不受影响** ✓
 #:
 #: 分配理由（配置原文）：大关节 J1~J4 承重多、刚度给大；腕部 J5~J7 适中防啸叫。
 SETUP_K = [60.0, 60.0, 60.0, 60.0, 40.0, 40.0, 40.0]
@@ -249,8 +264,10 @@ def _q_meas(arm) -> List[float]:
 def _q_dq_meas(arm):
     """读**实测**位置与速度 `(q, dq)` —— **同一帧缓存，不多花一次往返**。
 
-    ⚠ `G(q)` 与限位墙 `wall.tau(q, dq)` 都必须吃**实测**（照搬 `joint_follow.step()`：
+    ⚠ 吃这个实测值的消费者有两个：**本模块**的 `wall_zone_mask`（判墙区以抬高 `kd`），
+    以及**下面的 `kd_sent` 计算**。都必须是**实测**（照搬 `joint_follow.step()`：
     它先 `read_q_dq()`、再 `compute_tau_ff(q, dq)`），**不能拿指令值代替**。
+    ⚠ 固件那份实测由它**自己**在 300 Hz 里采（`g_arm.joint[].q`），不经本函数。
     """
     st = arm.get_state(refresh=False).value
     if st is None:
@@ -273,22 +290,25 @@ def _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall=None) -> None:
         τ_ff = clamp(G(q_meas) + wall, ±tau_max)   # ← **固件算**（本函数不发）
         joint_follow(q_cmd, dq_cmd, K, B)          # 帧里只有这 4 组
 
-    ⚠⚠ **`G(q)` 必须由 PC 侧送**：固件对 MIT 透传**永不叠加内置前馈**
-    （`control_loop.c` 的 gating 注释原话：「`move_mit` / `move_js+tau_ff` 永不叠加内置」）
-    ⇒ **不送 G 就是没有重力补偿，臂会垂。**
+    ⚠⚠ **`G(q)` 由固件算，不从 PC 送** —— 这正是 `0x08` 这条接口存在的理由：
+    `control_loop.c` 在 `s_jf_ff` 会话里每拍自己跑 `dyn_gravity(q_meas)` + `law_wall`，
+    再钳到 `tau_max`（照 server 的 `compute_tau_ff`）⇒ **省掉 `get_gravity` 那次往返**。
 
-    ⚠⚠ **`wall` 是位置护栏的第二道**（第一道是 `clamp_to_limits` 把**目标**钳进限位）。
-    只有目标钳位不够：从臂带着柔性去追一个**恰好贴在边界上**的目标，实测位置会**冲过去**
-    —— 越界 >0.10 rad（或已使能时 >0.05）就**锁存 `joint_fault`**，该轴掉力并连带报
-    `FB_STALE`。真机实证（2026-09-28）：断轴先是 J4、换增益后变成 **J2+J3** ——
-    **轴会变** ⇒ 是"撞软限位"而不是某个电机坏了。墙在距限位 `margin` 处就给**排斥力矩**，
-    让它**减速**而不是撞上去（`joint_limit_wall`，逐字移植，先前因 `move_js` 无力矩通道而未接线）。
+    ⚠ **别把这条专用通道的待遇记到通用路径上**：`move_mit` / `move_mit_all` /
+    `move_js+tau_ff` 那几条**永不叠加内置前馈**（`control_loop.c` 的 gating 原话），
+    它们的 `tau_ff` **仍必须由 PC 送**。
 
-    ⚠ 指令与实测**是两组不同的值**：`q_cmd/dq_cmd` 下发给电机；`G` 与墙吃 `q_meas/dq_meas`
-    （照搬 server）。实测读缓存 ⇒ **不额外花往返**。
+    ⚠⚠ **限位护栏共三层**：① `clamp_to_limits` 把**目标**钳进限位；
+    ② 固件 `law_wall` 在距限位 `margin` 处给**排斥力矩**（叠进 `τ_ff`）；
+    ③ 固件 `slew_linear` 用 `vel_max` 限速。
 
-    ⚠ 代价：`get_gravity` 是一次往返（实测 **3.333 ms** = 一个固件 tick），
-    `send_mit_all` 又一次 ⇒ **每拍 2 次往返 ⇒ ~150 Hz**。这是 MIT 路线的固有开销。
+    ⚠ 本通道上固件**豁免**「位置越界」与「超速」两条**锁存**判据（照 server 的
+    `skip_position=True` + `measured_overspeed_factor=inf`）⇒ 越界不再锁存掉力。
+    但豁免的是「发现越界就锁存掉力」这个**动作**，不是「越界」本身 —— 所以①②③必须都留着。
+    详见 `docs/superpowers/specs/2026-09-28-joint-follow-in-firmware-design.md` §3.4。
+
+    ⚠ 指令与实测**是两组不同的值**：`q_cmd/dq_cmd` 下发给电机；固件算 G 与墙吃
+    `q_meas/dq_meas`（照搬 server）。实测读缓存 ⇒ **不额外花往返**。
     """
     kd_sent = [float(x) for x in kd]
     if wall is not None:
@@ -315,22 +335,22 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
     `target_provider()` 返回**目标关节角序列**；返回 `None` 时**保持上一拍的
     `q_cmd/dq_cmd` 不动**（照搬 `joint_follow` 那一支 —— "首帧到达前原地不动"）。
 
-    ## ⚠⚠ 执行器是 `send_mit_all`（MIT 透传），**不是** `move_js`
+    ## ⚠⚠ 执行器是 `arm.joint_follow`（`CMD_JOINT_FOLLOW 0x08`，**伺服环在固件里**）
 
-    两条路的控制律**形式相同、参数差一个数量级** —— 这就是手感的全部差别：
+    **不是** `move_js`（旧路线，已弃），也不是 `send_mit_all`（S4 之前的过渡执行器）。
 
-    | | `joint_follow`（本函数照搬的） | `move_js`（旧路线，已弃） |
-    | --- | --- | --- |
-    | `K` | **25**（随帧下发） | **400**（固件 `mit_kp`，改不了） |
-    | `B` | **0.5**（随帧下发） | **11**（固件 `mit_kd`+`kd_extra`，改不了） |
-    | 重力 `G` | **PC 送** | 固件内置 |
-    | 每拍往返 | 2 次 ⇒ **~150 Hz** | 1 次 ⇒ 250 Hz |
+    | | `joint_follow`（server，本函数照搬的） | 本实现 | `move_js`（旧路线，已弃） |
+    | --- | --- | --- | --- |
+    | `K` | 随帧下发 | **随帧下发**（`0x08` 的 `kp`） | **400**（固件 `mit_kp`，改不了） |
+    | `B` | 随帧下发 | **随帧下发**（`0x08` 的 `kd`） | **11**（`mit_kd`+`kd_extra`，改不了） |
+    | 重力 `G` | PC 算 | **固件算**（`dyn_gravity` + `law_wall`） | 固件内置 |
+    | 每拍往返 | 1 次 | **1 次**（`0x08` 一次下发） | 1 次 |
 
     `move_js` 的 K/B 是**固件出厂参数，没有随帧通道**；唯一能改的办法是写固件参数，
     而那条路已证伪（动态跟随断轴 + 连带改坏 `movej`）。⇒ **要 server 的手感就得换执行器。**
 
-    ⚠ 用户裁决 2026-09-28：**先试纯粹的 150 Hz**，`G` 不降频（降频能回到 250 Hz，
-    但那是下一步的事，先把"对不对"验了再谈"快不快"）。
+    ⚠ 节拍当前是 **150 Hz**（`DEFAULT_HZ`）。S4 起每拍只 1 次往返 ⇒ **硬件上能到 ~300 Hz**；
+    150 是**主动选的保守值**，不是上限 —— 见 `DEFAULT_HZ` 的注释。
     """
     try:
         sp = list(speed_limit or DEFAULT_SPEED_LIMIT)
@@ -386,10 +406,10 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             try:
                 _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall)
             except Exception:                        # noqa: BLE001
-                # ⚠ MIT 透传**没有** `move_js` 那条「目标 ≠ 实测位姿且 `dq == 0` 就拒帧」
+                # ⚠ 本通道**没有** `move_js` 那条「目标 ≠ 实测位姿且 `dq == 0` 就拒帧」
                 #   的限制（`move_js` 路线因此才需要「托住实测位姿」的退路）。
                 #   走到这里就是链路/帧本身出问题 ⇒ **直接受控接管并上抛**，不再硬撑。
-                log.exception("send_mit_all 失败，受控接管")
+                log.exception("joint_follow 下发失败，受控接管")
                 hold_at_current(arm)
                 raise
 

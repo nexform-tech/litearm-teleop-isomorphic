@@ -1,10 +1,12 @@
 # `JOINT_FOLLOW`：把伺服环搬进固件 —— 设计
 
-> **状态**：**待用户评审**（2026-09-28）。评审通过前**不动任何代码**。
+> **状态**：**已实施（S1–S4），待真机验收**（2026-09-28）。
+> 固件 + 宿主台：已提交、全绿（26 用例 261 判据）；SDK：契约测试已过。
+> ⛔ **§5 的六条真机判据一条都还没跑** —— 那需要烧录固件。
 >
-> ⚠ 本设计要改三个仓：`litearm-stm32`（固件）、`litearm-python`（SDK）、本仓。
-> 前两个在用户「不准动 `litearm-teleop-isomorphic` 以外任何项目」的禁令内
-> ⇒ **实施前须逐仓明确授权**。
+> ⚠ 本设计改了三个仓：`litearm-stm32`（固件）、`litearm-python`（SDK）、本仓。
+> 前两个在用户「不准动 `litearm-teleop-isomorphic` 以外任何项目」的禁令内 ⇒
+> **已逐仓取得明确授权**（两仓各在 `feat/joint-follow` 分支上）。
 
 ## 1. 为什么要做
 
@@ -145,7 +147,7 @@ if any(zone):
 
 | 判据 | 处置 | 依据 |
 | --- | --- | --- |
-| `OVERSPEED`（`|dq| > vel_max×1.5`） | **豁免** | server：`measured_overspeed_factor=float('inf')` |
+| `OVERSPEED`（`dq` 绝对值 > `vel_max×1.5`） | **豁免** | server：`measured_overspeed_factor=float('inf')` |
 | `POSITION_VIOLATION`（越界 >0.05） | **豁免** | server：`skip_position=True` |
 | `TEMP_WARNING` | **保留** | server 也不关；且电机保护不可让 |
 | 电机 `err` 码判读 | **保留** | `bad = hw.faulted()` 在 server 里仍然生效 |
@@ -164,8 +166,12 @@ if any(zone):
 | 固件 | **限速（`vel_max`）→ 重力 `G(q)` → 限位墙 → 弹簧-阻尼** |
 | 电机 | MIT 环执行 |
 
-**PC 侧因此变薄**：`servo.follow` 不再调 `get_gravity`，也不再需要 `slew_target`
-（那件事固件做得更准，且用的是**真实反馈**而非命令值）。
+**PC 侧因此变薄**：`servo.follow` 不再调 `get_gravity`（省掉一次往返）。
+
+⚠ **但 `slew_target` 保留了**（与本文档原稿不同）：固件的 `slew_linear` 用 `vel_max`
+兜底，而 PC 侧的 `speed_limit`/`accel_limit` 更保守 —— 两层不冲突（同值时自然退化为一层），
+且 PC 侧这一层交给固件的是**平滑目标**而不是阶跃。由 `test_safety.py` 与 pylitearm
+原版逐拍对拍锁定。
 
 ## 4. 接口与协议同步面
 
@@ -212,6 +218,30 @@ if any(zone):
 
 ⚠ **S1 单独成阶段是刻意的**：先证明"新通道能通、且**行为与旧路一致**（照样锁存）"，
 再加豁免。否则一旦 S2 之后不锁存，**分不清是豁免生效了还是新通道根本没在控制电机**。
+
+### 7.1 落地状态（2026-09-28）
+
+| 阶段 | 代码 | 离线验证（宿主台 `tools/ctl_loop_check_host.c`）|
+| --- | --- | --- |
+| **S1** | ✅ 已提交 | ✅ `t25` A1/A2（进得来；模式落 `MOVE_MIT_ALL`，未新增模式号）|
+| **S2** | ✅ 已提交 | ✅ `t25` D1（PC 在线时不锁存）＋ **D3 回归**（通用路径照样锁存）|
+| **S3** | ✅ **被 S1 覆盖** | ✅ `t25` C1/C2（前馈非零；对照 `move_mit_all` 为 0 ⇒ 确系固件所算）|
+| **S4** | ✅ 已提交 | ✅ 本仓 `test_servo.py` + `litearm-python` 契约测试 |
+
+⚠ **S3 与 S1 合并的原因**：`slew_linear`（`control_loop.c:2225`）本就跑在
+`MOVE_MIT_ALL` 分支上，而 `dyn_gravity` 与 `law_wall` 随 `s_jf_ff` 分支一并接上
+⇒ **没有独立的 S3 改动**。原稿以为要另做一阶段，实际被 S1 的接线覆盖。
+
+⚠ **对抗审查后追加的两条修复**（原稿没有，均已提交）：
+
+- `ctrl_joint_follow_active()` **必须带 `!hold`** —— 否则 PC 失联（看门狗跳闸 /
+  `drop_hold`）后豁免**无限期**继续。实测：J1 被推到 `q_max+0.20` 持续 40 拍，
+  既不锁存、**连 `POS_VIOL` 告警位都不上报**；同条件走通用 `move_mit_all` 第 5 拍就锁存。
+  判据 **`t25` D1b** 锁定它（判别力已反向验证：去掉 `!hold` 则双红）。
+- **前馈来源判据收成一处**：原先前馈算在 `s_jf_ff && enabled && !hold` 下、而 MIT_ALL
+  分支里选前馈来源却用裸 `s_jf_ff` ⇒ `hold` 期间二者不一致。
+
+⛔ **§5 的六条真机判据一条都未跑**（需烧录固件，由用户执行）。
 
 ## 8. 四项定案（用户裁决 2026-09-28：**一律以 litearm-server 的实际做法为准**）
 

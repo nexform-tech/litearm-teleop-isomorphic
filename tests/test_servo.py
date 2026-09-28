@@ -1,9 +1,10 @@
 """从臂伺服环的离线测试（用假臂，不需要硬件）。
 
 覆盖三件真机上不好反复验的事：
-  1. **K/B 逐帧是 server 的值**（`joint_follow` 的 25 / 0.5），且 `G(q)` 被钳到 `tau_max`
+  1. **K/B 逐帧是 server 的值**（`litearm.yaml` 的 `joint_follow:` 段，真值见 `servo.SETUP_K`）
   2. 参考生成确实经过 `slew_target`（速度/加速度受限、且**永不发 NaN**）
   3. 实测 **23 ms** 量级的 `all_joint_params()` **只在启动时读一次**，绝不进循环
+  4. `joint_follow` 的帧**只有四组**（q/dq/kp/kd）—— **没有 `tau`**，`G` 由固件算
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ class _State:
 
 
 class FakeArm:
-    """够 `servo` 用的假臂。记录每一次 `send_mit_all` 的五元组。
+    """够 `servo` 用的假臂。记录每一次 `joint_follow` 的四元组（q/dq/kp/kd）。
 
     ⚠ MIT 透传**没有** `move_js` 那条「目标 ≠ 实测位姿且 `dq == 0` 就拒帧」的限制
     （那属于固件的 `MOVE_JS` 分支）⇒ 本假臂**不需要** `reject_at`。
@@ -69,7 +70,11 @@ class FakeArm:
         return self
 
     def get_gravity(self, q):
-        """假重力项。⚠ 默认刻意取**远超 tau_max** 的数，好测钳位。"""
+        """假重力项。
+
+        ⛔ **已无调用点** —— S4 起 `G` 由固件算（`CMD_JOINT_FOLLOW`），`follow()` 不再
+        调 `get_gravity`。保留作测试替身的一部分，免得将来要在 PC 侧验 G 相关逻辑时重造。
+        """
         if self._gravity is not None:
             return _Msg(list(self._gravity))
         return _Msg([100.0] * N_JOINTS)
@@ -179,10 +184,13 @@ def _run(arm, target, ticks=20, hz=100.0, wall=None):
 
 
 def test_follow_sends_the_server_gains_on_every_frame():
-    """⛔ K/B 必须**逐帧是 server 的值**（25 / 0.5）—— 这是「丝滑」的全部来源。
+    """⛔ K/B 必须**逐帧是 server 的值**（`litearm.yaml` 的 `joint_follow:` 段）。
 
-    旧 `move_js` 路线用的是固件出厂值 **400 / 11**（刚度 16×、阻尼 22×），
-    真机判据：「跟随太慢，有明显的延迟」「没有 litearm-server 丝滑」。
+    ⚠ **别抄 `litearm_balanced.yaml`** 的 25 / 0.5 —— 那一档自己的历史注释就写着
+    "从 25 一律提高以改善滞后/追不上"，真机复现过同样的「明显延迟、很软」。
+
+    旧 `move_js` 路线用的是固件出厂值 **400 / 11**（刚度 6.7×、阻尼 11×），
+    真机判据：「跟随太慢，有明显的延迟」。
 
     判别力：把 `follow` 里的 `kp/kd` 换回出厂值，本用例立刻红。
     """
@@ -337,9 +345,9 @@ def test_speed_limit_stays_within_the_firmware_velocity_envelope():
 def test_joint_follow_frame_carries_no_tau():
     """⛔ `joint_follow` 的帧里**没有 `tau`** —— 前馈由固件算（G + 墙）。
 
-    ⚠ 这是本路线与 `send_mit_all` 的**唯一实质差别**，也是"省掉一次 `get_gravity`
-    往返 ⇒ 每拍 1 次往返 ⇒ 250 Hz 可达"的来源。判据取"假臂收到的就是 4 组"：
-    谁把它改回 `send_mit_all`（5 组），本用例立刻红。
+    ⚠ 这是本执行器与 `send_mit_all` 的**实质差别之一**：省掉一次 `get_gravity` 往返
+    ⇒ 每拍 1 次往返（节拍由 `DEFAULT_HZ` 定，当前 150 Hz；硬件上限 ~300 Hz）。
+    判据取"假臂收到的就是 4 组"：谁改回 `send_mit_all`（5 组），本用例立刻红。
     """
     arm = FakeArm()
     _run(arm, [0.1] * N_JOINTS)

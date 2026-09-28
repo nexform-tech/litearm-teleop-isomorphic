@@ -195,11 +195,12 @@ class TeleopPage(QtWidgets.QWidget):
         #    放在 apply() 里设的后果：布局按"空标签"算好了高度，之后不重算 ⇒ **文字被裁**
         #    （离屏量出来只有 20px 高，而这里有 4 行）。
         self.lab_params = QtWidgets.QLabel(
-            "参数（限速/限加速逐值照抄 litearm-server）\n"
-            "  speed_limit = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]\n"
-            "  accel_limit = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]    engage_sec = 0.3\n"
-            "⚠ 刚度/阻尼用固件出厂值（mit_kp 400/300/50），不是 server 的 K=25/B=0.5："
-            "`move_js` 没有随帧下发 K/B 的通道（spec §5.3）")
+            "参数（限速/限加速照抄 litearm-server 的配置口径）\n"
+            f"  speed_limit = {servo.DEFAULT_SPEED_LIMIT}\n"
+            f"  accel_limit = {servo.DEFAULT_ACCEL_LIMIT}"
+            f"    engage_sec = {servo.DEFAULT_ENGAGE_SEC}\n"
+            f"刚度/阻尼**随帧下发**（非固件出厂值）："
+            f"K={servo.SETUP_K}  B={servo.SETUP_B}")
         self.lab_params.setWordWrap(True)
         self.lab_params.setMinimumHeight(self.lab_params.sizeHint().height())
         lay.addWidget(self.lab_params)
