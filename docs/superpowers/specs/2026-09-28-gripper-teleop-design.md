@@ -485,19 +485,27 @@ litegrip 那份 `fake_can.py` **只用于 §11.2 的对拍**（本机手工跑�
      `self._enabled = False`（`gripper.py:343`），即使电机实际仍使能 ⇒ **恒红**。
    - ⛔ **不能直接用 litegrip 的 `make_gripper()`**：它不接 `disable_on_disconnect`
      （`fake_can.py:207-215`），默认构造走 `True` ⇒ 根本走不到要断言的那条路。
-   - ✅ **正确写法**：把断言**打在传输层**。照抄 litegrip 自己的先例
+   - ⛔ **也不能照抄 litearm-device 那条先例的位置**：litegrip 自己的
      `tests/test_actions.py` 的 `TestDisableOnDisconnect.test_can_keep_enabled`
-     （已实测绿）：
+     （已实测绿）是把断言打在**传输层** —— 因为 litegrip 的 `LiteGrip.disconnect()`
+     **不接参**、内部才把 `_disable_on_disconnect` 转给 `self._can.disconnect()`。
+     那是**它的**分层，不是我们的。
+   - ✅ **本设计的缝在「构造参数」**：我们的 `GripWorker` 是**直接** `g.disconnect()`，
+     行为在**构造时**就已决定 ⇒ 断言打在工厂传了什么 kwargs 上。
+     ⚠ 这一条是**原型真跑之后才发现的**（初稿照搬了 litearm-device 的分层，是错的）：
 
      ```python
      seen = {}
-     fake.disconnect = lambda disable=True: seen.update(disable=disable)
-     g.disconnect()
-     assert seen == {"disable": False}   # 传 True 时这里是 {"disable": True} ⇒ 必红
+     class _Recorder:
+         def __init__(self, **kw):
+             seen.update(kw)
+     mod = types.ModuleType("litegrip"); mod.LiteGrip = _Recorder
+     monkeypatch.setitem(sys.modules, "litegrip", mod)
+     _default_gripper_factory("can0")
+     assert seen.get("disable_on_disconnect") is False   # 删掉 kwarg ⇒ 这里变 None ⇒ 必红
      ```
 
-   自建实例、显式传 `disable_on_disconnect=False`（也可用公开 setter，`gripper.py:288-290`）。
-   **不传 `disable_on_disconnect=False` 时 `seen` 是 `{"disable": True}` ⇒ 必红。**
+     （若将来真改成走 adapter 层，则回到「断言打在传输层」那种写法。）
 
 3. **watchdog 持位**：停发帧后从端 `q` 不变，且 `send_mit_frame` 仍在被调用。
 4. **未标定拒绝启动**：`cfg.calibrated=False` 时启动即抛，且 `enable()` **未被调用**。
