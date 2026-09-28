@@ -28,8 +28,10 @@ class _Msg:
 
 
 class _State:
-    def __init__(self, q):
+    def __init__(self, q, dq=None):
         self.q = list(q)
+        # ⚠ `_send_mit` 现在要**实测 dq** 去算限位墙 ⇒ 状态帧必须有这一项
+        self.dq = list(dq) if dq is not None else [0.0] * len(self.q)
 
 
 class FakeArm:
@@ -157,7 +159,13 @@ def test_follow_holds_when_provider_returns_none():
 
 # ────────────────────── MIT 透传：照搬 server 的 K/B ──────────────────────
 
-def _run(arm, target, ticks=20, hz=100.0):
+def _wall():
+    """两边留 ±1.5 rad 的假限位墙（与 `FakeArm` 的 `q_min/q_max` 一致）。"""
+    from liteteleop.wall import JointLimitWall
+    return JointLimitWall.from_limits([-1.5] * N_JOINTS, [1.5] * N_JOINTS)
+
+
+def _run(arm, target, ticks=20, hz=100.0, wall=None):
     """跑 `ticks` 拍（`engage_sec=0` ⇒ 只有 prime + 主循环）。"""
     n = {"i": 0}
 
@@ -165,7 +173,8 @@ def _run(arm, target, ticks=20, hz=100.0):
         n["i"] += 1
         return n["i"] > ticks
 
-    return servo.follow(arm, lambda: target, should_stop=stop, engage_sec=0.0, hz=hz)
+    return servo.follow(arm, lambda: target, should_stop=stop, engage_sec=0.0,
+                        hz=hz, wall=wall)
 
 
 def test_follow_sends_the_server_gains_on_every_frame():
@@ -322,6 +331,43 @@ def test_apply_payload_reads_back_what_actually_landed():
 def test_default_payload_is_the_gripper_the_user_gave():
     assert servo.DEFAULT_PAYLOAD_MASS == 0.6            # 600 g
     assert servo.DEFAULT_PAYLOAD_COM == (0.0, 0.0, 0.03)  # 质心 3 cm 在 Z 轴
+
+
+# ────────────────────── 限位墙（第二道位置护栏）──────────────────────
+
+def test_wall_torque_actually_reaches_the_frame():
+    """⛔ 限位墙必须**真的叠进 `τ_ff`** —— 这是"接线"的判据。
+
+    真机教训（2026-09-28）：只靠 `clamp_to_limits` 钳**目标**不够 —— 从臂追一个恰好
+    贴在边界上的目标会冲过去，越界锁存 `joint_fault` ⇒ 掉力 + `FB_STALE`。
+
+    判别力：把 `_send_mit` 里的 `g[i] + w[i]` 改回 `g[i]`，或忘传 `wall=`，本用例立刻红。
+    """
+    # J1 抬到 1.49：已越过墙线（q_max 1.5 − margin 0.02 = 1.48）⇒ 该轴应有排斥力矩
+    q = [1.49] + [0.0] * (N_JOINTS - 1)
+    arm = FakeArm(q=q, tau_max=1000.0, gravity=[0.0] * N_JOINTS)   # 重力置 0 ⇒ 只剩墙
+    _run(arm, q, ticks=3, wall=_wall())
+    assert arm.mit_calls, "一帧都没发"
+    tau = arm.mit_calls[-1][4]
+    assert tau[0] < 0.0, f"接近上限时墙力必须把关节往限位【内】推（应为负），实际 {tau[0]}"
+    for i in range(1, N_JOINTS):
+        assert tau[i] == 0.0, f"没进墙区的 J{i+1} 不该有力矩，实际 {tau[i]}"
+
+
+def test_wall_is_absent_when_not_wired():
+    """`wall=None` ⇒ 只有重力项。这是上一条的**对照组**（否则分不清力矩是谁给的）。"""
+    q = [1.49] + [0.0] * (N_JOINTS - 1)
+    arm = FakeArm(q=q, tau_max=1000.0, gravity=[0.0] * N_JOINTS)
+    _run(arm, q, ticks=3, wall=None)
+    assert arm.mit_calls[-1][4] == [0.0] * N_JOINTS, "没接墙就不该出现墙力"
+
+
+def test_wall_torque_direction_is_inward_on_the_lower_side():
+    """靠近**下限**时力为正（往限位内推）—— 方向约定照搬 server。"""
+    q = [-1.49] + [0.0] * (N_JOINTS - 1)
+    arm = FakeArm(q=q, tau_max=1000.0, gravity=[0.0] * N_JOINTS)
+    _run(arm, q, ticks=3, wall=_wall())
+    assert arm.mit_calls[-1][4][0] > 0.0, "接近下限时墙力应为正"
 
 
 # ────────────── 增益必须是 server 默认配置的那一份 ──────────────

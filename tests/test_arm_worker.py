@@ -226,7 +226,9 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
 
         def __init__(self):
             self.writes = []
-            self.jp = [type("P", (), {"kp": 400.0, "kd": 5.0, "tau_max": 78.0})() for _ in range(7)]
+            self.jp = [type("P", (), {"kp": 400.0, "kd": 5.0, "tau_max": 78.0,
+                                       "q_min": -1.5, "q_max": 1.5})()
+                   for _ in range(7)]
 
         @property
         def params(self):

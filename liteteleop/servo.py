@@ -220,10 +220,19 @@ def hold_at_current(arm) -> None:
 def _q_meas(arm) -> List[float]:
     """读**实测**关节角。⚠ `refresh=False` 走 SDK 缓存（实测 **0.001 ms**）——
     `refresh=True` 实测 **10 ms**，进了循环就等于把环频钉死在 100 Hz。"""
+    return _q_dq_meas(arm)[0]
+
+
+def _q_dq_meas(arm):
+    """读**实测**位置与速度 `(q, dq)` —— **同一帧缓存，不多花一次往返**。
+
+    ⚠ `G(q)` 与限位墙 `wall.tau(q, dq)` 都必须吃**实测**（照搬 `joint_follow.step()`：
+    它先 `read_q_dq()`、再 `compute_tau_ff(q, dq)`），**不能拿指令值代替**。
+    """
     st = arm.get_state(refresh=False).value
     if st is None:
         raise RuntimeError("状态帧取不到（链路静默）")
-    return list(st.q)
+    return list(st.q), list(st.dq)
 
 
 def _read_tau_max(arm) -> List[float]:
@@ -231,7 +240,7 @@ def _read_tau_max(arm) -> List[float]:
     return [float(p.tau_max) for p in arm.params.all_joint_params()]
 
 
-def _send_mit(arm, q, dq, kp, kd, tau_max) -> None:
+def _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max, wall=None) -> None:
     """**照搬 `joint_follow.step()` 的最后那一步**：
 
         τ_ff = clamp(G(q_meas), ±tau_max)          # 重力前馈
@@ -241,19 +250,31 @@ def _send_mit(arm, q, dq, kp, kd, tau_max) -> None:
     （`control_loop.c` 的 gating 注释原话：「`move_mit` / `move_js+tau_ff` 永不叠加内置」）
     ⇒ **不送 G 就是没有重力补偿，臂会垂。**
 
+    ⚠⚠ **`wall` 是位置护栏的第二道**（第一道是 `clamp_to_limits` 把**目标**钳进限位）。
+    只有目标钳位不够：从臂带着柔性去追一个**恰好贴在边界上**的目标，实测位置会**冲过去**
+    —— 越界 >0.10 rad（或已使能时 >0.05）就**锁存 `joint_fault`**，该轴掉力并连带报
+    `FB_STALE`。真机实证（2026-09-28）：断轴先是 J4、换增益后变成 **J2+J3** ——
+    **轴会变** ⇒ 是"撞软限位"而不是某个电机坏了。墙在距限位 `margin` 处就给**排斥力矩**，
+    让它**减速**而不是撞上去（`joint_limit_wall`，逐字移植，先前因 `move_js` 无力矩通道而未接线）。
+
+    ⚠ 指令与实测**是两组不同的值**：`q_cmd/dq_cmd` 下发给电机；`G` 与墙吃 `q_meas/dq_meas`
+    （照搬 server）。实测读缓存 ⇒ **不额外花往返**。
+
     ⚠ 代价：`get_gravity` 是一次往返（实测 **3.333 ms** = 一个固件 tick），
     `send_mit_all` 又一次 ⇒ **每拍 2 次往返 ⇒ ~150 Hz**。这是 MIT 路线的固有开销。
     """
-    g = [float(x) for x in arm.model.get_gravity(q).value]
-    tau = [min(max(g[i], -tau_max[i]), tau_max[i]) for i in range(N_JOINTS)]
-    arm.send_mit_all(list(q), list(dq), list(kp), list(kd), tau)
+    q_meas, dq_meas = _q_dq_meas(arm)
+    g = [float(x) for x in arm.model.get_gravity(q_meas).value]
+    w = wall.tau(q_meas, dq_meas) if wall is not None else [0.0] * N_JOINTS
+    tau = [min(max(g[i] + w[i], -tau_max[i]), tau_max[i]) for i in range(N_JOINTS)]
+    arm.send_mit_all(list(q_cmd), list(dq_cmd), list(kp), list(kd), tau)
 
 
 def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
            K=None, B=None, speed_limit=None, accel_limit=None,
            engage_sec: float = DEFAULT_ENGAGE_SEC, hz: float = DEFAULT_HZ,
            should_stop: Callable[[], bool] = lambda: False,
-           duration_s: Optional[float] = None) -> bool:
+           duration_s: Optional[float] = None, wall=None) -> bool:
     """从臂跟随环 —— **逐条照搬 `joint_follow`**（`pylitearm/control/joint_follow.py`）。
 
     `target_provider()` 返回**目标关节角序列**；返回 `None` 时**保持上一拍的
@@ -288,7 +309,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         q_cmd = _q_meas(arm)
         dq_cmd = [0.0] * N_JOINTS
         q_target = list(q_cmd)
-        _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max)
+        _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max, wall)
 
         # ── engage：`engage_sec` 内用**低刚度**托住（`joint_follow.engage`）──
         if engage_sec > 1e-6:
@@ -297,7 +318,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             kd_e = [ENGAGE_KD] * N_JOINTS
             t_end = time.monotonic() + engage_sec
             while time.monotonic() < t_end and not should_stop():
-                _send_mit(arm, q_ref, [0.0] * N_JOINTS, kp_e, kd_e, tau_max)
+                _send_mit(arm, q_ref, [0.0] * N_JOINTS, kp_e, kd_e, tau_max, wall)
                 time.sleep(dt_nom)
 
         # ── start：指令/目标都初始化成【当前实测】──
@@ -327,7 +348,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             q_cmd, dq_cmd = slew_target(q_target, q_cmd, dq_cmd, sp, ac, dt_nom)
 
             try:
-                _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max)
+                _send_mit(arm, q_cmd, dq_cmd, kp, kd, tau_max, wall)
             except Exception:                        # noqa: BLE001
                 # ⚠ MIT 透传**没有** `move_js` 那条「目标 ≠ 实测位姿且 `dq == 0` 就拒帧」
                 #   的限制（`move_js` 路线因此才需要「托住实测位姿」的退路）。

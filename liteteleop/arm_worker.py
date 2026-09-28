@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 from . import link, servo, wire
+from .wall import JointLimitWall
 from .safety import clamp_to_limits, read_safe_limits
 from .wire import N_JOINTS
 
@@ -454,6 +455,18 @@ class ArmWorker:
         #    ⇒ 用户实测「跟随太慢，有明显的延迟」⇒ 撤掉，回到 S0 验过的 server 原值。
         # ⚠ 这份配置**本来就是配 `B=0.5` 的** —— K/B 随帧下发之后，它才第一次名副其实。
         sl = list(servo.DEFAULT_SPEED_LIMIT)
+        # ── 限位墙：位置护栏的**第二道**（第一道是 `clamp_to_limits` 把目标钳进限位）──
+        # ⚠ 用**固件原始**软限位 —— 墙自己按 `margin_rad` 内缩。⛔ 别用 `self._limits`：
+        #   那份已经内缩过 margin 了，再用会**双重内缩**。
+        # ⚠ 真机实证（2026-09-28）：只靠目标钳位**不够** —— 从臂带着柔性去追一个
+        #   **恰好贴在边界上**的目标，实测位置会冲过去 ⇒ 越界锁存 `joint_fault`
+        #   ⇒ 该轴掉力并连带 `FB_STALE`。断轴先是 J4、换增益后又变成 **J2+J3**
+        #   ⇒ **轴会变** ⇒ 是"撞软限位"，不是某个电机坏了。
+        _jp = arm.params.all_joint_params()
+        wall = JointLimitWall.from_limits(
+            [float(x.q_min) for x in _jp], [float(x.q_max) for x in _jp])
+        self._log(f"限位墙已接线：margin={wall.margin} rad  "
+                  f"stiffness={wall.stiffness}  damping={wall.damping}")
         self._log(f"从臂跟随：K={servo.SETUP_K} B={servo.SETUP_B}"
                   f"（litearm.yaml 默认档，随 send_mit_all 下发）")
         self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
@@ -483,7 +496,7 @@ class ArmWorker:
             self._drain(0.0)
             return False
 
-        servo.follow(arm, provider, should_stop=should_stop, hz=SLAVE_HZ,
+        servo.follow(arm, provider, should_stop=should_stop, hz=SLAVE_HZ, wall=wall,
                      speed_limit=sl)
 
     def _peer_host(self) -> str:
