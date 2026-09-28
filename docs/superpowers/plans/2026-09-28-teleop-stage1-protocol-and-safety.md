@@ -1976,15 +1976,30 @@ Expected: `AttributeError: module 'liteteleop.safety' has no attribute 'TeleopSt
 
 - [ ] **Step 3: 实现**
 
-**先把文件顶部的 `__all__` 换成完整版**（否则 `import *` 拿不到状态机）：
+**先把文件顶部的 `__all__` 换成下面这一份**（否则 `import *` 拿不到状态机）：
 
 ```python
 __all__ = [
-    "clamp", "slew_target", "clamp_to_limits", "LimitsError", "Limits",
-    "read_limits_ok", "saturate_dq", "speed_limit_from_kd",
+    "DEFAULT_KD_BUDGET", "LimitsError", "Limits",
+    "read_limits_ok", "clamp_to_limits", "saturate_dq", "speed_limit_from_kd",
+    "slew_target",
     "IDLE", "ALIGN_FAST", "FOLLOWING", "HOLDING", "TeleopState",
 ]
 ```
+
+> ⚠ **`__all__` 必须与文件里实际存在的顶层名字逐一对得上。** part 1 里**没有 `clamp` 函数**
+> —— 边界夹取是内联的 `max(lo, min(hi, x))`（见 `slew_target` 内），别照抄"应该有"的名字。
+> ⇒ 改完**必须**跑这条判据（它才是"导出面与实现一致"的真判据）：
+
+```bash
+python3 -c "
+import liteteleop.safety as s
+missing = [n for n in s.__all__ if not hasattr(s, n)]
+print('缺失:', missing)
+raise SystemExit(1 if missing else 0)"
+```
+
+Expected: `缺失: []`，退出码 0。
 
 然后追加到 `liteteleop/safety.py` 末尾：
 
