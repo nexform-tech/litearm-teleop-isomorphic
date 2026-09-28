@@ -254,6 +254,16 @@ S2_RATE_TOL = 0.20           # ±20%
 #   早先写死 `S3_AMP=0.25` 驱动 J2，只到它设计上限的 37% —— 永远碰不到承重轴 J4。
 S3_SEC = 20.0
 S3_RMS_TOL = 0.05            # rad
+
+#: spike 的**基准位姿** —— ⛔ 不许从 URDF 零位跑。两个理由都是硬事实：
+#:  ① URDF 零位是**奇异**位姿（σmin≈0）；`TEST_Q0` 的 σmin=0.0795 良态
+#:     （`litearm-stm32/tools/cartesian_check.py:118,1480`）。
+#:  ② ⚠ **J4 在零位几乎没有余量**：它的软限位是 [-3.0715, +0.0175]，而零位 q4≈0
+#:     ⇒ S3（驱动承重轴 J4 ±0.5·speed_limit_j）的**正向会被全部钳住**，
+#:     量到的是"顶住限位"而不是跟随 —— 假绿或假红。`TEST_Q0` 的 J4=-1.20 ⇒ 到上端还有 +1.2175。
+BASELINE_Q = [0.0, -0.60, 0.90, -1.20, 0.0, 0.50, 0.0]      # = cartesian_check.TEST_Q0
+#: 各轴在本次 spike 里需要的最大偏移（用于余量守卫）：S2 驱动 J2 +1.0；S3 驱动承重轴 ±0.5·speed_limit_j
+NEED_OFFSET = [0.0, 1.0, 0.0, 0.60, 0.0, 0.0, 0.0]
 # S4: 100 Hz ACK 稳定性
 S4_SEC = 30.0
 # S5: 收尾 A/B 对照
@@ -532,7 +542,28 @@ def main(argv=None) -> int:
         print(f"⛔ 起始状态不干净: {st.fault_detail}", flush=True)
         arm.close()
         return 3
-    q0 = list(st.q)
+
+    # ── 余量守卫：本 spike 会让 J2 走 +1.0、承重轴走 ±0.5·speed_limit_j ──
+    # ⚠ 少了这一步，从 URDF 零位起跑时 J4 的正向偏移会被软限位**全部钳住**
+    # （J4 上端只有 +0.0175），S3 于是量到"顶住限位"而不是跟随 —— 假结论。
+    lp = arm.params.all_joint_params()
+    for i, need in enumerate(NEED_OFFSET):
+        if need <= 0.0:
+            continue
+        rng = (lp[i].q_max - lp[i].q_min) / 2.0
+        if need > rng:
+            print(f"⛔ J{i + 1} 需要 ±{need} rad 的余量，但它全行程只有 {2 * rng:.3f} rad "
+                  f"（[{lp[i].q_min:.4f}, {lp[i].q_max:.4f}]）—— 该轴的判据会量到钳位而非跟随。"
+                  f"换个位姿或跳过相关节。", flush=True)
+            arm.close()
+            return 4
+    print("余量守卫通过（各轴行程足够）", flush=True)
+
+    # ── 移到基准位姿：不许从 URDF 零位跑（奇异 + J4 无余量，见 BASELINE_Q 注释）──
+    print(f"移到基准位姿 {BASELINE_Q} ...", flush=True)
+    arm.movej(BASELINE_Q, speed=0.3)
+    q0 = read_q_cached(arm)
+    print(f"基准位姿就位 q = {[round(x, 4) for x in q0]}", flush=True)
     print(f"起点 q = {[round(x, 4) for x in q0]}", flush=True)
 
     try:
