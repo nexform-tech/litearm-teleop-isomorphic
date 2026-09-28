@@ -1,0 +1,13 @@
+[project]
+name = "liteteleop"
+version = "0.0.0"
+description = "LiteArm 同构遥操上位机（主臂零重力拖动 → zenoh 点对点 → 从臂 move_js 跟随）"
+requires-python = ">=3.10"
+dependencies = ["zenoh>=1.7", "PyQt5>=5.15"]      # PyQt5 阶段二才用，先声明
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: 慢测（起子进程 / 数十秒），用 -m \"not slow\" 跳过"]
