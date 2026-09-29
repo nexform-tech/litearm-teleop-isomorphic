@@ -225,9 +225,19 @@ class ConnectStatusCard(Card):
 class TeleopPage(QtWidgets.QWidget):
     """控制台（**唯一页面**）：顶栏以下全归它。
 
-    ⚠ 中栏现在是**连接 + 臂遥操 + 夹爪遥操 + 末端载荷**四张卡，比一屏高 ⇒
-    中栏也是滚动列（照 studio `responsive.ts:18` 的 `SCROLL_COLUMN`：
-    三列都是"自己滚自己的"）。
+    ## 三列的分工（2026-09-29 用户裁决：**连接与遥操分成两个动作**）
+
+    | 列 | 内容 |
+    | --- | --- |
+    | 左（窄，可滚动） | **连接**（左上角）· 主从链路 · 曲线卡 · 关节表 · 连接状态 |
+    | 中（吃余量，可滚动） | 机械臂遥操 · 夹爪遥操 · 末端载荷 |
+    | 右（窄） | 大 STOP · 节点日志 |
+
+    ⚠⚠ **「连接」独立成卡、放左上角**，不许再和「机械臂遥操」揉成一张 ——
+    它们是两个动作：左边是"把口开起来、连上"，中间才是"让臂动起来"。
+    揉在一起时按钮并排，用户分不清哪一下会让臂动。
+    ⚠ 中栏三张卡也比一屏高 ⇒ 中栏也是滚动列（照 studio `responsive.ts:18`
+    的 `SCROLL_COLUMN`：三列各滚各的）。
     """
 
     teleop_toggled = QtCore.pyqtSignal(bool)
@@ -249,10 +259,11 @@ class TeleopPage(QtWidgets.QWidget):
         cols.setSpacing(14)
         outer.addLayout(cols, 1)
 
-        # ── 左栏 ──
+        # ── 左栏：**连接在最上面**（左上角）──
         self.left = ScrollColumn()
         self.left.setMinimumWidth(400)
         self.left.setMaximumWidth(470)
+        self.connect_card = self._build_connect_card()
         self.link_card = LinkCard()
         self.metrics = MetricsCard()
         self.joints_card = Card("关节（q / dq / tau / 温度 / err）")
@@ -262,17 +273,20 @@ class TeleopPage(QtWidgets.QWidget):
             "⚠ `err != 1` 才高亮（1 = 使能，其余 = 失能/故障）—— 温度只报数值，"
             "不另判阈值（固件的温度锁存已反映在 err 上）", "hintSubtle"))
         self.status_card = ConnectStatusCard()
-        for w in (self.link_card, self.metrics, self.joints_card, self.status_card):
+        for w in (self.connect_card, self.link_card, self.metrics,
+                  self.joints_card, self.status_card):
             self.left.add(w)
         self.left.add_stretch()
         cols.addWidget(self.left, 0)
 
-        # ── 中栏（吃余量，可滚动）──
+        # ── 中栏（吃余量，可滚动）：只有"让臂/夹爪动起来"这两件 + 载荷 ──
         self.mid = ScrollColumn()
         self.mid.setMinimumWidth(470)
-        self.mid.add(self._build_arm_card())
-        self.mid.add(self._build_grip_card())
-        self.mid.add(self._build_payload_card())
+        self.arm_card = self._build_arm_card()
+        self.grip_card = self._build_grip_card()
+        self.payload_card = self._build_payload_card()
+        for c in (self.arm_card, self.grip_card, self.payload_card):
+            self.mid.add(c)
         self.mid.add_stretch()
         cols.addWidget(self.mid, 1)
 
@@ -301,23 +315,22 @@ class TeleopPage(QtWidgets.QWidget):
         rl.addWidget(self.log_card, 1)
         cols.addWidget(right, 0)
 
-    # ── 机械臂遥操卡（**含连接**）──
-    def _build_arm_card(self) -> Card:
-        """臂这一张卡：**连接参数 + 遥操参数 + 两个按钮**。
+    # ── 连接卡（**左上角**，与遥操分开）──
+    def _build_connect_card(self) -> Card:
+        """「连接」：把口开起来、连上。**与「让臂动起来」是两件事。**
 
-        ⚠⚠ 为什么把「连接」并进来：用户裁决去掉独立页之后，这些参数总得有个家；
-        而它们本来就只服务于臂遥操这一件事。
-        ⚠⚠ 于是这几格从"只读生效值"变回**真输入框** —— 它们是真接线的：
-        `_connect()` 会读 `role()/ed_peer/sp_port/ed_arm_id/cb_port` 去构造 `ArmWorker`。
-        ⛔ 别再改回只读：那会让"改了没反应"这件事重新出现。
+        ⚠⚠ 用户裁决 2026-09-29：连接与遥操是**两个动作**，不许揉进同一张卡 ——
+        揉在一起时「连接臂」和「启动遥操」两个按钮并排，用户分不清哪一下会让臂动。
+        ⚠ 这几格是**真输入框**（不是只读的生效值）：`_connect()` 会读
+        `role()/ed_peer/sp_port/ed_arm_id/cb_port` 去构造 `ArmWorker`。
+        ⛔ 别改成只读：那会让"改了没反应"重新出现。
         ⚠ 但**连上之后必须锁死** —— `ArmWorker` 在构造时就把这几项吃掉了。
+        ⚠ 版式要迁就**窄栏**（~440px）：地址那三项拆成两行，CDC 口与「重新扫描」上下排。
         """
-        card = Card("机械臂遥操")
-        self.role_badge = Badge("本机角色 主臂（发布）", "outline")
-        card.header.addWidget(self.role_badge)
-
-        card.add(hint("主臂零重力拖动、发布关节流；从臂订阅并跟随。"
-                      "两端的「主臂 ID」与端口必须一致。", "hint"))
+        card = Card("连接")
+        self.conn_badge = Badge("未连接", "outline")
+        card.header.addWidget(self.conn_badge)
+        card.add(hint("先在这里把臂连上；上面连好之后，才去中间启动遥操。", "hintSubtle"))
 
         # ── 角色（连上后不可改）──
         self.seg_role = SegmentedControl(
@@ -326,15 +339,14 @@ class TeleopPage(QtWidgets.QWidget):
         self.seg_role.changed.connect(self._role_changed)
         card.add_row("本机角色", self.seg_role)
 
-        # ── 地址（真输入框）──
+        # ── 地址（真输入框；窄栏 ⇒ 拆两行）──
         self.ed_peer = QtWidgets.QLineEdit(self.gs.peer)
-        self.ed_peer.setFixedWidth(140)
         self.ed_peer.setPlaceholderText("主臂 IP（从臂填）")
-        self.sp_port = _spin(self.gs.jport, 1, 65535, 96)
+        self.sp_port = _spin(self.gs.jport, 1, 65535, 88)
         self.ed_arm_id = QtWidgets.QLineEdit(self.gs.arm_id)
-        self.ed_arm_id.setFixedWidth(92)
-        card.add_row("主臂 IP", self.ed_peer, "端口", self.sp_port,
-                     "主臂 ID", self.ed_arm_id)
+        self.ed_arm_id.setFixedWidth(88)
+        card.add_row("主臂 IP", self.ed_peer)
+        card.add_row("端口", self.sp_port, "主臂 ID", self.ed_arm_id)
         for w in (self.ed_peer, self.ed_arm_id):
             w.editingFinished.connect(self._emit_changed)
         self.sp_port.valueChanged.connect(self._emit_changed)
@@ -342,24 +354,39 @@ class TeleopPage(QtWidgets.QWidget):
         # ── CDC 口（真输入框 + 重扫）──
         # ⚠ **两条以上同型号臂时必须显式选**（VID:PID 相同，自动挑会挑错且不报错）
         self.cb_port = QtWidgets.QComboBox()
-        self.cb_port.setMinimumWidth(300)
         self.btn_rescan = QtWidgets.QPushButton("重新扫描")
         self.btn_rescan.setProperty("variant", "outline")
+        self.btn_rescan.setFixedWidth(96)
         self.btn_rescan.clicked.connect(self.rescan_ports)
         self.cb_port.currentIndexChanged.connect(self._emit_changed)
-        card.add_row("CDC 口", self.cb_port, self.btn_rescan)
+        card.add_row("CDC 口", self.cb_port)
+        card.add_row("", self.btn_rescan)
         self.lab_port_note = hint("")
         card.add(self.lab_port_note)
 
-        # ── 连接 ──
+        card.add(separator())
+
+        # ── 连接（**只这一个按钮**，不再与遥操按钮并排）──
         self.btn_connect = QtWidgets.QPushButton("连接臂")
         self.btn_connect.setProperty("variant", "primaryAction")
         self.btn_connect.setFixedWidth(120)
         self.btn_connect.clicked.connect(self.connect_clicked.emit)  # type: ignore[arg-type]
+        card.add_row(self.btn_connect)
         self.lab_info = hint("未连接", "hint")
-        card.add_row(self.btn_connect, self.lab_info)
+        card.add(self.lab_info)
 
-        card.add(separator())
+        self.rescan_ports()
+        return card
+
+    # ── 机械臂遥操卡（**只有遥操**）──
+    def _build_arm_card(self) -> Card:
+        """「机械臂遥操」：让臂动起来。**连不连上不归它管**（那是左上角「连接」卡的事）。"""
+        card = Card("机械臂遥操")
+        self.role_badge = Badge("本机角色 主臂（发布）", "outline")
+        card.header.addWidget(self.role_badge)
+
+        card.add(hint("主臂零重力拖动、发布关节流；从臂订阅并跟随。"
+                      "（角色/地址/端口在左上角的「连接」卡里设）", "hint"))
 
         # ── 只读的生效值（本版没接线）──
         self.ro_align_speed = ro_field(f"{servo.ALIGN_SPEED:g}", 72,
@@ -403,7 +430,6 @@ class TeleopPage(QtWidgets.QWidget):
         card.body.addLayout(row)
         card.add(hint("⚠ 从臂启动前会先低速对齐到主臂位置；watchdog 超时自动停止跟随。",
                       "hintSubtle"))
-        self.rescan_ports()
         return card
 
     # ── 夹爪遥操卡 ──
@@ -610,13 +636,16 @@ class TeleopPage(QtWidgets.QWidget):
         if s.error:
             self.lab_info.setText(f"⛔ {s.error}")
             info_role = "danger"
+            self.conn_badge.set_state("出错", "danger")
         elif s.connected:
             side = "监听" if master else f"连接 {peer}"
             self.lab_info.setText(f"✓ 已连接 · 固件 {s.firmware} · {side}:{jport}")
             info_role = "ok"
+            self.conn_badge.set_state("已连接", "ok")
         else:
             self.lab_info.setText("未连接")
             info_role = "hint"
+            self.conn_badge.set_state("未连接", "outline")
         self.lab_info.setProperty("role", info_role)
         self.lab_info.style().unpolish(self.lab_info)
         self.lab_info.style().polish(self.lab_info)

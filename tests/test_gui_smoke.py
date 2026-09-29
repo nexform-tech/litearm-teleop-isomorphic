@@ -198,6 +198,35 @@ def test_role_segmented_control_drives_role(qapp):
     w.close()
 
 
+def test_connect_and_teleop_are_separate_actions(qapp):
+    """⚠⚠ 用户裁决 2026-09-29：**连接与遥操是两个动作**，不许揉进同一张卡。
+
+    「连接」卡在**左上角**（左栏第一张），中栏只放"让臂/夹爪动起来"那两张 + 载荷。
+
+    判别力：谁把连接那几格挪回「机械臂遥操」卡（那会让「连接臂」与「启动遥操」
+    两个按钮并排 —— 用户分不清哪一下会让臂动），本用例会红。
+    """
+    w = MainWindow(Settings())
+    p = w.page
+
+    # 左栏第一张就是「连接」
+    first = p.left.col.itemAt(0).widget()
+    assert first is p.connect_card, "「连接」必须是左栏第一张卡（左上角）"
+
+    # 连接按钮与遥操按钮**不在同一张卡里**
+    assert p.connect_card.isAncestorOf(p.btn_connect), "连接臂按钮属于「连接」卡"
+    assert not p.arm_card.isAncestorOf(p.btn_connect), \
+        "连接臂按钮不许出现在「机械臂遥操」卡里（两个动作要分开）"
+    assert p.arm_card.isAncestorOf(p.btn_teleop), "启动遥操按钮属于「机械臂遥操」卡"
+    assert not p.connect_card.isAncestorOf(p.btn_teleop)
+
+    # 中栏只有三张：机械臂遥操 / 夹爪遥操 / 末端载荷
+    mid = [p.mid.col.itemAt(i).widget() for i in range(3)]
+    assert mid == [p.arm_card, p.grip_card, p.payload_card], \
+        f"中栏顺序应当是 臂遥操 → 夹爪遥操 → 末端载荷，实际 {mid}"
+    w.close()
+
+
 def test_fault_locks_the_arm_checkbox(qapp):
     """FAULT ⇒ 自动重新锁定安全确认（§7.2）。"""
     w = MainWindow(Settings())
