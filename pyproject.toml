@@ -1,0 +1,18 @@
+[project]
+name = "liteteleop"
+version = "0.0.0"
+description = "LiteArm 同构遥操上位机（主臂零重力拖动 → zenoh 点对点 → 从臂 joint_follow 跟随）"
+requires-python = ">=3.10"
+# ⚠ PyPI 上的发行名是 `eclipse-zenoh`（import 名仍是 `zenoh`）。写 `zenoh` 装不上：
+#   `ERROR: No matching distribution found for zenoh` —— CI 就这么挂在装依赖上过。
+dependencies = ["eclipse-zenoh>=1.6", "PyQt5>=5.15"]
+
+[project.scripts]
+liteteleop = "liteteleop.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: 慢测（起子进程 / 数十秒），用 -m \"not slow\" 跳过"]
