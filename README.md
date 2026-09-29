@@ -18,8 +18,11 @@ The arm path and the gripper path are both implemented. The arm path has been
 validated on hardware; the gripper path has not.
 
 Implemented and covered by the offline suite: the wire protocol codec, the zenoh
-point-to-point link, the pure-logic safety layer, the firmware `joint_follow`
-(`0x08`) servo loop, and the gripper link.
+point-to-point link, the pure-logic safety layer, and the firmware `joint_follow`
+(`0x08`) servo loop. Gripper teleoperation is **not** implemented here. This
+repository delegates it to the `litegrip` SDK
+(`LiteGrip.teleop_start`); the offline suite covers the thin worker that maps
+that status into the UI.
 
 ## Usage
 
@@ -37,10 +40,12 @@ python -m liteteleop --role slave  --cdc /dev/ttyACM1 --peer 192.168.31.10 \
                      --gcan can1 --gpeer 192.168.31.10
 ```
 
-The gripper is published on `litearm/v4/{grip_id}/gripper_teleop` as a 32-byte
-big-endian frame `(openness, position_mm, force_n, timestamp)`. `openness ∈ [0,1]`
-is the payload that drives the follower. Omit `--gcan` to leave gripper
-teleoperation off; that is the default.
+The gripper link uses the topic `litearm/v4/{grip_id}/gripper_teleop` and the
+32-byte big-endian frame `(openness, position_mm, force_n, timestamp)`, where
+`openness ∈ [0,1]` drives the follower. Neither the frame nor the loop lives
+here: both come from the `litegrip` SDK, which this repository calls through
+`LiteGrip.teleop_start`. Omit `--gcan` to leave gripper teleoperation off; that
+is the default.
 
 Bring the CAN bus up first. The gripper needs its own bus (`can0` or `can1`), not
 the arm's CDC port:
@@ -65,6 +70,7 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 | [litearm-ros2](https://github.com/nexform-tech/litearm-ros2) | ROS 2 driver |
 | [litearm-ros1](https://github.com/nexform-tech/litearm-ros1) | ROS 1 driver |
 | [litearm-python](https://github.com/nexform-tech/litearm-python) | Python SDK |
+| [litegrip-python](https://github.com/nexform-tech/litegrip-python) | Gripper SDK; owns the gripper teleop link and loop |
 | [litearm-docs](https://github.com/nexform-tech/litearm-docs) | Product documentation |
 
 ## Repository standards
@@ -118,8 +124,8 @@ condensed from are not published.
 - Do not expect `LiteGrip.close()` to disconnect. It closes the jaws; `disconnect()` drops the link.
 - Do not leave `disable_on_disconnect` at its default when you want the gripper to keep holding. It defaults to `True`, so `disconnect()` disables the motors first.
 - That drops whatever is being gripped. Pass `False` explicitly.
-- Do not read `ok=True` from the gripper's `open()` or `close()` as success. It means the jaws stalled against a mechanical limit, the opposite of the intuitive reading.
-- Do not expect an uncalibrated gripper to complain. `send_mit_frame` and `goto_rad` do not raise; they use placeholder limits as if they were real.
+- Do not let the SDK refuse an uncalibrated gripper. `teleop_start` checks, but only after the caller enabled the motors. Check first, in `grip_worker.check_ready()`.
+- Do not read a sessionless `teleop_status()` as a snapshot. It returns only `{"active": False, "mode": None}` — no `topic`/`frames` yet. Overwriting the readout with it zeroes the UI.
 
 ### Reading the codebase
 

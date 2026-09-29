@@ -8,6 +8,11 @@
 ⚠⚠ 本替身**故意没有 `disable()` 方法** —— 任何"顺手失能"的代码路径会当场
 `AttributeError`，这本身就是一道结构性护栏（spec §8 rule 4）。
 
+⚠⚠ 遥操不再是本仓实现（已下沉到 litegrip SDK）⇒ 本替身**只**提供
+`teleop_start/teleop_stop/teleop_status` 三个方法，模拟 SDK 的状态字典。
+判据与 SDK `teleop.py` 的 `status()` 同键名。`teleop_status_extra` 供用例注入
+`stale`/`fault`/`rejected`/`openness`/… 各个字段。
+
 ⚠⚠ `disconnects` 记录的是**每次 `disconnect()` 调用**。要断言
 「收尾不失能」不能看这里 —— 该断言打在**构造参数**上（见 `test_grip_worker.py`
 的 `test_factory_keeps_motor_enabled_on_disconnect`），因为本设计里 worker 是
@@ -52,7 +57,7 @@ class FakeState:
     """`GripperState` 的最小子集。
 
     ⚠ `error_code` 必须留着：SDK 语义 `1` = 已使能、`0` = 已失能、其它 = 故障
-    （`litegrip/constants.py:73-95`）。`grip_worker._note_grip_fault` 就靠它，
+    （`litegrip/constants.py:73-95`）。SDK 的 `teleop_status()["fault"]` 由它推出，
     没有这个字段就测不了"夹爪自己报故障"那条路。
     """
 
@@ -104,6 +109,18 @@ class FakeGrip:
         self.disconnects = 0
         self.raise_on_enable: Optional[BaseException] = None
 
+        # ── 遥操替身状态（SDK 的 teleop_* 鸭子类型）──
+        self.teleop_running = False
+        self.teleop_mode: Optional[str] = None
+        self.teleop_grip_id = "gripA"
+        self.teleop_frames = 0
+        self.teleop_starts: List[dict] = []   # 每次 teleop_start 的实参
+        self.teleop_stops = 0
+        #: 注入/覆盖 `teleop_status()` 的字段（`stale`/`fault`/`rejected`/…）。
+        self.teleop_status_extra: dict = {}
+        #: `teleop_start` 是否抛（测"启动失败要记 error"那条路）。
+        self.raise_on_teleop_start: Optional[BaseException] = None
+
     def _err_code(self) -> int:
         if self.fault_code is not None:
             return int(self.fault_code)
@@ -141,6 +158,57 @@ class FakeGrip:
         本替身不模拟它（那会造出零判别力的断言）—— 见模块 docstring。"""
         self.disconnects += 1
         self.connected = False
+
+    # ── 遥操（SDK 的 `teleop_start/teleop_stop/teleop_status` 鸭子类型）──
+    def teleop_start(self, mode, **kw):
+        """真 SDK 会在这里起一条后台环；本替身只翻个标志。
+
+        ⚠ 实参**原样记录** —— `GripWorker` 传下去的 `watchdog_s`/`rate_hz`/
+        `grip_id` 要能被断言（别传错端口/模式）。"""
+        if self.raise_on_teleop_start is not None:
+            raise self.raise_on_teleop_start
+        self.teleop_starts.append({"mode": mode, **kw})
+        self.teleop_mode = mode
+        self.teleop_grip_id = kw.get("grip_id", self.teleop_grip_id)
+        self.teleop_running = True
+        self.teleop_frames = 0
+        return self.teleop_status()
+
+    def teleop_stop(self, timeout: float = 2.0) -> dict:
+        self.teleop_stops += 1
+        self.teleop_running = False
+        self.teleop_mode = None
+        return {"active": False, "mode": None}
+
+    def teleop_status(self) -> dict:
+        """与 SDK `teleop.py` 的 `status()` 同键名。
+
+        ⚠ **会话没起来时只返回 `{"active": False, "mode": None}`** —— 没有 `topic`
+        键，这正是 `GripWorker._update` 用来判"这不是一份状态"的判据（别拿它把
+        上一帧的读数清成 0）。"""
+        if not self.teleop_running:
+            return {"active": False, "mode": None}
+        self.teleop_frames += 1                 # 模拟 SDK 的环在跑
+        state = self.get_state(wait=False)
+        st = {
+            "active": True,
+            "mode": self.teleop_mode,
+            "topic": f"litearm/v4/{self.teleop_grip_id}/gripper_teleop",
+            "frames": self.teleop_frames,
+            "last_frame_age_ms": 12.5,
+            "stale": False,
+            "openness": 0.0,
+            "position_mm": state.position_mm,
+            "force_n": state.force_n,
+            "loop_hz": 50.0,
+            "dq_cmd": 0.0,
+            "rejected": 0,
+            "send_failed": 0,
+            "fault": "",
+            "matching": True,
+        }
+        st.update(self.teleop_status_extra)
+        return st
 
     # ── 读写 ──
     def get_state(self, wait: bool = True) -> FakeState:

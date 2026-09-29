@@ -14,8 +14,9 @@ LiteArm 机械臂系列的同构遥操作。人手在零重力模式下拖动主
 
 主臂链路与夹爪链路都已实现。主臂链路已在真机验证；夹爪链路尚未验证。
 
-离线测试覆盖：线协议编解码、zenoh 点对点链路、纯逻辑安全层、固件侧的 `joint_follow`
-（`0x08`）伺服环，以及夹爪链路。
+离线测试覆盖：线协议编解码、zenoh 点对点链路、纯逻辑安全层，以及固件侧的 `joint_follow`
+（`0x08`）伺服环。夹爪遥操**不由本仓实现**，而是下沉给 `litegrip` SDK
+（`LiteGrip.teleop_start`）；离线测试覆盖的只是那层把 SDK 状态翻成界面的薄 worker。
 
 ## 用法
 
@@ -32,9 +33,10 @@ python -m liteteleop --role slave  --cdc /dev/ttyACM1 --peer 192.168.31.10 \
                      --gcan can1 --gpeer 192.168.31.10
 ```
 
-夹爪发布在 `litearm/v4/{grip_id}/gripper_teleop`，是一个 32 字节大端帧
-`(openness, position_mm, force_n, timestamp)`。真正驱动从端的是 `openness ∈ [0,1]`。
-**不传 `--gcan` 就不启用夹爪遥操**，这也是默认状态。
+夹爪链路用话题 `litearm/v4/{grip_id}/gripper_teleop` 和 32 字节大端帧
+`(openness, position_mm, force_n, timestamp)`，真正驱动从端的是 `openness ∈ [0,1]`。
+帧与环**都不在本仓**：两者都来自 `litegrip` SDK，本仓只是经 `LiteGrip.teleop_start`
+调它。**不传 `--gcan` 就不启用夹爪遥操**，这也是默认状态。
 
 先把 CAN 总线拉起来。夹爪需要自己的总线（`can0` 或 `can1`），不是臂的 CDC 口：
 
@@ -58,6 +60,7 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 | [litearm-ros2](https://github.com/nexform-tech/litearm-ros2) | ROS 2 驱动 |
 | [litearm-ros1](https://github.com/nexform-tech/litearm-ros1) | ROS 1 驱动 |
 | [litearm-python](https://github.com/nexform-tech/litearm-python) | Python SDK |
+| [litegrip-python](https://github.com/nexform-tech/litegrip-python) | 夹爪 SDK；夹爪遥操的链路与环归它 |
 | [litearm-docs](https://github.com/nexform-tech/litearm-docs) | 产品文档 |
 
 ## 仓库规范
@@ -106,8 +109,8 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 - 应当走 `grip_worker.pin_grip_sdk()`，它会断言并打日志。只做一个 `sys.path.insert` 挡不住将来改用 `meta_path.insert` 的注册方式。
 - **不要**以为 `LiteGrip.close()` 是断开。它是合爪；断链是 `disconnect()`。
 - **不要**在想让夹爪继续夹住时，让 `disable_on_disconnect` 留在默认值。它默认 `True`，所以 `disconnect()` 会先失能，把正夹着的东西松掉。要显式传 `False`。
-- **不要**把夹爪 `open()` / `close()` 返回的 `ok=True` 当作成功。它的含义是夹爪顶到机械限位堵转，与直觉相反。
-- **不要**指望未标定的夹爪会报错。`send_mit_frame` 和 `goto_rad` 都不抛异常，它们会拿占位限位当真实限位用。
+- **不要**把"拒掉未标定夹爪"这件事交给 SDK。`teleop_start` 确实会查，但那是在调用方**已经使能**之后。要先查 —— `grip_worker.check_ready()` —— 未标定的夹爪绝不上电。
+- **不要**把无会话的 `teleop_status()` 当成一份快照。它只返回 `{"active": False, "mode": None}`；`topic`、`openness`、`frames` 这些状态键只有会话在跑时才有。拿它覆盖上一帧读数会把界面清零。
 
 ### 读代码
 
