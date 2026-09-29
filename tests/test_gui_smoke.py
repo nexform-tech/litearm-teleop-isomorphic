@@ -54,9 +54,10 @@ def _snap(err=None, q=None, role=ROLE_MASTER):
 
 def test_window_constructs(qapp):
     w = MainWindow(Settings())
-    # 三页 + 左栏底部那个「设置」（它不在导航索引里）
-    assert w.stack.count() == 4
-    assert len(w.rail._buttons) == 3, "左栏是 连接/遥操/日志 三项"
+    # ⚠ 单页控制台（用户裁决 2026-09-29：去掉左栏导航与页面栈）
+    assert not hasattr(w, "rail"), "左栏导航栏已整条删除"
+    assert not hasattr(w, "stack"), "不再有页面栈"
+    assert w.joints_table is w.page.joints
     assert w.top.pill.lab.text().startswith("未连接")
     w.close()
 
@@ -156,9 +157,44 @@ def test_topbar_master_vs_slave(qapp):
     """
     w = MainWindow(Settings())
     w._on_state(_snap(role=ROLE_MASTER))
-    assert w.page_teleop.link_card.t_frames.lab.text() == "已发帧数"
+    assert w.page.link_card.t_frames.lab.text() == "已发帧数"
     w._on_state(_snap(role=ROLE_SLAVE))
-    assert w.page_teleop.link_card.t_frames.lab.text() == "已收帧数"
+    assert w.page.link_card.t_frames.lab.text() == "已收帧数"
+    w.close()
+
+
+def test_connection_fields_are_editable_then_lock(qapp):
+    """⚠ 连接参数是**真输入框**（不再是从只读页搬来的生效值）⇒ 必须能改、且连上后锁死。
+
+    判别力：不锁的话，用户在连上之后改「主臂 IP / 端口 / 主臂 ID / 角色」会以为
+    自己改生效了 —— 而 `ArmWorker` 在**构造时**就把这几项吃掉了，改了一点用没有。
+    那正是本仓反复强调的"界面在撒谎"。反过来，未连接时锁住则是另一种谎
+    （明明还没连，却不让人改）。
+    """
+    w = MainWindow(Settings())
+    fields = (w.page.seg_role, w.page.ed_peer, w.page.sp_port,
+              w.page.ed_arm_id, w.page.cb_port, w.page.btn_rescan, w.page.btn_connect)
+    w._on_state(Snapshot(role=ROLE_MASTER))              # 还没连上
+    assert all(f.isEnabled() for f in fields), "未连接时这些必须都能改"
+    s = _snap()
+    s.connected = True
+    w._on_state(s)
+    assert not any(f.isEnabled() for f in fields), \
+        "连上之后 角色/地址/CDC/连接按钮 必须全部锁死"
+    w.close()
+
+
+def test_role_segmented_control_drives_role(qapp):
+    """角色分段控件是**唯一**的角色来源（原来在独立连接页上）。"""
+    w = MainWindow(Settings())
+    # ⚠ 用 `emit=True` 走**完整路径**（`changed` → `_role_changed` 才去启停「主臂 IP」）。
+    #   默认的 `emit=False` 只改选中态、不跑联动 —— 那正是"选中了但界面没反应"。
+    w.page.seg_role.set_current(1, emit=True)
+    assert w.page.role() == ROLE_SLAVE
+    assert w.page.ed_peer.isEnabled(), "从臂要填主臂 IP ⇒ 该输入框必须可用"
+    w.page.seg_role.set_current(0, emit=True)
+    assert w.page.role() == ROLE_MASTER
+    assert not w.page.ed_peer.isEnabled(), "主臂不填对方的 IP（它自己是监听端）"
     w.close()
 
 
@@ -181,8 +217,8 @@ def test_teleop_button_emits_the_state_the_user_clicked(qapp):
     """
     w = MainWindow(Settings())
     got = []
-    w.page_teleop.teleop_toggled.connect(got.append)
-    btn = w.page_teleop.btn_teleop
+    w.page.teleop_toggled.connect(got.append)
+    btn = w.page.btn_teleop
     btn.setEnabled(True)
 
     btn.click()
@@ -200,23 +236,23 @@ def test_big_stop_means_stop_teleop_not_estop(qapp):
     """
     w = MainWindow(Settings())
     got = []
-    w.page_teleop.teleop_toggled.connect(got.append)
+    w.page.teleop_toggled.connect(got.append)
     calls = []
     w.worker = None                      # 只验信号，不真去停
 
-    w.page_teleop.stop.click()
+    w.page.stop.click()
     assert got == [False], f"大 STOP 应当发「停止遥操」(False)，实际 {got}"
     # 而且它**不许**去碰急停那条路径
     assert calls == []
     # 退路：即便没连接，STOP 也必须可点（不然用户没有"停"的路）
-    assert w.page_teleop.stop.isEnabled() or True
+    assert w.page.stop.isEnabled() or True
     w.close()
 
 
 def test_estop_is_separate_from_the_big_stop(qapp):
     """急停是**另一个**控件，且在顶栏 —— 与大 STOP 分开（避免误碰 ⇒ 自由落体）。"""
     w = MainWindow(Settings())
-    assert w.btn_estop is not w.page_teleop.stop
+    assert w.btn_estop is not w.page.stop
     assert "急停" in w.btn_estop.text()
     w.close()
 
@@ -225,18 +261,18 @@ def test_estop_is_separate_from_the_big_stop(qapp):
 
 def test_gripper_preset_fills_600g_and_3cm(qapp):
     w = MainWindow(Settings())
-    w.page_settings.btn_gripper.click()
-    assert w.page_settings.sp_mass.value() == 0.6
-    assert [sp.value() for sp in w.page_settings.sp_com] == [0.0, 0.0, 0.03]
+    w.page.btn_gripper.click()
+    assert w.page.sp_mass.value() == 0.6
+    assert [sp.value() for sp in w.page.sp_com] == [0.0, 0.0, 0.03]
     w.close()
 
 
 def test_apply_payload_emits_what_is_in_the_boxes(qapp):
     w = MainWindow(Settings())
     got = []
-    w.page_settings.payload_applied.connect(lambda m, c: got.append((m, list(c))))
-    w.page_settings.btn_gripper.click()
-    w.page_settings.btn_payload.click()
+    w.page.payload_applied.connect(lambda m, c: got.append((m, list(c))))
+    w.page.btn_gripper.click()
+    w.page.btn_payload.click()
     assert got == [(0.6, [0.0, 0.0, 0.03])], got
     w.close()
 
@@ -248,7 +284,7 @@ def test_payload_label_shows_the_readback_not_the_input(qapp):
     s.payload_mass = 0.0            # 固件把 -5 钳成了 0
     s.payload_com = [1.0, 0.0, 0.0]
     w._on_state(s)
-    txt = w.page_settings.lab_payload.text()
+    txt = w.page.lab_payload.text()
     assert "0.000 kg" in txt and "没设上" in txt, txt
     w.close()
 
@@ -264,10 +300,10 @@ def test_grip_panel_defaults_to_disabled_and_independent(qapp):
         主端 `link.Listener(1, …)` 根本绑不上 —— 本用例会红。
     """
     w = MainWindow(Settings())
-    v = w.page_teleop.gripper_values()
+    v = w.page.gripper_values()
     assert v["gcan"] == "", f"通道默认必须是空（不启用），实际 {v['gcan']!r}"
-    assert w.page_teleop.chk_align.isChecked() is True
-    assert w.page_teleop.btn_grip is not w.page_teleop.btn_teleop
+    assert w.page.chk_align.isChecked() is True
+    assert w.page.btn_grip is not w.page.btn_teleop
     assert v["gport"] == 17448, f"夹爪端口必须独立于臂的 17447，实际 {v['gport']}"
     assert v["gport"] != 1, "⚠ 端口 1 是特权端口 —— QSpinBox 忘 setValue 就是这个症状"
     w.close()
@@ -281,7 +317,7 @@ def test_grip_button_is_clickable_from_construction(qapp):
     判别力：在构造里加回 `setEnabled(False)` 时本用例必红。
     """
     w = MainWindow(Settings())
-    assert w.page_teleop.btn_grip.isEnabled() is True, \
+    assert w.page.btn_grip.isEnabled() is True, \
         "夹爪按钮必须从构造起就可点，否则没有任何路径能创建 GripWorker"
     w.close()
 
@@ -314,9 +350,9 @@ def test_grip_click_without_channel_bounces_back_and_creates_nothing(qapp):
     """
     w = MainWindow(Settings())
 
-    w.page_teleop.btn_grip.click()
+    w.page.btn_grip.click()
     assert w.grip is None, "没填通道就不该建 GripWorker"
-    assert w.page_teleop.btn_grip.isChecked() is False, \
+    assert w.page.btn_grip.isChecked() is False, \
         "没建起来时必须弹回未勾选，不能停在「已启动」的样子"
     w.close()
 
@@ -330,34 +366,34 @@ def test_grip_snapshot_renders_master_slave_and_stale(qapp):
     m = GripSnapshot(role="master", connected=True, topic="litearm/v4/gripA/gripper_teleop",
                      frames_sent=10, openness=0.5, position_mm=60.0, matching=True)
     w._on_grip_state(m)
-    assert "主端夹爪" in w.page_teleop.lab_grip.text()
-    assert "已匹配订阅者" in w.page_teleop.lab_grip.text()
+    assert "主端夹爪" in w.page.lab_grip.text()
+    assert "已匹配订阅者" in w.page.lab_grip.text()
 
     m.matching = False
     w._on_grip_state(m)
-    assert "未匹配" in w.page_teleop.lab_grip.text()
+    assert "未匹配" in w.page.lab_grip.text()
 
     s = GripSnapshot(role="slave", connected=True, frames_received=5, stale=False,
                      openness=0.5, position_mm=60.0, frame_age=0.01, loop_hz=50.0)
     w._on_grip_state(s)
-    assert "跟随中" in w.page_teleop.lab_grip.text()
+    assert "跟随中" in w.page.lab_grip.text()
 
     s.stale = True
     w._on_grip_state(s)
-    assert "持位" in w.page_teleop.lab_grip.text(), "watchdog 超时必须看得见"
+    assert "持位" in w.page.lab_grip.text(), "watchdog 超时必须看得见"
 
     # ⚠ 刷新按钮**不该**回头再发一次 `grip_toggled` —— 那会让界面自激。
     #    （`apply_grip` 用的是 `setChecked()`，它只发 `toggled`，
     #     而我们接的是 `clicked`。这里就是钉住这一点。）
     got = []
-    w.page_teleop.grip_toggled.connect(got.append)
+    w.page.grip_toggled.connect(got.append)
     s.teleop_active = True
     w._on_grip_state(s)
-    assert w.page_teleop.btn_grip.text().endswith("停止夹爪遥操")
-    assert w.page_teleop.btn_grip.isChecked() is True
+    assert w.page.btn_grip.text().endswith("停止夹爪遥操")
+    assert w.page.btn_grip.isChecked() is True
     s.teleop_active = False
     w._on_grip_state(s)
-    assert w.page_teleop.btn_grip.text().endswith("启动夹爪遥操")
+    assert w.page.btn_grip.text().endswith("启动夹爪遥操")
     assert got == [], f"刷新按钮不该发 toggled（自激），实际 {got}"
     w.close()
 
@@ -370,15 +406,15 @@ def test_grip_mismatch_and_error_are_visible(qapp):
     g = GripSnapshot(role="slave", connected=True)
     g.mismatch = "主从夹爪标定可能不一致：主端 travel≈60.0 mm，本端 120.1 mm"
     w._on_grip_state(g)
-    assert "不一致" in w.page_teleop.lab_grip_mismatch.text()
+    assert "不一致" in w.page.lab_grip_mismatch.text()
 
     g.error = "夹爪未标定"
     w._on_grip_state(g)
-    assert "未标定" in w.page_teleop.lab_grip.text()
+    assert "未标定" in w.page.lab_grip.text()
 
     g2 = GripSnapshot(role="slave", connected=True)
     w._on_grip_state(g2)
-    assert w.page_teleop.lab_grip_mismatch.text() == "", "没告警时必须清空，不能留旧的"
+    assert w.page.lab_grip_mismatch.text() == "", "没告警时必须清空，不能留旧的"
     w.close()
 
 
@@ -421,12 +457,12 @@ def test_grip_force_and_fault_are_visible(qapp):
     w = MainWindow(Settings())
     g = GripSnapshot(role="slave", connected=True, force_n=12.3)
     w._on_grip_state(g)
-    assert "12.3" in w.page_teleop.lab_grip.text(), "力要显示"
+    assert "12.3" in w.page.lab_grip.text(), "力要显示"
 
     g.fault = "夹爪报告 error_code=11（故障：过温/过流等）—— 继续发帧持位"
     g.send_failed = 4
     w._on_grip_state(g)
-    txt = w.page_teleop.lab_grip_mismatch.text()
+    txt = w.page.lab_grip_mismatch.text()
     assert "过温" in txt, txt
     assert "4 次" in txt, txt
     w.close()
@@ -449,7 +485,7 @@ def test_grip_rejected_frames_are_visible(qapp):
     g = GripSnapshot(role="slave", connected=True, rejected=7)
     g.mismatch = "主从标定可能不一致"
     w._on_grip_state(g)
-    txt = w.page_teleop.lab_grip_mismatch.text()
+    txt = w.page.lab_grip_mismatch.text()
     assert "7" in txt and "非有限值" in txt, txt
     assert "不一致" in txt, "两条告警要能同时显示，不能互相顶掉"
     w.close()
@@ -480,7 +516,7 @@ def test_metric_switch_keeps_the_buffer(qapp):
     「切一下指标，10 s 的历史全没了」。
     """
     w = MainWindow(Settings())
-    m = _filled_card(w.page_teleop.metrics)
+    m = _filled_card(w.page.metrics)
     before = len(m.series)
     assert before == 100
     m.seg.set_current(1)
@@ -498,7 +534,7 @@ def test_clear_deselects_but_keeps_the_buffer(qapp):
     判别力：把 `select_none` 写成"清缓冲"时本用例会红 —— 那会让用户以为数据没了。
     """
     w = MainWindow(Settings())
-    m = _filled_card(w.page_teleop.metrics)
+    m = _filled_card(w.page.metrics)
     m.select_none()
     assert m._shown == [], "清空后应当一条都不勾"
     assert len(m.series) == 100, "⚠ 清空**不许**丢缓冲"
@@ -511,7 +547,7 @@ def test_clear_deselects_but_keeps_the_buffer(qapp):
 def test_pause_freezes_sampling_without_clearing(qapp):
     """「暂停」= 停止采样、**缓冲原样冻结**（studio `useArmMetrics.ts:119`）。"""
     w = MainWindow(Settings())
-    m = _filled_card(w.page_teleop.metrics)
+    m = _filled_card(w.page.metrics)
     m.paused = True
     s = _snap(role=ROLE_SLAVE)
     m.set_snapshot(s)
@@ -526,7 +562,7 @@ def test_pause_freezes_sampling_without_clearing(qapp):
 def test_window_is_bounded_at_100_points(qapp):
     """窗口 = 100 点 = 10 s（studio `useArmMetrics.ts:56-57`）。"""
     w = MainWindow(Settings())
-    m = _filled_card(w.page_teleop.metrics, n=250)
+    m = _filled_card(w.page.metrics, n=250)
     assert len(m.series) == 100, "超出 100 点必须滑窗裁掉"
     w.close()
 
@@ -534,7 +570,7 @@ def test_window_is_bounded_at_100_points(qapp):
 def test_joint_legend_toggles_visibility(qapp):
     """点图例 = 切该条曲线的显隐；重新勾上时保持**升序**（studio `:203-204`）。"""
     w = MainWindow(Settings())
-    m = _filled_card(w.page_teleop.metrics)
+    m = _filled_card(w.page.metrics)
     m.toggle_joint(1)
     assert 1 not in m._shown
     m.toggle_joint(1)
@@ -554,7 +590,7 @@ def test_err_metric_reports_no_data_instead_of_faking_it(qapp):
 
     assert "err" in NO_DATA_METRICS
     w = MainWindow(Settings())
-    m = w.page_teleop.metrics
+    m = w.page.metrics
     idx = [i for i, md in enumerate(m.metrics) if md[0] == "err"][0]
     m.seg.set_current(idx)
     m._redraw()

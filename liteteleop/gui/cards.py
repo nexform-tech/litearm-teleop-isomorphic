@@ -276,11 +276,19 @@ class SegmentedControl(QtWidgets.QFrame):
                 return i
         return 0
 
-    def set_current(self, idx: int) -> None:
-        """程序化选中。⚠ 不发 `changed`（避免自激，同 `pages` 里按钮那条纪律）。"""
+    def set_current(self, idx: int, emit: bool = False) -> None:
+        """程序化选中。
+
+        ⚠ `emit=False`（默认）**不发** `changed` —— 避免"程序化改一下"被当成用户操作，
+        同 `pages` 里按钮那条纪律（`setChecked` 只发 `toggled`、而外面接的是 `clicked`）。
+        ⚠ 但**联动逻辑挂在 `changed` 上**（如 `TeleopPage._role_changed` 会启停「主臂 IP」
+        那一格）⇒ 想走完整路径就得显式 `emit=True`，否则会出现"选中了但联动没跑"。
+        """
         if 0 <= idx < len(self._buttons):
             self._buttons[idx].setChecked(True)
             self._refresh()
+            if emit:
+                self.changed.emit(idx)
 
 
 # ────────────────────────── 指标块 ──────────────────────────
