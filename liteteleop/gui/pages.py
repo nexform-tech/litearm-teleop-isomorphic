@@ -252,6 +252,8 @@ class TeleopPage(QtWidgets.QWidget):
     grip_settings_changed = QtCore.pyqtSignal()
     connect_clicked = QtCore.pyqtSignal()
     settings_changed = QtCore.pyqtSignal()
+    #: 臂维护动作：`"enable"` / `"clear"` / `"reset"` / `"home"`（见 `_build_arm_card`）
+    arm_action = QtCore.pyqtSignal(str)
     #: (mass_kg, [x, y, z]) —— 由 main_window 接到 `worker.set_payload`
     payload_applied = QtCore.pyqtSignal(float, object)
 
@@ -431,6 +433,39 @@ class TeleopPage(QtWidgets.QWidget):
                      "B 大", self.ro_b1, "B 腕", self.ro_b2)
         card.add(hint("见回摆→加大 B；追不上→加大 K；啸叫→降 K"
                       "（大关节 J1~J4 / 腕部 J5~J7 两档）　⛔ 本版只读", "hintSubtle"))
+
+        card.add(separator())
+
+        # ── 臂维护：使能 / 清错 / 复位 / 回零 ──
+        # ⚠⚠ **门控分两档**（见 `_relock`），这是有意的：
+        #   · **运动类**（使能、回零）：臂会动 ⇒ 要勾安全确认。
+        #   · **状态类**（清错、复位）：**恰恰是在臂出故障时才要按的** ——
+        #     而故障会让 `_relock` 自动把安全确认摘掉 ⇒ 它们**绝不能**要那个勾选，
+        #     否则"最需要它的时候它不可用"。⭐ 这条判据有专门的回归测试。
+        self.btn_enable = QtWidgets.QPushButton("使能")
+        self.btn_clear = QtWidgets.QPushButton("清错")
+        self.btn_reset = QtWidgets.QPushButton("复位")
+        self.btn_home = QtWidgets.QPushButton("回零")
+        for b in (self.btn_enable, self.btn_clear, self.btn_reset, self.btn_home):
+            b.setProperty("variant", "secondary")
+        self.btn_enable.setToolTip(
+            "使能全关节。⚠ 臂若正被自重压着（例如刚失能过），使能瞬间会**弹**到保持位。")
+        self.btn_clear.setToolTip(
+            "清故障码（逐轴，健康轴零触碰）。\n"
+            "⚠ 它**不能替代复位**：臂可能还在 EMERGENCY 锁存态。\n"
+            "真机验证过的恢复顺序：清错 → 复位 → 使能。")
+        self.btn_reset.setToolTip(
+            "清 EMERGENCY 锁存（固件 CMD_RESET 0x00）。\n"
+            "只清错不复位时，使能会恒拒 ERR[10,6]「锁存, 须先 RESET」。")
+        self.btn_home.setToolTip(
+            "⚠ **臂会移动**：各轴回 URDF 零位舒展姿（固件 CMD_HOME 0x2A）。\n"
+            "固件侧速度写死 0.10（低安全速度）；**须先使能**。\n"
+            "它是失能漂出软限位之后的回家动作（固件允许从越限/贴端发起）。")
+        for key, b in (("enable", self.btn_enable), ("clear", self.btn_clear),
+                       ("reset", self.btn_reset), ("home", self.btn_home)):
+            b.clicked.connect(lambda _c, k=key: self.arm_action.emit(k))
+        card.add_row("臂维护", self.btn_enable, self.btn_clear,
+                     self.btn_reset, self.btn_home)
 
         card.add(separator())
 

@@ -282,12 +282,23 @@ QPushButton[variant="secondary"] {{
     background: {C['secondary']}; color: {C['secondary_foreground']}; border-color: transparent;
 }}
 QPushButton[variant="secondary"]:hover {{ background: #ececec; }}
+/* ⚠⚠ `:disabled` 一条都不能省。带属性选择器的 `[variant=...]` 规则**盖过**下面那条
+   通用的 `QPushButton:disabled` ⇒ 少了它，"禁用"和"启用"会**渲染得一模一样**
+   （离屏逐像素比对：0 个像素不同）—— 于是一个按不动的按钮看起来完全能按。
+   2026-09-29 实测踩到：臂维护那四个 `secondary` 键在遥操运行时是禁用的，
+   却和可点时长得一样。⭐ 判据 = `tests/test_gui_smoke.py::test_disabled_buttons_look_disabled`。 */
+QPushButton[variant="secondary"]:disabled {{
+    background: {C['line_soft']}; color: {C['ink_ghost']}; border-color: transparent;
+}}
 
 /* ghost 变体 */
 QPushButton[variant="ghost"] {{
     background: transparent; color: {C['ink_strong']}; border-color: transparent;
 }}
 QPushButton[variant="ghost"]:hover {{ background: {C['muted']}; }}
+QPushButton[variant="ghost"]:disabled {{
+    background: transparent; color: {C['ink_ghost']};
+}}
 
 /* 行进/选中态（studio 用 --chip 深色胶囊表示「开」） */
 QPushButton[variant="toggle"] {{
@@ -384,3 +395,8 @@ QToolTip {{
 
 #: 供测试/对账用的令牌原件（勿就地修改）。
 TOKENS = dict(C)
+
+#: 本应用用到的**全部按钮变体**（`None` = 不设 `variant` 属性的默认档）。
+#: ⚠ 新增变体时**必须**加进来，并且要在 QSS 里给它配一条 `:disabled` ——
+#: 见上面 secondary 那段的说明与 `test_disabled_buttons_look_disabled`。
+BUTTON_VARIANTS = [None, "outline", "secondary", "ghost", "toggle", "primaryAction"]

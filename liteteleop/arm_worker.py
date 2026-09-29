@@ -220,6 +220,78 @@ class ArmWorker:
                       + ("   ⚠ **被固件钳过**（给的值超出 [0,20]/[-1,1]）" if clamped else ""))
         self.post(_do)
 
+    # ────────────────────── 臂维护动作（使能 / 清错 / 复位 / 回零）──────────────────────
+    #
+    # ⚠⚠ 这些**都是排到 worker 线程上执行的**（与 `set_payload` 同款）——
+    #   GUI 只投命令，任何 SDK 调用都在 worker 线程里（spec §3.1）。
+    # ⚠ `go_home` 是**阻塞**的：SDK 的 `Arm.home()` 内部 `_arrive()` 会一直等到
+    #   到位/超时（超时 = 构造时的 `move_timeout`，本仓默认 30 s）。
+    #   期间 worker 线程被占着 ⇒ 起不了遥操、处理不了别的投递命令；
+    #   ⛔ 但**急停仍然可达**（`emergency_stop` 绕过队列，见 §7.4 与它那条回归测试）。
+
+    def _arm_action(self, name: str, fn) -> None:
+        """把一次臂操作排到 worker 线程上执行，并统一记日志/错误。"""
+        def _do() -> None:
+            if self._arm is None:
+                self._log(f"⚠ 未连接，{name}未执行")
+                return
+            try:
+                out = fn(self._arm)
+            except Exception as e:                       # noqa: BLE001
+                self._log(f"⛔ {name}失败: {e}")
+                with self._lock:
+                    self._snap.error = f"{name}失败: {e}"
+                return
+            with self._lock:
+                # 一次成功的手动操作 ⇒ 清掉上一次的错误（否则界面会一直挂着旧错）
+                if self._snap.error:
+                    self._snap.error = ""
+            if out is not None:
+                self._log(f"✓ {name}完成：{out}")
+            else:
+                self._log(f"✓ {name}已执行")
+        self.post(_do)
+
+    def enable_arm(self) -> None:
+        """使能全关节。
+
+        ⚠ **是一条运动类动作**：臂若正被自重压着（例如刚失能过），使能瞬间会
+        "弹"到保持位 —— 所以界面把它与「回零」一起按运动类门控（要勾安全确认）。
+        重试策略在 SDK 里（只对固件明说可重试的码重试）。
+        """
+        self._arm_action("使能", lambda a: a.enable())
+
+    def clear_faults(self) -> None:
+        """清故障码（逐轴；**健康轴零触碰**）。
+
+        ⚠⚠ **它不是 `reset()` 的替代**：`clear_faults` 能把 `joint_fault` 清成 0，
+        但臂可能还在 **EMERGENCY 锁存**态 —— 那时 `enable` 会恒拒
+        `ERR[10,6]「锁存, 须先 RESET」`。
+        真机验证过的恢复顺序：**`clear_faults()` → `reset_arm()` → `enable_arm()`**。
+        """
+        self._arm_action("清错", lambda a: a.clear_faults())
+
+    def reset_arm(self) -> None:
+        """清 EMERGENCY 锁存（固件 `CMD_RESET 0x00`）。见 `clear_faults` 里的恢复顺序。"""
+        self._arm_action("复位", lambda a: a.reset())
+
+    def go_home(self) -> None:
+        """**回零**：各轴回 URDF 零位舒展姿（固件 `CMD_HOME 0x2A`）。
+
+        ⚠ 固件侧速度写死 **0.10**（低安全速度），本方法**不接受 speed** ——
+        与 `movej([0]*n)` 的差别是固件**允许它从越软限/贴端发起**（软限位 clamp 作用在
+        **目标**上，零位在限内，起点不影响），所以它才是失能漂出限位之后的回家动作。
+        ⚠ **须先使能**：未使能时先喊一声，别让用户对着"点了没反应"发呆。
+        """
+        def _fn(a):
+            st = a.get_state(refresh=True).value
+            if st is not None and not st.enabled:
+                raise RuntimeError("臂未使能 —— 先点「使能」（固件会拒未使能的 home）")
+            st2 = a.home()
+            q = getattr(st2, "q", None)
+            return None if q is None else [round(v, 3) for v in q]
+        self._arm_action("回零", _fn)
+
     def refresh_payload(self) -> None:
         """读回载荷到快照。**只许在非跟随路径上调** —— 它是串口往返，会拖累伺服环。"""
         if self._arm is None:

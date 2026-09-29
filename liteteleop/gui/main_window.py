@@ -110,6 +110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.page.grip_toggled.connect(self._toggle_grip)
         self.page.grip_settings_changed.connect(self._save_grip)
         self.page.payload_applied.connect(self._apply_payload)
+        self.page.arm_action.connect(self._arm_action)
 
         self._relock()
         self._log("就绪。⚠ 一个 CDC 口只允许一个进程。")
@@ -134,10 +135,23 @@ class MainWindow(QtWidgets.QMainWindow):
         snap = self._last
         bad = bool(snap and (snap.faulted or snap.joint_fault or snap.error))
         armed = self.chk_ok.isChecked() and not bad
-        self.page.btn_teleop.setEnabled(armed and bool(snap and snap.connected))
+        connected = bool(snap and snap.connected)
+        live = bool(snap and snap.teleop_active)
+        self.page.btn_teleop.setEnabled(armed and connected)
         # ⚠ 大 STOP **不锁**：链路挂了也必须留一条"停"的退路
         #   （夹爪按钮那条死锁是同一个道理）。断开时点它是个无害的 no-op。
         self.btn_estop.setEnabled(self.worker is not None)
+
+        # ── 臂维护四键，**门控分两档**（见 `pages._build_arm_card`）──
+        # ⚠⚠ 运动类（使能/回零）要勾安全确认：它们会让臂动。
+        # ⚠⚠ 状态类（清错/复位）**绝不要**那个勾选 —— 臂出故障时 `_relock` 会把
+        #   确认框自动摘掉，而那一刻**正是**要按"清错→复位"的时候。
+        #   绑上勾选就等于"最需要它的时候它不可用"。
+        # 遥操跑着的时候四键一律禁用：它们会和伺服环抢臂。
+        self.page.btn_enable.setEnabled(armed and connected and not live)
+        self.page.btn_home.setEnabled(armed and connected and not live)
+        self.page.btn_clear.setEnabled(connected and not live)
+        self.page.btn_reset.setEnabled(connected and not live)
         if bad:
             self.chk_ok.setChecked(False)
 
@@ -163,6 +177,30 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._log("启动遥操" if on else "停止遥操（受控接管 movej）")
         self.worker.set_teleop(on)
+
+    def _arm_action(self, what: str) -> None:
+        """臂维护动作（使能/清错/复位/回零）—— 排到 worker 线程上执行。
+
+        ⚠ 这里**不做 SDK 调用**，只投递（spec §3.1）；日志与出错处理在 worker 里。
+        """
+        if self.worker is None:
+            self._log("⚠ 未连接，臂操作未执行")
+            return
+        table = {
+            "enable": (self.worker.enable_arm, "使能"),
+            "clear": (self.worker.clear_faults, "清错"),
+            "reset": (self.worker.reset_arm, "复位"),
+            "home": (self.worker.go_home, "回零"),
+        }
+        hit = table.get(what)
+        if hit is None:                                  # 理论不可达（信号值写死）
+            self._log(f"⚠ 未知的臂操作 {what!r}")
+            return
+        fn, name = hit
+        if what == "home":
+            # ⚠ 回零是**会动臂**的，且 worker 会在里面阻塞到到位/超时 ⇒ 必须让用户看见
+            self._log("⚠ 回零：臂将移动到 URDF 零位（固件低安全速度 0.10）…")
+        fn()
 
     def _apply_payload(self, mass, com) -> None:
         if self.worker is None:

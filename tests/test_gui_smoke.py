@@ -28,6 +28,7 @@ pytest.importorskip("PyQt5")
 from PyQt5 import QtWidgets                                      # noqa: E402
 
 from liteteleop.arm_worker import ROLE_MASTER, ROLE_SLAVE, Snapshot   # noqa: E402
+from liteteleop.gui import theme                                 # noqa: E402
 from liteteleop.gui.main_window import MainWindow                 # noqa: E402
 from liteteleop.gui.widgets import BAD_BRUSH, ERR_ENABLED, OK_BRUSH  # noqa: E402
 from liteteleop.settings import Settings                          # noqa: E402
@@ -88,6 +89,52 @@ def test_disabled_axis_is_highlighted(qapp):
 
 def test_err_enabled_constant_is_one(qapp):
     assert ERR_ENABLED == 1, "口径：1 = 使能（用户裁决）"
+
+
+def _render_button(variant, enabled):
+    """离屏渲染一个按钮，返回 QImage。"""
+    w = QtWidgets.QWidget()
+    w.setStyleSheet(theme.qss())
+    lay = QtWidgets.QHBoxLayout(w)
+    lay.setContentsMargins(6, 6, 6, 6)
+    b = QtWidgets.QPushButton("清错")
+    b.setFixedWidth(90)
+    if variant:
+        b.setProperty("variant", variant)
+    b.setEnabled(enabled)
+    lay.addWidget(b)
+    w.resize(110, 46)
+    w.show()
+    qapp_ = QtWidgets.QApplication.instance()
+    qapp_.processEvents()
+    img = w.grab().toImage()
+    w.close()
+    return img
+
+
+def test_disabled_buttons_look_disabled(qapp):
+    """⚠⚠ **每个按钮变体的禁用态都必须看得出来。**
+
+    判别力（2026-09-29 实测踩到）：带属性选择器的 `[variant=...]` 规则**盖过**通用那条
+    `QPushButton:disabled` ⇒ 少写 `:disabled` 的变体，"禁用"与"启用"会**渲染得一模一样**
+    （离屏逐像素比对 = **0 个像素不同**）。真机表现：臂维护那四个 `secondary` 键在遥操
+    运行时明明是禁用的，看起来却完全能按 —— 又一个"界面在撒谎"。
+
+    ⚠ 为什么不只查 QSS 文本里有没有那条规则：**规则可以在、却是个 no-op**。
+    判据必须落到**像素**上（与 `test_err_colour_reaches_the_pixels` 同一族）。
+    """
+    for v in theme.BUTTON_VARIANTS:
+        sel = (f'QPushButton[variant="{v}"]:disabled' if v
+               else "QPushButton:disabled")
+        assert sel in theme.qss(), f"QSS 里缺少 {sel}"
+
+        on = _render_button(v, True)
+        off = _render_button(v, False)
+        diff = sum(1 for y in range(on.height()) for x in range(on.width())
+                   if on.pixelColor(x, y) != off.pixelColor(x, y))
+        assert diff > 0, (
+            f"变体 {v!r} 的禁用态与启用态**渲染完全一样**（{diff} 个像素不同）—— "
+            f"多半是漏了 `{sel}`，或者那条规则没真的改到颜色")
 
 
 def test_err_colour_reaches_the_pixels(qapp):
@@ -254,6 +301,98 @@ def test_fault_locks_the_arm_checkbox(qapp):
     s.faulted = True
     w._on_state(s)
     assert w.chk_ok.isChecked() is False
+    w.close()
+
+
+def test_arm_maintenance_gating_is_two_tiered(qapp):
+    """⚠⚠ 臂维护四键的**两档门控** —— 这是有意设计的，别"统一"掉。
+
+    - **运动类**（使能 / 回零）：臂会动 ⇒ 要勾安全确认。
+    - **状态类**（清错 / 复位）：**恰恰是在臂出故障时才要按的**，而故障会让
+      `_relock` 自动摘掉安全确认 ⇒ 它们**绝不能**要那个勾选。
+      绑上就等于"最需要它的时候它不可用"。
+
+    判别力：谁把四键统一成 `armed and connected`，第三条断言会红。
+    """
+    w = MainWindow(Settings())
+    p = w.page
+
+    def st(**kw):
+        s = _snap(role=ROLE_MASTER)
+        for k, v in kw.items():
+            setattr(s, k, v)
+        return s
+
+    both = (p.btn_enable, p.btn_home)
+    state_ = (p.btn_clear, p.btn_reset)
+
+    # ① 已连接但没勾安全确认
+    w._on_state(st())
+    assert not any(b.isEnabled() for b in both), "运动类必须先勾安全确认"
+    assert all(b.isEnabled() for b in state_), "状态类不该要那个勾选"
+
+    # ② 勾上
+    w.chk_ok.setChecked(True)
+    w._on_state(st())
+    assert all(b.isEnabled() for b in both)
+
+    # ③ ⭐ 出故障 ⇒ 勾选被自动摘掉，但清错/复位**仍然可按**
+    s = st()
+    s.joint_fault = 0x08
+    w._on_state(s)
+    assert w.chk_ok.isChecked() is False, "FAULT 要自动摘掉安全确认"
+    assert not any(b.isEnabled() for b in both), "运动类随勾选一起锁上"
+    assert all(b.isEnabled() for b in state_), \
+        "⚠ 故障时清错/复位必须还能按 —— 否则没有恢复路径"
+
+    # ④ 遥操跑着 ⇒ 四键全禁（会和伺服环抢臂）
+    w.chk_ok.setChecked(True)
+    w._on_state(st(teleop_active=True))
+    assert not any(b.isEnabled() for b in (p.btn_enable, p.btn_clear,
+                                           p.btn_reset, p.btn_home))
+    w.close()
+
+
+def test_arm_maintenance_buttons_emit_the_right_action(qapp):
+    """四个按钮要发出**各自的**动作名（接错就是按"回零"跑"清错"）。"""
+    w = MainWindow(Settings())
+    got = []
+    w.page.arm_action.connect(got.append)
+    # ⚠ 先启用：Qt 对**禁用**按钮不发 `clicked`（没连接时它们本来就是锁着的），
+    #   不启的话这里会静默什么都不发（本用例第一版就是这么红的）。
+    for btn, key in ((w.page.btn_enable, "enable"), (w.page.btn_clear, "clear"),
+                     (w.page.btn_reset, "reset"), (w.page.btn_home, "home")):
+        btn.setEnabled(True)
+        btn.click()
+        assert got[-1] == key, f"{btn.text()} 应发 {key!r}，实际 {got[-1]!r}"
+    w.close()
+
+
+def test_arm_action_reaches_the_worker_method(qapp):
+    """信号 → worker 方法要接对（`home` 别接到 `reset` 上）。"""
+    w = MainWindow(Settings())
+    calls = []
+
+    class _W:
+        def enable_arm(self):
+            calls.append("enable")
+
+        def clear_faults(self):
+            calls.append("clear")
+
+        def reset_arm(self):
+            calls.append("reset")
+
+        def go_home(self):
+            calls.append("home")
+
+    w.worker = _W()          # type: ignore[assignment]
+    for key in ("enable", "clear", "reset", "home"):
+        w._arm_action(key)
+    assert calls == ["enable", "clear", "reset", "home"], calls
+    # 没连接时不许炸，只记一句
+    w.worker = None
+    w._arm_action("home")
     w.close()
 
 

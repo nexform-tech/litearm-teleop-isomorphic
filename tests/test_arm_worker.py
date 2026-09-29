@@ -275,3 +275,101 @@ def test_align_move_timeout_is_thirty_seconds():
     """
     assert arm_worker.ALIGN_MOVE_TIMEOUT == 30.0
     assert ArmWorker(role=ROLE_SLAVE).move_timeout == 30.0
+
+
+# ────────────── 臂维护动作：使能 / 清错 / 复位 / 回零 ──────────────
+
+
+class _MaintArm:
+    """记下 SDK 调用的假臂。`enabled` 决定 `go_home` 的预检走哪条。"""
+
+    def __init__(self, enabled=True, boom=None):
+        self.enabled = enabled
+        self.boom = boom                # 非 None ⇒ 那个方法抛异常
+        self.calls = []
+
+    def _hit(self, name):
+        self.calls.append(name)
+        if self.boom == name:
+            raise RuntimeError(f"{name} 炸了")
+
+    def get_state(self, refresh=False):
+        return type("M", (), {"value": type("S", (), {"enabled": self.enabled})()})()
+
+    def enable(self):
+        self._hit("enable")
+
+    def clear_faults(self):
+        self._hit("clear_faults")
+
+    def reset(self):
+        self._hit("reset")
+
+    def home(self):
+        self._hit("home")
+        return type("S", (), {"q": [0.0] * N_JOINTS})()
+
+
+def _drain_once(w):
+    """跑掉队列里排着的那一条命令。"""
+    w._drain(0.0)
+
+
+def test_maintenance_commands_reach_the_arm():
+    """四个维护动作都要**真的落到 SDK 上**（名字别接错）。"""
+    for method, sdk in (("enable_arm", "enable"), ("clear_faults", "clear_faults"),
+                        ("reset_arm", "reset"), ("go_home", "home")):
+        w = ArmWorker(role=ROLE_MASTER)
+        w._arm = _MaintArm()
+        getattr(w, method)()
+        _drain_once(w)
+        assert w._arm.calls == [sdk], f"{method} 应当调用 arm.{sdk}，实际 {w._arm.calls}"
+
+
+def test_go_home_refuses_when_the_arm_is_not_enabled():
+    """⚠⚠ **未使能时不许闷头发 home** —— 固件会拒，而用户只会看到"点了没反应"。
+
+    判别力：把那个预检删掉，本用例会红（`home()` 会被调用）。
+    """
+    w = ArmWorker(role=ROLE_MASTER)
+    w._arm = _MaintArm(enabled=False)
+    w.go_home()
+    _drain_once(w)
+    assert w._arm.calls == [], f"未使能就不该调 arm.home()，实际 {w._arm.calls}"
+    assert "未使能" in w._snap.error, f"要把原因说出来，实际 {w._snap.error!r}"
+
+
+def test_maintenance_failure_is_visible_not_swallowed():
+    """失败要**记进快照**（界面看得见），不能只写一行日志。"""
+    w = ArmWorker(role=ROLE_MASTER)
+    w._arm = _MaintArm(boom="clear_faults")
+    w.clear_faults()
+    _drain_once(w)
+    assert "清错失败" in w._snap.error and "炸了" in w._snap.error, w._snap.error
+
+
+def test_a_successful_maintenance_clears_the_previous_error():
+    """一次成功的手动操作 ⇒ 清掉旧错误，否则界面会一直挂着上一次的错。"""
+    w = ArmWorker(role=ROLE_MASTER)
+    w._arm = _MaintArm()
+    with w._lock:
+        w._snap.error = "上一次的旧错"
+    w.reset_arm()
+    _drain_once(w)
+    assert w._snap.error == "", f"成功之后该清空，实际 {w._snap.error!r}"
+
+
+def test_maintenance_on_a_missing_arm_says_so():
+    """没连接时要说一声，不是静默 no-op。
+
+    ⚠ 这里只**记日志**、**不写 `snap.error`** —— 与 `set_payload` 同一惯例：
+    "没连接"是用户操作问题，不是臂的故障；写进快照会让顶栏的"故障"格亮红。
+    （界面上这条路径其实到不了：`_relock` 没连接时就把四键禁掉了，这里是兜底。）
+    """
+    logs = []
+    w = ArmWorker(role=ROLE_MASTER, on_log=logs.append)
+    w._arm = None
+    w.enable_arm()
+    _drain_once(w)
+    assert any("未连接" in x for x in logs), logs
+    assert w._snap.error == "", "不是臂的故障，别污染快照里的 error"
