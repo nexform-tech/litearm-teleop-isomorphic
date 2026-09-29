@@ -31,7 +31,7 @@ def qapp():
 
 
 def _snap(err=None, q=None, role=ROLE_MASTER):
-    s = Snapshot(role=role, connected=True, firmware="Litearm1.8.0-7J",
+    s = Snapshot(role=role, connected=True, firmware="Litearm1.9.0-7J",
                  mode_name="MOVE_J", enabled=True)
     s.q = list(q or [0.1] * N_JOINTS)
     s.dq = [0.0] * N_JOINTS
