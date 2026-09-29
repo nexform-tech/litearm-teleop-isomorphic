@@ -552,7 +552,7 @@ def _filled_card(card, n=100):
         card.series.append(
             1000.0 + k * 0.1,
             [30.0 + k % 5] * N_JOINTS, [0.1 * k] * N_JOINTS,
-            [1.0] * N_JOINTS, [0.0] * N_JOINTS)
+            [1.0] * N_JOINTS)
     card._was_live = True
     return card
 
@@ -570,8 +570,8 @@ def test_metric_switch_keeps_the_buffer(qapp):
     m.seg.set_current(1)
     m._on_metric(1)
     assert len(m.series) == before, "切指标不许清缓冲"
-    m.seg.set_current(3)
-    m._on_metric(3)
+    m.seg.set_current(2)              # 只有 温度/速度/力矩 三个页签了
+    m._on_metric(2)
     assert len(m.series) == before
     w.close()
 
@@ -624,24 +624,4 @@ def test_joint_legend_toggles_visibility(qapp):
     m.toggle_joint(1)
     assert m._shown == sorted(m._shown), "重新勾选后必须有序"
     assert 1 in m._shown
-    w.close()
-
-
-def test_err_metric_reports_no_data_instead_of_faking_it(qapp):
-    """⚠ 跟踪误差这一路**本机没有数据** ⇒ 必须显示"不提供"，**不许画零线**。
-
-    与 studio 同款纪律（`useArmMetrics.ts:137` 写死 `err: []`，绝不伪造）。
-    判别力：谁让它去读 `Snapshot.err`（那是**逐关节故障码**、不是跟踪误差），
-    本用例会红 —— 那会把"故障码 1"当成"误差 1 rad"画出来。
-    """
-    from liteteleop.gui.chart import NO_DATA_METRICS
-
-    assert "err" in NO_DATA_METRICS
-    w = MainWindow(Settings())
-    m = w.page.metrics
-    idx = [i for i, md in enumerate(m.metrics) if md[0] == "err"][0]
-    m.seg.set_current(idx)
-    m._redraw()
-    assert "不提供" in (m.chart._notice or ""), \
-        f"跟踪误差必须如实报「无数据」，实际 notice={m.chart._notice!r}"
     w.close()

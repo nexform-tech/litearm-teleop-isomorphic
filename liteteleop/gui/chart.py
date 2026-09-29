@@ -4,10 +4,10 @@
 
 | 事 | studio 怎么做 |
 | --- | --- |
-| 数据集 | 固定四路：温度 `°C` / 速度 `rad/s` / 力矩 `Nm` / 跟踪误差 `rad`（`useArmMetrics.ts:49-54`） |
+| 数据集 | 三路：温度 `°C` / 速度 `rad/s` / 力矩 `Nm` |
 | 采样 | **定时器 100 ms（10 Hz）**，不是每帧推（`:56,147`）—— 注释明说故意不依赖帧引用 |
 | 窗口 | **100 点 = 10 s**（`:57`），超出 `splice(0, len-100)` 滑窗 |
-| 缓冲 | **一个共享缓冲**，每拍同时存四路通道（`SeriesSample = {t, temp[], dq[], tau[], err[]}`，`:9-15`） |
+| 缓冲 | **一个共享缓冲**，每拍同时存三路通道（`SeriesSample`，`:9-15`） |
 | 切指标 | **不切缓冲、不清空** —— 只是换读哪个字段（`metricDatasets.ts:5,30`） |
 | 暂停 | 停止采样；**缓冲原样冻结**（`:119`），恢复后从当前时刻继续、不补采样 |
 | 全选 | 勾选**当前全部轴**（不是写死 0..6）（`:210`） |
@@ -20,14 +20,16 @@
 | 刻度 | y 上限 5 条、x 上限 6 条且不旋转；色 `#9aa6b6`、10px |
 | 无数据态 | **图框保留**，只叠加说明文字（`MetricsPanel.tsx:187-192` 测试钉住） |
 
-## ⚠ 与 studio 的两处**有意**不同
+## ⚠ 与 studio 的**有意**不同
 
 1. **版式**：设计稿把图例做成**右栏竖排**、每行直接带当前读数；studio 是横排纯开关芯片、
    读数另起一行。按"布局照设计稿、行为照 studio"的裁决，这里取设计稿版式。
-2. **`err`（跟踪误差）本机没有这个通道**：studio 在实机上也**故意留空、不伪造**
-   （`useArmMetrics.ts:137` 写死 `err: []`，`noData: real && m.id === 'err'`）。
-   本仓同理 —— `arm_worker.Snapshot` 里根本没收主臂 q，所以显示"无数据"而不是画零线。
-   ⚠ 这是**如实呈现**，不是没做完：要让它有数据得先把主臂 q 接进 `Snapshot`。
+2. **只有三路数据集，没有 studio 的「跟踪误差」**。studio 那一路在实机上是空跑的
+   （`useArmMetrics.ts:137` 写死 `err: []`），它选择留个页签写"无数据"。
+   本仓**没有这个数据源**（`arm_worker.Snapshot` 不收主臂 q）⇒ 用户裁决
+   2026-09-29：**直接去掉，不摆一个永远画不出东西的页签**。
+   ⚠ 要加回来的前提是先把主臂 q 接进 `Snapshot`（那是另一件事），
+   ⛔ 而不是在这里恢复一个空页签。
 """
 from __future__ import annotations
 
@@ -53,19 +55,14 @@ METRIC_DEFS: List[Tuple[str, str, str, str]] = [
     ("temp", "温度", "°C", "T (°C)"),
     ("dq", "速度", "rad/s", "dq (rad/s)"),
     ("tau", "力矩", "Nm", "tau (Nm)"),
-    ("err", "跟踪误差", "rad", "e (rad)"),
 ]
 
 #: 逐指标小数位（`useArmMetrics.ts:77`）。
-DECIMALS = {"temp": 0, "dq": 2, "tau": 1, "err": 3}
+DECIMALS = {"temp": 0, "dq": 2, "tau": 1}
 
 #: 采样间隔与窗口 —— `useArmMetrics.ts:56-57`。
 SERIES_INTERVAL_MS = 100
 SERIES_MAX_LEN = 100
-
-#: 实机不提供的通道（`useArmMetrics.ts:137,185`）。本仓同理，见模块 docstring。
-NO_DATA_METRICS = {"err"}
-
 
 def _fmt(v: Optional[float], key: str) -> str:
     """按指标的小数位格式化；缺失给 `—`（**不是 0**）。"""
@@ -116,9 +113,9 @@ class MetricSeries:
         self._buf.clear()
 
     def append(self, t: float, temp: Sequence[float], dq: Sequence[float],
-               tau: Sequence[float], err: Sequence[float]) -> None:
+               tau: Sequence[float]) -> None:
         self._buf.append({"t": t, "temp": list(temp), "dq": list(dq),
-                          "tau": list(tau), "err": list(err)})
+                          "tau": list(tau)})
 
     def samples(self) -> List[dict]:
         return list(self._buf)
@@ -289,7 +286,7 @@ class MetricsCard(Card):
     （`useArmMetrics.ts:98-99`：每帧换引用会把定时器反复重建；200 Hz 重绘也没有意义）。
     """
 
-    def __init__(self, metrics: Sequence[str] = ("temp", "dq", "tau", "err"),
+    def __init__(self, metrics: Sequence[str] = ("temp", "dq", "tau"),
                  joint_count: int = N_JOINTS, parent=None):
         super().__init__("", parent=parent, padding=12, spacing=8)
         self.metrics = [m for m in METRIC_DEFS if m[0] in metrics]
@@ -445,9 +442,7 @@ class MetricsCard(Card):
             def col(x, k):
                 return list(x) if x else []
             self.series.append(
-                time.time(),
-                col(s.t_mos, n), col(s.dq, n), col(s.tau, n),
-                [] if "err" in NO_DATA_METRICS else col(s.err, n))
+                time.time(), col(s.t_mos, n), col(s.dq, n), col(s.tau, n))
         self._redraw()
 
     # ── 重绘 ──
@@ -464,9 +459,7 @@ class MetricsCard(Card):
         colors = [joint_color(i) for i in range(self.joint_count)]
 
         notice = None
-        if key in NO_DATA_METRICS:
-            notice = "本机不提供「跟踪误差」通道（不伪造数据）"
-        elif self._snap is None or not getattr(self._snap, "connected", False):
+        if self._snap is None or not getattr(self._snap, "connected", False):
             notice = "未连接 · 无实时数据" if not len(self.series) else "链路已断开（缓冲已清空）"
         elif not len(self.series):
             notice = "等待数据…"
