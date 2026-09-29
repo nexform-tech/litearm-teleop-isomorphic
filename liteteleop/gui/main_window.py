@@ -67,7 +67,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.page = TeleopPage(settings)
 
         # ── 顶栏 ──
-        self.top = TopBar("遥操控制台")
+        # ⚠ 顶栏**没有标题**（用户裁决 2026-09-29）—— 见 `shell.TopBar`
+        self.top = TopBar()
         self.btn_estop = QtWidgets.QPushButton("⛔ 急停")
         self.btn_estop.setStyleSheet(
             f"QPushButton {{ {theme.sans(12.5, 600)} color: {theme.C['danger']};"

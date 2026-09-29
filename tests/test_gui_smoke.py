@@ -213,10 +213,13 @@ def test_connect_lives_in_the_topbar_next_to_the_title(qapp):
     assert not p.arm_card.isAncestorOf(p.connect_bar), \
         "「连接」组不许出现在「机械臂遥操」卡里（两个动作要分开）"
     assert not p.left.isAncestorOf(p.connect_bar), "也不许做回左栏的卡"
-    # 顶栏里它排在标题后面（slot 就是给它的位置）
+    # ⚠ 顶栏**没有标题**了（用户裁决 2026-09-29）⇒ 「连接」组就是**第一个**元素。
+    #   判别力：谁把「遥操控制台」那种标题加回来，本用例会红。
     assert w.top.slot.indexOf(p.connect_bar) >= 0
-    assert w.top.layout().indexOf(w.top.slot) > w.top.layout().indexOf(w.top.lab_title), \
-        "「连接」组要排在「遥操控制台」标题的右侧"
+    assert not hasattr(w.top, "lab_title"), "顶栏不该再有标题"
+    first_item = w.top.layout().itemAt(0)
+    assert first_item is not None and first_item.layout() is w.top.slot, \
+        "「连接」组必须是顶栏的第一个元素"
 
     # ⚠⚠ 归属分界线：**「连接」只有 CDC 口**；角色/地址/端口是遥操配置。
     assert p.connect_bar.isAncestorOf(p.cb_port), "CDC 口属于「连接」组"

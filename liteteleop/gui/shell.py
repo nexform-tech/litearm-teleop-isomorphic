@@ -1,8 +1,11 @@
 """应用外壳 = **顶栏**。
 
 出处 `litearm-studio/src/layout/TopBar.tsx`：高 57.53px、底 `--card`（**不是**
-`--app-bg`）、下边框 1px `--border`、左右内边距 18.49px；左侧标题 16.44px/**700**；
-副标题（端口·固件串）**等宽** 12.33px `--muted-foreground`；右侧指标组 `gap-4`。
+`--app-bg`）、下边框 1px `--border`、左右内边距 18.49px；副标题（固件·端点串）
+**等宽** 12.33px `--muted-foreground`；右侧指标组 `gap-4`。
+
+⚠ **本仓的顶栏没有 studio 那个左侧标题**（「遥操控制台」）—— 用户裁决 2026-09-29
+去掉：那六个字不提供信息，窗口标题栏里已经有名字。顶栏现在从「连接」组开始。
 
 ⚠ **2026-09-29 用户裁决：左侧导航栏（`RailNav`）整条删掉** —— 「连接/遥操/日志
 三个分块没有意义，只要遥操这一个页面」。连带的清理：
@@ -35,7 +38,7 @@ class TopBar(QtWidgets.QFrame):
     出处 `TopBar.tsx:61-126`。
     """
 
-    def __init__(self, title: str = "遥操控制台", parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(TOPBAR_H)
         self.setStyleSheet(
@@ -44,13 +47,13 @@ class TopBar(QtWidgets.QFrame):
         lay.setContentsMargins(18, 0, 18, 0)
         lay.setSpacing(12)
 
-        self.lab_title = QtWidgets.QLabel(title)
-        self.lab_title.setStyleSheet(
-            f"QLabel {{ {sans(16.44, 700)} color: {C['foreground']}; }}")
-        lay.addWidget(self.lab_title)
+        # ⚠ 原来这里有个「遥操控制台」标题（studio 的 `TopBar` 左侧那个 16.44px/700 的
+        #   `text-base`）。**2026-09-29 用户裁决去掉** —— 那六个字不提供任何信息
+        #   （窗口标题栏里已经有名字了），而顶栏这一行横的量本来就紧。
+        #   ⇒ 顶栏现在**从「连接」组开始**。⛔ 别再把标题加回来；
+        #   要标识身份就改 `MainWindow.setWindowTitle`（那才是用户切窗口时看的地方）。
 
-        #: ⚠ **连接组（CDC 口 / 重新扫描 / 连接臂）插在这** ——
-        #: 用户裁决 2026-09-29：「放在『遥操控制台』这几个字的**水平右侧**」。
+        #: **连接组（CDC 口 / 重新扫描 / 连接臂）就在这**，是顶栏**第一个**元素。
         #: 由 `main_window` 调 `add_connect()` 把 `pages.TeleopPage.connect_bar` 放进来。
         self.slot = QtWidgets.QHBoxLayout()
         self.slot.setContentsMargins(0, 0, 0, 0)
