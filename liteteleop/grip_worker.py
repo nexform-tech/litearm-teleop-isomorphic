@@ -170,7 +170,7 @@ class GripSnapshot:
 class GripWorker:
     """独占夹爪的线程。生命周期：`start()` → … → `stop()`。"""
 
-    def __init__(self, role: str, gcan: str, grip_id: str = "gripA",
+    def __init__(self, gcan: str, grip_id: str = "gripA",
                  gpeer: str = "127.0.0.1", gport: int = 17448,
                  rate_hz: float = GRIP_RATE_HZ,
                  kp: Optional[float] = None, kd: Optional[float] = None,
@@ -179,8 +179,13 @@ class GripWorker:
                  gripper_factory: Optional[Callable[[str], object]] = None,
                  on_state: Optional[Callable[[GripSnapshot], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
-        if role not in (ROLE_MASTER, ROLE_SLAVE):
-            raise ValueError(f"role 必须是 {ROLE_MASTER}/{ROLE_SLAVE}，收到 {role!r}")
+        """⚠ 构造只收**连接/设备**参数（CAN 通道等）。
+
+        **角色不在构造里** —— 夹爪的角色**跟着臂走**，由
+        `set_teleop(True, role=...)` 在点「启动夹爪遥操」那一刻给。
+        （与 `ArmWorker` 同款：角色是**遥操**参数，不是连接参数。）
+        """
+        self._role: str = ""            # 空 = 角色未定（还没启过夹爪遥操）
         # ⚠ 退化的构造参数在**这里**就拒掉，不要留到线程里才崩：
         #    `rate_hz <= 0` / `watchdog_ms <= 0` 会被 SDK 的 `GripperTeleop` 拒掉
         #    （`teleop.py` 的 `__init__`）—— 但从线程里抛出来的表现是"点了按钮没反应"，
@@ -192,7 +197,6 @@ class GripWorker:
             raise ValueError(f"watchdog_ms 必须 > 0，收到 {watchdog_ms!r}")
         if not float(poll_s) > 0.0:
             raise ValueError(f"poll_s 必须 > 0，收到 {poll_s!r}")
-        self.role = role
         self.gcan = gcan
         self.grip_id = grip_id
         self.gpeer = gpeer
@@ -211,7 +215,7 @@ class GripWorker:
         self._grip = None
         self._cfg = None
         self._lock = threading.Lock()
-        self._snap = GripSnapshot(role=role, topic=self._topic)
+        self._snap = GripSnapshot(topic=self._topic)   # ⚠ 角色未定，见 self._role
         self._stop = threading.Event()
         self._want = False
         self._thread: Optional[threading.Thread] = None
@@ -250,8 +254,19 @@ class GripWorker:
                 return
             self._thread = None
 
-    def set_teleop(self, on: bool) -> None:
-        """请求启动/停止夹爪遥操。**与臂的开关是两个独立控件**（spec §2）。"""
+    def set_teleop(self, on: bool, role: Optional[str] = None) -> None:
+        """请求启动/停止夹爪遥操。**与臂的开关是两个独立控件**（spec §2）。
+
+        ⚠⚠ **角色在这里定**（不是构造时），而且必须由调用方传 ——
+        夹爪的角色**跟着臂走**，两者都在点「启动遥操」那一刻读。
+        启动时不给就**同步抛**，别让错误留到线程里变成"点了没反应"。
+        """
+        if on:
+            if role not in (ROLE_MASTER, ROLE_SLAVE):
+                raise ValueError(
+                    f"启动夹爪遥操必须给 role（{ROLE_MASTER}/{ROLE_SLAVE}），"
+                    f"收到 {role!r}")
+            self._role = role
         self._want = bool(on)
 
     def snapshot(self) -> GripSnapshot:
@@ -335,13 +350,13 @@ class GripWorker:
 
     def _start_session(self) -> dict:
         st = self._grip.teleop_start(
-            self.role, link="zenoh",
-            host=None if self.role == ROLE_MASTER else self.gpeer,
+            self._role, link="zenoh",
+            host=None if self._role == ROLE_MASTER else self.gpeer,
             port=self.gport, grip_id=self.grip_id,
             kp=self.kp, kd=self.kd, align=self.align,
             watchdog_s=self.watchdog_ms / 1000.0, rate_hz=self.rate_hz)
         self._session = True
-        if self.role == ROLE_MASTER:
+        if self._role == ROLE_MASTER:
             self._log(f"主端夹爪：零重力拖动 · 发布 {self._topic} @ 端口 {self.gport}"
                       f" · {self.rate_hz:.0f} Hz")
         else:
@@ -353,13 +368,16 @@ class GripWorker:
 
     def _update(self, st: dict, running: bool) -> None:
         """把 SDK 的状态字典翻成界面要的 `GripSnapshot`。"""
-        master = self.role == ROLE_MASTER
+        master = self._role == ROLE_MASTER
         # `teleop_status()` 在没有会话时只返回 `{"active": False, "mode": None}` ——
         # 那不是一份状态，别拿它把上一帧的读数清成 0。
         has_session = "topic" in st
         with self._lock:
             s = self._snap
             s.teleop_active = bool(self._want or running)
+            # ⚠ 角色是**遥操参数** ⇒ 没启过夹爪遥操时这里是空串（界面显示"未定"，
+            #   而不是替用户猜一个）。真源就是 `_role`。
+            s.role = self._role
             if not has_session:
                 return
             frames = int(st.get("frames", 0) or 0)

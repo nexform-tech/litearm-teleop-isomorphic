@@ -1,17 +1,38 @@
-"""主窗口：顶栏 + 常驻状态条 + 左侧导航 + 页面栈 + 底部日志（spec §8）。"""
+"""主窗口：**顶栏 + 唯一一页**（单页控制台）。
+
+⚠ 2026-09-29 用户裁决：去掉左侧导航栏、去掉页面栈 —— 「连接/遥操/日志三个分块
+没有意义，只要遥操这一个页面」。连接并进中栏的「机械臂遥操」卡，日志本来就在
+右栏，末端载荷从中栏底部那张卡进（原「设置」页）。
+
+## ⚠⚠ 重做界面时**不许弄丢**的九条（都是真机上踩出来的）
+
+1. **安全确认闸门**（`_relock`）：没勾「我已确认…」时运动按钮一律锁定；
+   断线 / 急停 / FAULT 自动重新锁定。判据取**界面正在显示的那一份快照**。
+2. **急停不走 worker 队列**（§7.4）：worker 可能正卡在收尾 `movej` 里。
+3. **急停 ≠ 停止遥操**：急停是全失能 ⇒ 臂**自由落体**。右栏那个大 STOP 接的是
+   **停止遥操**（用户裁决 2026-09-29），急停另放顶栏、小小一个。
+4. **`clicked` 在按钮状态切换之后才发出** ⇒ 必须直接发 `isChecked()`，不许加 `not`。
+5. **夹爪按钮不许初始禁用**：`GripWorker` 只能由点它创建 ⇒ 禁用即死锁。
+6. **夹爪与臂是两条独立链路**：独立信号、独立 worker、不共享对象。
+7. **`BaseException` 兜底**：夹爪 SDK 不可用时异常逃出 Qt 槽会**直接 abort 进程**。
+8. **CDC 口两条以上必须显式选**（同型号 VID:PID 相同，自动挑会挑错且不报错）。
+9. **收尾必须显式 `close()`**：zenoh 不关 ⇒ 解释器退不出去。
+"""
 from __future__ import annotations
 
+import inspect
 import sys
 import time
 
 from PyQt5 import QtCore, QtWidgets
 
-from ..arm_worker import ROLE_MASTER, ArmWorker, Snapshot
+from ..arm_worker import ROLE_MASTER, ROLE_SLAVE, ArmWorker, Snapshot, TeleopParams
 from ..grip_worker import GripSnapshot, GripWorker
 from ..settings import Settings, load_settings, save_settings
+from . import theme
 from .bridge import WorkerBridge
-from .pages import JointsPage, LinkPage, TeleopPage
-from .widgets import StatusStrip
+from .pages import TeleopPage
+from .shell import TopBar
 
 __all__ = ["MainWindow", "run"]
 
@@ -20,8 +41,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.s = settings
-        self.setWindowTitle("同构遥操 · 主/从 · zenoh 点对点")
-        self.resize(1080, 720)
+        self.setWindowTitle("LiteArm 同构遥操 · 主/从 · zenoh 点对点")
+        self.resize(1560, 980)
+        self.setStyleSheet(theme.qss())
 
         self.worker: ArmWorker | None = None
         #: ⚠ 夹爪是**另一条链路**（独立 CAN / session / 端口 / 开关，spec §2）——
@@ -33,87 +55,76 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge = WorkerBridge(self)
         self.bridge.state.connect(self._on_state)
         self.bridge.log.connect(self._log)
-        # ⚠ 夹爪快照走**另一条**信号，不与臂的 `state` 混在一起
         self.bridge.grip_state.connect(self._on_grip_state)
 
+        root = QtWidgets.QWidget()
+        root.setObjectName("AppBg")
+        rl = QtWidgets.QVBoxLayout(root)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
+
+        # ⚠ 顺序要紧：**页面先造**，因为顶栏要插它的「连接」组（见下）。
+        self.page = TeleopPage(settings)
+
         # ── 顶栏 ──
-        top = QtWidgets.QWidget()
-        tl = QtWidgets.QHBoxLayout(top)
-        tl.setContentsMargins(8, 6, 8, 6)
-        self.lab_role = QtWidgets.QLabel("角色: —")
-        self.lab_link = QtWidgets.QLabel("● 未连接")
-        self.chk_ok = QtWidgets.QCheckBox("☑ 我已确认机械臂周围无障碍、急停可及")
-        self.chk_ok.setChecked(False)
-        self.chk_ok.toggled.connect(self._relock)
+        # ⚠ 顶栏**没有标题**（用户裁决 2026-09-29）—— 见 `shell.TopBar`
+        self.top = TopBar()
         self.btn_estop = QtWidgets.QPushButton("⛔ 急停")
-        self.btn_estop.setStyleSheet("background:#b02020; color:white; font-weight:bold;")
+        self.btn_estop.setStyleSheet(
+            f"QPushButton {{ {theme.sans(12.5, 600)} color: {theme.C['danger']};"
+            f" background: {theme.C['danger_soft']};"
+            f" border: 1px solid {theme.C['danger_line']};"
+            f" border-radius: {theme.RADIUS['md']}px; padding: 5px 12px; }}"
+            f"QPushButton:hover {{ background: {theme.C['danger_line']}; }}"
+            f"QPushButton:disabled {{ color: {theme.C['ink_ghost']};"
+            f" background: {theme.C['line_soft']}; border-color: {theme.C['line']}; }}")
         self.btn_estop.setToolTip(
             "⚠ 急停 = 全失能 ⇒ 臂**自由落体**。\n"
-            "要「稳住」请用「停止遥操」（受控接管 movej）—— 那是两件事。")
+            "要「稳住」请用右侧的大 STOP（停止遥操 → 受控接管 movej）—— 那是两件事。")
         self.btn_estop.clicked.connect(self._estop)
-        for w in (self.lab_role, self.lab_link, self.chk_ok):
-            tl.addWidget(w)
-        tl.addStretch(1)
-        tl.addWidget(self.btn_estop)
-        self.addToolBar(self._toolbarise(top))
+        self.top.layout().addWidget(self.btn_estop)
 
-        # ── 状态条 ──
-        self.strip = StatusStrip()
+        # ⚠ 「连接」组插到标题的**水平右侧**（用户裁决 2026-09-29）——
+        #   控件与信号都在 `TeleopPage` 那边（`connect_clicked` 等），这里只是
+        #   **把它挂到顶栏上**：一个控制台只有一条命令入口，没必要为它另起一层。
+        self.top.add_connect(self.page.connect_bar)
+        rl.addWidget(self.top)
 
-        # ── 导航 + 页面栈 ──
-        self.stack = QtWidgets.QStackedWidget()
-        self.page_link = LinkPage(settings)
-        self.page_joints = JointsPage()
-        self.page_teleop = TeleopPage(settings)
-        for p in (self.page_link, self.page_joints, self.page_teleop):
-            self.stack.addWidget(p)
-        nav = QtWidgets.QListWidget()
-        for name in ("链路", "关节", "遥操"):
-            nav.addItem(name)
-        nav.setFixedWidth(110)
-        nav.currentRowChanged.connect(self.stack.setCurrentIndex)
-        nav.setCurrentRow(0)
+        rl.addWidget(self.page, 1)
+        self.setCentralWidget(root)
 
-        mid = QtWidgets.QWidget()
-        ml = QtWidgets.QHBoxLayout(mid)
-        ml.setContentsMargins(0, 0, 0, 0)
-        ml.addWidget(nav)
-        ml.addWidget(self.stack, 1)
+        #: 关节表就在左栏里。单独挂一个名字出来，是因为
+        #: 「`err != 1` 才高亮」有专门的回归测试钉着。
+        self.joints_table = self.page.joints
+        self.chk_ok = self.page.chk_ok
+        #: 右栏那个「节点日志」。`self.log` 保持这个名字（回归测试都对着它写）。
+        self.log = self.page.log
 
-        # ── 日志面板（常驻）──
-        self.log = QtWidgets.QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(500)
-        self.log.setFixedHeight(150)
-
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        splitter.addWidget(mid)
-        splitter.addWidget(self.log)
-
-        central = QtWidgets.QWidget()
-        cl = QtWidgets.QVBoxLayout(central)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.addWidget(self.strip)
-        cl.addWidget(splitter, 1)
-        self.setCentralWidget(central)
+        # 夹爪 SDK 侧的只读默认值（本版没接线，但别显示 `—`）
+        self._show_grip_defaults()
 
         # ── 接线 ──
-        self.page_link.connect_clicked.connect(self._connect)
-        self.page_link.teleop_toggled.connect(self._toggle_teleop)
-        self.page_link.settings_changed.connect(self._save)
-        self.page_teleop.payload_applied.connect(self._apply_payload)
-        self.page_teleop.grip_toggled.connect(self._toggle_grip)
-        self.page_teleop.grip_settings_changed.connect(self._save_grip)
+        self.page.connect_clicked.connect(self._connect)
+        self.page.disconnect_clicked.connect(self._disconnect)
+        self.page.settings_changed.connect(self._save)
+        self.page.teleop_toggled.connect(self._toggle_teleop)
+        self.page.grip_toggled.connect(self._toggle_grip)
+        self.page.grip_settings_changed.connect(self._save_grip)
+        self.page.payload_applied.connect(self._apply_payload)
+        self.page.arm_action.connect(self._arm_action)
 
         self._relock()
         self._log("就绪。⚠ 一个 CDC 口只允许一个进程。")
 
-    @staticmethod
-    def _toolbarise(w: QtWidgets.QWidget) -> QtWidgets.QToolBar:
-        tb = QtWidgets.QToolBar()
-        tb.setMovable(False)
-        tb.addWidget(w)
-        return tb
+    def _show_grip_defaults(self) -> None:
+        """把 `GripWorker` 的构造默认值显示到夹爪卡的只读格子里（**只是显示**）。"""
+        from ..grip_worker import GRIP_RATE_HZ, GRIP_WATCHDOG_MS
+        sig = inspect.signature(GripWorker.__init__)
+        self.page.set_grip_defaults(
+            GRIP_RATE_HZ, sig.parameters["kp"].default, sig.parameters["kd"].default)
+        self.page.ro_watchdog.setToolTip(
+            f"`arm_worker.WATCHDOG_MS`（常量）　夹爪侧的 watchdog 默认 "
+            f"{GRIP_WATCHDOG_MS:g} ms —— 本版没接到界面上")
 
     # ────────────────────────── 安全闸门（§7.2）──────────────────────────
     def _relock(self, *_a) -> None:
@@ -125,8 +136,27 @@ class MainWindow(QtWidgets.QMainWindow):
         snap = self._last
         bad = bool(snap and (snap.faulted or snap.joint_fault or snap.error))
         armed = self.chk_ok.isChecked() and not bad
-        self.page_link.btn_connect.setEnabled(self.worker is None)
-        self.page_link.btn_teleop.setEnabled(armed and bool(snap and snap.connected))
+        connected = bool(snap and snap.connected)
+        live = bool(snap and snap.teleop_active)
+        self.page.btn_teleop.setEnabled(armed and connected)
+        # ⚠ 大 STOP **不锁**：链路挂了也必须留一条"停"的退路
+        #   （夹爪按钮那条死锁是同一个道理）。断开时点它是个无害的 no-op。
+        self.btn_estop.setEnabled(self.worker is not None)
+
+        # ── 臂维护四键，**门控分两档**（见 `pages._build_arm_card`）──
+        # ⚠⚠ 运动类（使能/回零）要勾安全确认：它们会让臂动。
+        # ⚠⚠ 状态类（清错/复位）**绝不要**那个勾选 —— 臂出故障时 `_relock` 会把
+        #   确认框自动摘掉，而那一刻**正是**要按"清错→复位"的时候。
+        #   绑上勾选就等于"最需要它的时候它不可用"。
+        # 遥操跑着的时候四键一律禁用：它们会和伺服环抢臂。
+        # ⚠ 「连接臂 / 断开」按 **worker 是否还在** 驱动（不是按快照的 connected）：
+        #   断开之后快照要等我们自己复位，中间会有一瞬"快照说已连接、worker 已没了"。
+        self.page.btn_connect.setEnabled(self.worker is None)
+        self.page.btn_disconnect.setEnabled(self.worker is not None)
+        self.page.btn_enable.setEnabled(armed and connected and not live)
+        self.page.btn_home.setEnabled(armed and connected and not live)
+        self.page.btn_clear.setEnabled(connected and not live)
+        self.page.btn_reset.setEnabled(connected and not live)
         if bad:
             self.chk_ok.setChecked(False)
 
@@ -136,23 +166,89 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect(self) -> None:
         if self.worker is not None:
-            self._log("已经连接（先关闭窗口再改角色）")
+            self._log("已经连接（先点顶栏的「断开」）")
             return
-        self.s.role = self.page_link.role()
         self._save()
+        # ⚠⚠ 连接**只吃连接参数**（CDC 口）。角色 / arm_id / peer / 端口都是
+        #     **遥操**参数，在点「启动遥操」时才读 —— 见 `TeleopParams`。
+        #     与 litearm-server 同形（它的 transport 启动时就建好、**不按 mode 分叉**）。
         self.worker = ArmWorker(
-            role=self.s.role, port=self.s.cdc_port or None, arm_id=self.s.arm_id,
-            peer=self.s.peer, jport=self.s.jport,
+            port=self.s.cdc_port or None,
             on_state=self.bridge.on_state, on_log=self.bridge.on_log)
         self.worker.start()
-        self.lab_role.setText(f"角色: {'主臂' if self.s.role == ROLE_MASTER else '从臂'}")
-        self._log(f"正在连接（角色={self.s.role}）…")
+        self._log("正在连接臂（角色在点「启动遥操」时才定）…")
+
+    def _disconnect(self) -> None:
+        """断开：停遥操 → 受控接管 movej → 关 zenoh → 关臂（**不失能**）。
+
+        ⚠ 收尾顺序与关窗**完全同路**（都走 `ArmWorker.shutdown` → `_teardown`）⇒
+        断开后臂保持**使能并停在当前位置**，不是自由落体。
+        ⚠⚠ **收尾没跑完就不许解除连接**：超时那次 join 只是"没等到"，线程仍占着
+        **CDC 口与 zenoh 端口**，这时再连一个新的会让两者抢同一份资源。
+        所以这里跟夹爪那条错误恢复同一个套路：报告 + 让用户再点一次。
+        """
+        w = self.worker
+        if w is None:
+            return
+        self._log("正在断开：停遥操 → 受控接管 movej → 关 zenoh → 关臂（**不失能**）…")
+        # ⚠ 用短超时：收尾是 `movej(实测位姿)`，到位即返回，正常是毫秒级；
+        #   别让 Qt 主线程为了一个理论上限卡 8 s（与关窗那条同款取舍）。
+        w.shutdown(timeout=3.0)
+        if w.is_alive():
+            self._log("⚠ 收尾尚未完成（线程还占着 CDC 口与 zenoh 端口）—— "
+                      "暂不解除连接；请稍后再点一次「断开」")
+            return
+        self.worker = None
+        # ⚠ 必须把界面那份快照也复位：`_teardown` 只改 worker 自己那份、不会推给界面，
+        #   留着旧的"已连接"会让 `_relock` 继续按已连接判定、字段也不解锁。
+        self._last = Snapshot()          # ⚠ 角色未定（还没启遥操）
+        self.page.apply(self._last, self.s.peer, self.s.jport, self.s.arm_id)
+        self.top.update_from(self._last)
+        self.top.set_connection(False, "未连接")
+        self.top.set_detail("—")
+        self.page.log_badge.set_state("未连接", "outline")
+        self._relock()
+        self._log("✓ 已断开（臂保持使能与当前位置）")
 
     def _toggle_teleop(self, on: bool) -> None:
         if self.worker is None:
             return
-        self._log("启动遥操" if on else "停止遥操（受控接管 movej）")
-        self.worker.set_teleop(on)
+        if not on:
+            self._log("停止遥操（受控接管 movej）")
+            self.worker.set_teleop(False)
+            return
+        # ⚠⚠ **角色/arm_id/peer/端口在这一刻读**，不是连接时 —— 见 `TeleopParams`。
+        #    所以连上之后这四个控件仍然可以改，改了**下次启动生效**
+        #    （界面按 `teleop_active` 锁，不是按 `connected`）。
+        params = TeleopParams(role=self.page.role(), arm_id=self.s.arm_id,
+                              peer=self.s.peer, jport=self.s.jport)
+        self._log(f"启动遥操（角色={'主臂' if params.role == ROLE_MASTER else '从臂'}"
+                  f" · {params.key} · 端口 {params.jport}）")
+        self.worker.set_teleop(True, params)
+
+    def _arm_action(self, what: str) -> None:
+        """臂维护动作（使能/清错/复位/回零）—— 排到 worker 线程上执行。
+
+        ⚠ 这里**不做 SDK 调用**，只投递（spec §3.1）；日志与出错处理在 worker 里。
+        """
+        if self.worker is None:
+            self._log("⚠ 未连接，臂操作未执行")
+            return
+        table = {
+            "enable": (self.worker.enable_arm, "使能"),
+            "clear": (self.worker.clear_faults, "清错"),
+            "reset": (self.worker.reset_arm, "复位"),
+            "home": (self.worker.go_home, "回零"),
+        }
+        hit = table.get(what)
+        if hit is None:                                  # 理论不可达（信号值写死）
+            self._log(f"⚠ 未知的臂操作 {what!r}")
+            return
+        fn, name = hit
+        if what == "home":
+            # ⚠ 回零是**会动臂**的，且 worker 会在里面阻塞到到位/超时 ⇒ 必须让用户看见
+            self._log("⚠ 回零：臂将移动到 URDF 零位（固件低安全速度 0.10）…")
+        fn()
 
     def _apply_payload(self, mass, com) -> None:
         if self.worker is None:
@@ -163,7 +259,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ────────────────────────── 夹爪遥操（独立链路，§2）──────────────────────────
     def _save_grip(self) -> None:
-        v = self.page_teleop.gripper_values()
+        v = self.page.gripper_values()
         self.s.gcan = v["gcan"]
         self.s.gpeer = v["gpeer"]
         self.s.gport = v["gport"]
@@ -180,7 +276,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return self.grip
             # ⚠ 线程已经收尾完了 ⇒ 丢掉重建（否则会一直把一个死 worker 当活的用）
             self.grip = None
-        v = self.page_teleop.gripper_values()
+        v = self.page.gripper_values()
         if not v["gcan"]:
             self._log("⚠ 未填夹爪 CAN 通道 —— 夹爪遥操未启用")
             return None
@@ -204,7 +300,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("   （夹爪遥操已停用；臂遥操不受影响）")
             return None
         self.grip = GripWorker(
-            role=self.page_link.role(), gcan=v["gcan"], grip_id=v["grip_id"],
+            gcan=v["gcan"], grip_id=v["grip_id"],
             gpeer=v["gpeer"], gport=v["gport"], align=v["align"],
             on_state=self.bridge.grip_state.emit, on_log=self.bridge.on_log)
         self.grip.start()
@@ -218,14 +314,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         w = self._ensure_grip_worker()
         if w is None:
-            self.page_teleop.btn_grip.setChecked(False)
+            self.page.btn_grip.setChecked(False)
             return
-        self._log("启动夹爪遥操")
-        w.set_teleop(True)
+        # ⚠ 夹爪的角色**跟着臂走** ⇒ 也在这一刻读（不是连接时、也不是建 worker 时）
+        role = self.page.role()
+        self._log(f"启动夹爪遥操（角色={'主臂' if role == ROLE_MASTER else '从臂'}，跟随臂）")
+        w.set_teleop(True, role)
 
     def _on_grip_state(self, g: GripSnapshot) -> None:
         # ⚠ 本槽在 **Qt 主线程**跑（信号跨线程排队），碰控件是安全的
-        self.page_teleop.apply_grip(g)
+        self.page.apply_grip(g)
         # ⚠⚠ 夹爪出错过 ⇒ 丢掉这个 worker，让下次点击能**重建**。
         #    不复位的话 `GripWorker` 已经死了、按钮又永远停用 ⇒ 只能重启应用。
         #    （`stop()` 是幂等的；此时那条线程早已在 `_teardown` 里收完尾。）
@@ -237,7 +335,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.grip.stop(timeout=2.0)
             except Exception:                        # noqa: BLE001
                 pass
-            self.page_teleop.btn_grip.setChecked(False)
+            self.page.btn_grip.setChecked(False)
             if self.grip.is_alive():
                 # ⚠⚠ 线程还活着 ⇒ 它仍占着 **zenoh 端口**与 **CAN**。
                 #    这时候再建一个 worker 会让两条线程抢同一份资源
@@ -274,11 +372,29 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_state(self, snap: Snapshot) -> None:
         # ⚠ 本槽在 **Qt 主线程**跑（信号跨线程排队），碰控件是安全的
         self._last = snap
-        self.strip.update_from(snap)
-        self.page_joints.apply(snap)
-        self.page_teleop.apply(snap)
-        self.page_link.apply(snap)
-        self.lab_link.setText("● 已连接" if snap.connected else "● 未连接")
+        self.page.apply(snap, self.s.peer, self.s.jport, self.s.arm_id)
+        self.top.update_from(snap)
+        # ⚠ 连接状态全部归顶栏：**胶囊**（状态）+ **详情串**（固件/端点，或错误文本）。
+        #   出错时胶囊走 `bad`、详情串转红 —— 错误不许只躺在日志里。
+        if snap.error:
+            self.top.set_connection(False, "出错", kind="bad")
+            self.top.set_detail(f"⛔ {snap.error}", role="danger")
+        else:
+            master = snap.role == ROLE_MASTER
+            self.top.set_connection(snap.connected,
+                                    "已连接" if snap.connected else "未连接")
+            # ⚠ 角色**未定**时（连上但还没启遥操）不写"监听/连接" —— 那是猜的。
+            # ⚠⚠ 而且**端点只在 side 非空时才拼**：从前那句 `if snap.connected` 挂错了
+            #     对象 ⇒ 角色未定时会吐出 `"… ·  127.0.0.1:17447"`（**双空格**），
+            #     未连接时会吐出 `"… · "`（**尾部悬挂一个分隔符**）。
+            side = "监听" if master else ("连接" if snap.role == ROLE_SLAVE else "")
+            parts = [snap.firmware or ""]
+            if side and snap.connected:
+                parts.append(f"{side} {self.s.peer}:{self.s.jport}")
+            self.top.set_detail(" · ".join(p for p in parts if p) or "—")
+        self.page.log_badge.set_state(
+            "已连接" if snap.connected else "未连接",
+            "ok" if snap.connected else "outline")
         self._relock()
 
     def _log(self, text: str) -> None:
