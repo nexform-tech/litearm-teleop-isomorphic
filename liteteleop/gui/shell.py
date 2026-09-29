@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtCore, QtWidgets
 
 from .cards import MetricTile, StatusPill
 from .theme import C, mono, sans
@@ -49,15 +49,25 @@ class TopBar(QtWidgets.QFrame):
             f"QLabel {{ {sans(16.44, 700)} color: {C['foreground']}; }}")
         lay.addWidget(self.lab_title)
 
+        #: ⚠ **连接组（CDC 口 / 重新扫描 / 连接臂）插在这** ——
+        #: 用户裁决 2026-09-29：「放在『遥操控制台』这几个字的**水平右侧**」。
+        #: 由 `main_window` 调 `add_connect()` 把 `pages.TeleopPage.connect_bar` 放进来。
+        self.slot = QtWidgets.QHBoxLayout()
+        self.slot.setContentsMargins(0, 0, 0, 0)
+        self.slot.setSpacing(8)
+        lay.addLayout(self.slot)
+
         self.pill = StatusPill("未连接")
         lay.addWidget(self.pill)
 
-        # 副标题：**CDC 口 · 固件**（等宽，照 studio 把"端口·固件串"放这儿的做法）。
-        # ⚠ 别再放一次 peer:jport —— 那跟左边状态胶囊里的端点重复。
-        self.lab_endpoint = QtWidgets.QLabel("—")
-        self.lab_endpoint.setStyleSheet(
+        # 详情串（等宽）：固件 / 端点，出错时是错误文本。
+        # ⚠ 它**可被压缩**（`setMinimumWidth(0)` + 省略号），是这一行里最先让步的那个；
+        #   右边那四个指标和急停是固定宽度。
+        self.lab_detail = QtWidgets.QLabel("—")
+        self.lab_detail.setMinimumWidth(0)
+        self.lab_detail.setStyleSheet(
             f"QLabel {{ {mono(12.33)} color: {C['muted_foreground']}; }}")
-        lay.addWidget(self.lab_endpoint)
+        lay.addWidget(self.lab_detail, 0)
 
         lay.addStretch(1)
 
@@ -68,12 +78,25 @@ class TopBar(QtWidgets.QFrame):
             lay.addWidget(t)
             self.tiles[key] = t
 
-    # ── 刷新 ──
-    def set_connection(self, connected: bool, text: str) -> None:
-        self.pill.set_state(text, "ok" if connected else "idle")
+    # ── 装配 ──
+    def add_connect(self, w: QtWidgets.QWidget) -> None:
+        """把「连接」组插到标题的**水平右侧**（用户裁决 2026-09-29）。"""
+        self.slot.addWidget(w)
 
-    def set_endpoint(self, text: str) -> None:
-        self.lab_endpoint.setText(text or "—")
+    # ── 刷新 ──
+    def set_connection(self, connected: bool, text: str, kind: str = "") -> None:
+        """`kind` 显式给 `bad` 时会显示成错误态（出错时用）。"""
+        self.pill.set_state(text, kind or ("ok" if connected else "idle"))
+
+    def set_detail(self, text: str, role: str = "hintSubtle") -> None:
+        """详情串（固件/端点，或错误文本）。太长就省略 —— 见 `lab_detail` 的注释。"""
+        fm = self.lab_detail.fontMetrics()
+        self.lab_detail.setText(
+            fm.elidedText(text or "—", QtCore.Qt.ElideRight, max(120, self.lab_detail.width())))
+        self.lab_detail.setToolTip(text or "")
+        color = {"danger": C["danger"], "ok": C["ok"]}.get(role, C["muted_foreground"])
+        self.lab_detail.setStyleSheet(
+            f"QLabel {{ {mono(12.33)} color: {color}; }}")
 
     def update_from(self, s) -> None:
         """从快照刷新右侧四个指标。⚠ 没数据一律 `—`，**不写 0**。"""

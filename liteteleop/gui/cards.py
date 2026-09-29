@@ -175,6 +175,9 @@ class StatusPill(QtWidgets.QFrame):
         self.lab.setStyleSheet(f"QLabel {{ {sans(12.84, 600)} color: {C['ink_muted']}; }}")
         lay.addWidget(self.dot)
         lay.addWidget(self.lab)
+        # ⚠ 钉死高度：放进 58px 的顶栏后，布局会把它**纵向拉伸**成一整块
+        #   空荡荡的方框（离屏截图里量到 ~37px 高、比里面的字高一倍）。
+        self.setFixedHeight(27)
         self.set_state(text, "idle")
 
     def set_state(self, text: str, kind: str = "idle") -> None:

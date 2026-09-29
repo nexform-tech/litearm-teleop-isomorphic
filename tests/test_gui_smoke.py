@@ -198,41 +198,43 @@ def test_role_segmented_control_drives_role(qapp):
     w.close()
 
 
-def test_connect_and_teleop_are_separate_actions(qapp):
-    """⚠⚠ 用户裁决 2026-09-29：**连接与遥操是两个动作**，不许揉进同一张卡。
+def test_connect_lives_in_the_topbar_next_to_the_title(qapp):
+    """⚠⚠ 用户裁决 2026-09-29（第三版）：**「连接臂」在顶栏、标题的水平右侧**。
 
-    「连接」卡在**左上角**（左栏第一张），中栏只放"让臂/夹爪动起来"那两张 + 载荷。
+    它既不是左栏的卡，也不在「机械臂遥操」卡里 —— 连接（开哪个 CDC 口）与遥操
+    （让臂动起来）是两个动作，按钮并排会让人分不清哪一下会让臂动。
 
-    判别力：谁把连接那几格挪回「机械臂遥操」卡（那会让「连接臂」与「启动遥操」
-    两个按钮并排 —— 用户分不清哪一下会让臂动），本用例会红。
+    判别力：谁把它做回卡片（或挪进「机械臂遥操」卡），本用例会红。
     """
     w = MainWindow(Settings())
     p = w.page
 
-    # 左栏第一张就是「连接」
-    first = p.left.col.itemAt(0).widget()
-    assert first is p.connect_card, "「连接」必须是左栏第一张卡（左上角）"
+    assert w.top.isAncestorOf(p.connect_bar), "「连接」组必须在**顶栏**里"
+    assert not p.arm_card.isAncestorOf(p.connect_bar), \
+        "「连接」组不许出现在「机械臂遥操」卡里（两个动作要分开）"
+    assert not p.left.isAncestorOf(p.connect_bar), "也不许做回左栏的卡"
+    # 顶栏里它排在标题后面（slot 就是给它的位置）
+    assert w.top.slot.indexOf(p.connect_bar) >= 0
+    assert w.top.layout().indexOf(w.top.slot) > w.top.layout().indexOf(w.top.lab_title), \
+        "「连接」组要排在「遥操控制台」标题的右侧"
 
-    # 连接按钮与遥操按钮**不在同一张卡里**
-    assert p.connect_card.isAncestorOf(p.btn_connect), "连接臂按钮属于「连接」卡"
-    assert not p.arm_card.isAncestorOf(p.btn_connect), \
-        "连接臂按钮不许出现在「机械臂遥操」卡里（两个动作要分开）"
-    assert p.arm_card.isAncestorOf(p.btn_teleop), "启动遥操按钮属于「机械臂遥操」卡"
-    assert not p.connect_card.isAncestorOf(p.btn_teleop)
-
-    # ⚠⚠ 归属分界线：**「连接」卡只有 CDC 口**；角色/地址/端口是遥操配置。
-    #    判别力：谁把那几项当"连接参数"搬去左上角，本用例会红 ——
-    #    那等于把"开哪个口"和"两端怎么对上"两件事又混起来了。
-    assert p.connect_card.isAncestorOf(p.cb_port), "CDC 口属于「连接」卡"
-    # ⚠ 循环变量**别叫 `w`** —— 那会覆盖上面那个 `w = MainWindow(...)`，
-    #   让 MainWindow 失去最后一个 Python 引用而被回收，它的 C++ 对象连同所有子
-    #   `Card` 一起销毁，报出来的是 `RuntimeError: wrapped C/C++ object of type
-    #   Card has been deleted`（离真正的原因隔了两层，我在这上面绕过一次）。
+    # ⚠⚠ 归属分界线：**「连接」只有 CDC 口**；角色/地址/端口是遥操配置。
+    assert p.connect_bar.isAncestorOf(p.cb_port), "CDC 口属于「连接」组"
+    assert p.connect_bar.isAncestorOf(p.btn_connect), "连接臂按钮属于「连接」组"
+    assert not p.arm_card.isAncestorOf(p.btn_connect)
+    # ⚠ 循环变量**别叫 `w`** —— 那会覆盖上面那个 `w = MainWindow(...)`，让 MainWindow
+    #   失去最后一个 Python 引用而被回收，C++ 对象连同所有子 Card 一起销毁，
+    #   报出来的是 `RuntimeError: wrapped C/C++ object of type Card has been deleted`
+    #   （离真正的原因隔了两层，我在这上面绕过一次）。
     for child, name in ((p.seg_role, "角色"), (p.ed_peer, "主臂 IP"),
                         (p.sp_port, "端口"), (p.ed_arm_id, "主臂 ID")):
         assert p.arm_card.isAncestorOf(child), f"{name} 属于「机械臂遥操」卡（遥操配置）"
-        assert not p.connect_card.isAncestorOf(child), \
-            f"{name} 不是连接参数，不许搬进「连接」卡"
+        assert not p.connect_bar.isAncestorOf(child), \
+            f"{name} 不是连接参数，不许放进「连接」组"
+
+    # 左栏第一张回到「主从链路」
+    first = p.left.col.itemAt(0).widget()
+    assert first is p.link_card, "左栏第一张应当是「主从链路」"
 
     # 中栏只有三张：机械臂遥操 / 夹爪遥操 / 末端载荷
     mid = [p.mid.col.itemAt(i).widget() for i in range(3)]

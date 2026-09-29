@@ -270,7 +270,8 @@ class TeleopPage(QtWidgets.QWidget):
         self.left = ScrollColumn()
         self.left.setMinimumWidth(400)
         self.left.setMaximumWidth(470)
-        self.connect_card = self._build_connect_card()
+        # ⚠ 「连接」组**不进左栏** —— 它归顶栏（见 `_build_connect_bar`）
+        self.connect_bar = self._build_connect_bar()
         self.link_card = LinkCard()
         self.metrics = MetricsCard()
         self.joints_card = Card("关节（q / dq / tau / 温度 / err）")
@@ -280,8 +281,7 @@ class TeleopPage(QtWidgets.QWidget):
             "⚠ `err != 1` 才高亮（1 = 使能，其余 = 失能/故障）—— 温度只报数值，"
             "不另判阈值（固件的温度锁存已反映在 err 上）", "hintSubtle"))
         self.status_card = ConnectStatusCard()
-        for w in (self.connect_card, self.link_card, self.metrics,
-                  self.joints_card, self.status_card):
+        for w in (self.link_card, self.metrics, self.joints_card, self.status_card):
             self.left.add(w)
         self.left.add_stretch()
         cols.addWidget(self.left, 0)
@@ -322,48 +322,57 @@ class TeleopPage(QtWidgets.QWidget):
         rl.addWidget(self.log_card, 1)
         cols.addWidget(right, 0)
 
-    # ── 连接卡（**左上角**，只有 CDC 口）──
-    def _build_connect_card(self) -> Card:
+    # ── 连接组（**进顶栏，在标题右侧**）──
+    def _build_connect_bar(self) -> QtWidgets.QWidget:
         """「连接」= **开哪个 CDC 口**。就这一件事。
 
-        ⚠⚠ 用户裁决 2026-09-29（第二版）：这张卡**只放 CDC 口**。
-        **角色 / 主臂 IP / 端口 / 主臂 ID 不是连接的事，是"遥操怎么跑"的配置** ⇒
-        它们在「机械臂遥操」卡里（见 `_build_arm_card`）。
-        ⛔ 别再把那几项搬回来：连接是"把口打开"，遥操是"两端怎么对上"。
+        ⚠⚠ 用户裁决 2026-09-29（第三版）：它**不是左栏的卡**，而是**顶栏里的一横条**，
+        位置在「遥操控制台」标题的**水平右侧**。由 `main_window` 调
+        `TopBar.add_connect()` 插进去。
+        ⛔ 别把它做回卡片：用户要的是"最顶端、标题右边"，左栏第一张卡仍比标题低一行。
+        ⚠ 也**只放 CDC 口**。角色 / 主臂 IP / 端口 / 主臂 ID 不是连接的事，
+        是"遥操怎么跑"的配置 ⇒ 在「机械臂遥操」卡里（见 `_build_arm_card`）。
         ⚠ 但 `_connect()` **确实会读**那些值（`role()/ed_peer/sp_port/ed_arm_id`）——
           `ArmWorker` 构造时要它们 ⇒ 所以它们连上后同样锁死，见 `apply()`。
         """
-        card = Card("连接")
-        self.conn_badge = Badge("未连接", "outline")
-        card.header.addWidget(self.conn_badge)
-        card.add(hint("选一个 CDC 口连上。角色/地址在中间的「机械臂遥操」里设。",
-                      "hintSubtle"))
+        bar = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(bar)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(7)
 
-        # ── CDC 口（真输入框 + 重扫）──
+        lay.addWidget(QtWidgets.QLabel("CDC 口"))
         # ⚠ **两条以上同型号臂时必须显式选**（VID:PID 相同，自动挑会挑错且不报错）
         self.cb_port = QtWidgets.QComboBox()
+        # 顶栏高度固定 58px、横向很挤 ⇒ 这个下拉要能被压缩；
+        # 完整标签（含序列号）放 tooltip 与下拉列表里。
+        self.cb_port.setMinimumWidth(140)
+        self.cb_port.setMaximumWidth(240)
+        self.cb_port.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_port.setMinimumContentsLength(10)
+        self.cb_port.currentIndexChanged.connect(self._emit_changed)
+        lay.addWidget(self.cb_port)
+
         self.btn_rescan = QtWidgets.QPushButton("重新扫描")
         self.btn_rescan.setProperty("variant", "outline")
-        self.btn_rescan.setFixedWidth(96)
         self.btn_rescan.clicked.connect(self.rescan_ports)
-        self.cb_port.currentIndexChanged.connect(self._emit_changed)
-        card.add_row("CDC 口", self.cb_port)
-        card.add_row("", self.btn_rescan)
-        self.lab_port_note = hint("")
-        card.add(self.lab_port_note)
-
-        card.add(separator())
+        lay.addWidget(self.btn_rescan)
 
         self.btn_connect = QtWidgets.QPushButton("连接臂")
         self.btn_connect.setProperty("variant", "primaryAction")
-        self.btn_connect.setFixedWidth(120)
+        self.btn_connect.setFixedWidth(96)
         self.btn_connect.clicked.connect(self.connect_clicked.emit)  # type: ignore[arg-type]
-        card.add_row(self.btn_connect)
-        self.lab_info = hint("未连接", "hint")
-        card.add(self.lab_info)
+        lay.addWidget(self.btn_connect)
+
+        #: 端口告警：**只在需要时说话**（检测到多条 / 一条都没检测到）。
+        #: ⚠ 顶栏放不下换行的长文案 ⇒ 这里用短句，完整说明进下拉的 tooltip。
+        self.lab_port_note = QtWidgets.QLabel("")
+        self.lab_port_note.setStyleSheet(
+            f"QLabel {{ {sans(11.5)} color: {C['danger']}; }}")
+        lay.addWidget(self.lab_port_note)
 
         self.rescan_ports()
-        return card
+        return bar
 
     # ── 机械臂遥操卡（角色 + 地址 + 遥操参数）──
     def _build_arm_card(self) -> Card:
@@ -564,7 +573,12 @@ class TeleopPage(QtWidgets.QWidget):
 
     # ── 连接参数 ──
     def rescan_ports(self) -> None:
-        """重新枚举 CDC 口。**序列号才是唯一标识**，所以标签里带上它。"""
+        """重新枚举 CDC 口。**序列号才是唯一标识**，所以标签里带上它。
+
+        ⚠ 顶栏只有一行、放不下换行的长文案 ⇒ 这里用**短句**，完整说明进 tooltip。
+        ⛔ 但告警本身不许省：**两条以上同型号臂（VID:PID 相同）时必须显式选**，
+        自动挑会挑错而且不报错。
+        """
         cur = self.gs.cdc_port
         self.cb_port.blockSignals(True)
         self.cb_port.clear()
@@ -574,21 +588,23 @@ class TeleopPage(QtWidgets.QWidget):
         idx = self.cb_port.findData(cur)
         self.cb_port.setCurrentIndex(idx if idx >= 0 else 0)
         self.cb_port.blockSignals(False)
+        # 下拉被压窄了 ⇒ 每项都要能悬停看到全名
+        for i in range(self.cb_port.count()):
+            self.cb_port.setItemData(i, self.cb_port.itemText(i), QtCore.Qt.ToolTipRole)
+
         n = self.cb_port.count() - 1
         if n >= 2:
-            self.lab_port_note.setText(
-                f"⚠ 检测到 <b>{n}</b> 条臂。同型号 VID:PID 相同，"
-                "<b>必须选一个</b> —— 自动挑会挑错而且不报错。")
-            role = "danger"
+            self.lab_port_note.setText(f"⚠ {n} 条臂，必须选一个")
+            tip = (f"⚠ 检测到 {n} 条臂。同型号 VID:PID 相同，**必须选一个** —— "
+                   "自动挑会挑错而且不报错。")
         elif n == 0:
-            self.lab_port_note.setText("未检测到 STM32 CDC 口（检查 USB 与 dialout 权限）")
-            role = "danger"
+            self.lab_port_note.setText("⚠ 未检测到 CDC 口")
+            tip = "未检测到 STM32 CDC 口（检查 USB 与 dialout 权限）"
         else:
-            self.lab_port_note.setText(f"检测到 1 条臂：{self.cb_port.itemText(1)}")
-            role = "hintSubtle"
-        self.lab_port_note.setProperty("role", role)
-        self.lab_port_note.style().unpolish(self.lab_port_note)
-        self.lab_port_note.style().polish(self.lab_port_note)
+            self.lab_port_note.setText("")
+            tip = f"检测到 1 条臂：{self.cb_port.itemText(1)}"
+        self.cb_port.setToolTip(tip)
+        self.lab_port_note.setToolTip(tip)
 
     def role(self) -> str:
         return ROLE_MASTER if self.seg_role.current() == 0 else ROLE_SLAVE
@@ -648,23 +664,8 @@ class TeleopPage(QtWidgets.QWidget):
         #    那份判据只有一份真源，就在 `widgets.JointTable.update_from` 里。
         self.joints.update_from(s)
 
-        # 连接状态
-        if s.error:
-            self.lab_info.setText(f"⛔ {s.error}")
-            info_role = "danger"
-            self.conn_badge.set_state("出错", "danger")
-        elif s.connected:
-            side = "监听" if master else f"连接 {peer}"
-            self.lab_info.setText(f"✓ 已连接 · 固件 {s.firmware} · {side}:{jport}")
-            info_role = "ok"
-            self.conn_badge.set_state("已连接", "ok")
-        else:
-            self.lab_info.setText("未连接")
-            info_role = "hint"
-            self.conn_badge.set_state("未连接", "outline")
-        self.lab_info.setProperty("role", info_role)
-        self.lab_info.style().unpolish(self.lab_info)
-        self.lab_info.style().polish(self.lab_info)
+        # ⚠ 连接状态**不在这里显示** —— 它归顶栏（胶囊 + 详情串），
+        #   见 `main_window._on_state` → `TopBar.set_connection/set_detail`。
         # ⚠ 连上之后角色/地址/CDC 全部锁死 —— `ArmWorker` 构造时就把它们吃掉了
         for w in (self.seg_role, self.ed_peer, self.sp_port, self.ed_arm_id,
                   self.cb_port, self.btn_rescan):

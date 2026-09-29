@@ -63,6 +63,9 @@ class MainWindow(QtWidgets.QMainWindow):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
+        # ⚠ 顺序要紧：**页面先造**，因为顶栏要插它的「连接」组（见下）。
+        self.page = TeleopPage(settings)
+
         # ── 顶栏 ──
         self.top = TopBar("遥操控制台")
         self.btn_estop = QtWidgets.QPushButton("⛔ 急停")
@@ -79,10 +82,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "要「稳住」请用右侧的大 STOP（停止遥操 → 受控接管 movej）—— 那是两件事。")
         self.btn_estop.clicked.connect(self._estop)
         self.top.layout().addWidget(self.btn_estop)
+
+        # ⚠ 「连接」组插到标题的**水平右侧**（用户裁决 2026-09-29）——
+        #   控件与信号都在 `TeleopPage` 那边（`connect_clicked` 等），这里只是
+        #   **把它挂到顶栏上**：一个控制台只有一条命令入口，没必要为它另起一层。
+        self.top.add_connect(self.page.connect_bar)
         rl.addWidget(self.top)
 
-        # ── 唯一一页 ──
-        self.page = TeleopPage(settings)
         rl.addWidget(self.page, 1)
         self.setCentralWidget(root)
 
@@ -279,13 +285,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last = snap
         self.page.apply(snap, self.s.peer, self.s.jport, self.s.arm_id)
         self.top.update_from(snap)
-        self.top.set_connection(
-            snap.connected,
-            ("已连接" if snap.connected else "未连接")
-            + f" · {self.s.peer}:{self.s.jport}")
-        self.top.set_endpoint(
-            " · ".join(x for x in (self.s.cdc_port or "自动选口",
-                                   snap.firmware) if x))
+        # ⚠ 连接状态全部归顶栏：**胶囊**（状态）+ **详情串**（固件/端点，或错误文本）。
+        #   出错时胶囊走 `bad`、详情串转红 —— 错误不许只躺在日志里。
+        if snap.error:
+            self.top.set_connection(False, "出错", kind="bad")
+            self.top.set_detail(f"⛔ {snap.error}", role="danger")
+        else:
+            master = (snap.role or "master") == "master"
+            self.top.set_connection(snap.connected,
+                                    "已连接" if snap.connected else "未连接")
+            side = "监听" if master else "连接"
+            self.top.set_detail(" · ".join(x for x in (
+                snap.firmware or "",
+                f"{side} {self.s.peer}:{self.s.jport}" if snap.connected else "")) or "—")
         self.page.log_badge.set_state(
             "已连接" if snap.connected else "未连接",
             "ok" if snap.connected else "outline")
