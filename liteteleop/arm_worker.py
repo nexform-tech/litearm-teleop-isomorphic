@@ -37,7 +37,8 @@ from .wire import N_JOINTS
 
 log = logging.getLogger("liteteleop.worker")
 
-__all__ = ["StateHookMissing", "Snapshot", "ArmWorker", "ROLE_MASTER", "ROLE_SLAVE"]
+__all__ = ["StateHookMissing", "Snapshot", "TeleopParams", "ArmWorker",
+           "ROLE_MASTER", "ROLE_SLAVE"]
 
 ROLE_MASTER = "master"
 ROLE_SLAVE = "slave"
@@ -59,6 +60,46 @@ ALIGN_MOVE_TIMEOUT = 30.0
 
 #: 从臂 watchdog（照搬 `TeleopManager.watchdog_ms` 默认值）。**收到首帧之后才生效。**
 WATCHDOG_MS = 200.0
+
+
+@dataclass(frozen=True)
+class TeleopParams:
+    """**遥操参数** —— 在点「启动遥操」的那一刻读取，**不是**连接时。
+
+    ⚠⚠ 为什么不是连接时：一个 CDC 口连上之后，"这台机是主臂还是从臂"、
+    "话题用哪个 arm_id"、"监听/连哪个端口"、"主臂在哪台机" 全都还没定 ——
+    它们是**遥操**的属性，不是**连接**的属性。连接只做「打开串口 + 使能 + 持位」。
+
+    与 `litearm-server` 同形：它的 transport 在启动时建好、**不按 mode 分叉**
+    （`__main__.py:175` 的注释「始终 router/listen，不再按 teleop_mode 分叉建
+    peer session」），角色是 `TeleopController.enter(mode, ...)` 的**参数**。
+
+    ⚠ 四个字段里没有一个属于"连接" ⇒ 界面**不该**在连上后把它们锁死
+    （那是旧设计「构造时定死」逼出来的补丁）。改成按 `teleop_active` 锁。
+    """
+
+    #: ⚠⚠ **必填、没有默认值** —— "不给就默认主臂"正是那种会造成事故的静默默认值
+    #: （把不该软的臂送进零重力）。调用方必须显式说明这台机是主还是从。
+    role: str
+    arm_id: str = link.DEFAULT_ARM_ID
+    peer: str = ""
+    jport: int = 0
+
+    def __post_init__(self) -> None:
+        if self.role not in (ROLE_MASTER, ROLE_SLAVE):
+            raise ValueError(f"role 必须是 {ROLE_MASTER}/{ROLE_SLAVE}，收到 {self.role!r}")
+
+    @property
+    def key(self) -> str:
+        """遥操 zenoh topic —— 由 `arm_id` 派生。"""
+        return wire.teleop_topic(self.arm_id)
+
+    @property
+    def topic(self) -> str:                                  # noqa: D401 - 见上
+        return self.key
+
+    def peer_host(self) -> str:
+        return (self.peer or "").strip() or "127.0.0.1"
 
 
 class StateHookMissing(RuntimeError):
@@ -113,7 +154,12 @@ class Snapshot:
     flags: int = 0
     flag_names: List[str] = field(default_factory=list)
     seq: int = 0
+    #: 电机**状态帧**速率（Hz）—— 顶栏「控制频率」。⚠ 1 s 窗口的实测值，无数据为 0
     state_hz: float = 0.0
+    #: **遥操链路**帧率（Hz）—— 主臂=发布、从臂=接收。主从链路卡那格。
+    #: ⚠ 与 `state_hz` **不是一回事**：那个量的是 CDC 上的电机状态帧，
+    #: 这个量的是 zenoh 上我们自己的遥操帧。停遥操后归 0（界面显示 `—`）。
+    link_hz: float = 0.0
     # 遥操
     teleop_active: bool = False
     frames_sent: int = 0
@@ -131,32 +177,30 @@ class Snapshot:
 class ArmWorker:
     """独占 `Arm` 的线程。生命周期：`start()` → … → `shutdown()`。"""
 
-    def __init__(self, role: str, port: Optional[str] = None,
-                 arm_id: str = link.DEFAULT_ARM_ID,
-                 peer: Optional[str] = None, jport: int = 0,
+    def __init__(self, port: Optional[str] = None,
                  on_state: Optional[Callable[[Snapshot], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None,
                  move_timeout: float = ALIGN_MOVE_TIMEOUT):
-        if role not in (ROLE_MASTER, ROLE_SLAVE):
-            raise ValueError(f"role 必须是 {ROLE_MASTER}/{ROLE_SLAVE}，收到 {role!r}")
-        self.role = role
+        """⚠ 构造只收**连接**参数（CDC 口）。
+
+        角色 / arm_id / peer / jport 都是**遥操**参数，走
+        `set_teleop(True, TeleopParams(...))` —— 见 `TeleopParams` 的说明。
+        """
         self.port = port
-        self.arm_id = arm_id
-        self.key = wire.teleop_topic(arm_id)
-        self.peer = peer
-        self.jport = int(jport or 0)
         self.move_timeout = float(move_timeout)
         self._on_state = on_state
         self._on_log = on_log
 
         self._arm = None
-        self._pub = None            # master: link.Listener
-        self._sub = None            # slave: link.Connector
+        self._pub = None            # master: link.Listener（**常驻**，见 _ensure_pub）
+        self._pub_meta = None       # 那个常驻端点是用哪组遥操参数建的
+        self._sub = None            # slave: link.Connector（**每会话**建/关）
         self._slot = link.LatestSlot()
         self._limits = None
+        self._params: Optional[TeleopParams] = None
 
         self._lock = threading.Lock()
-        self._snap = Snapshot(role=role)
+        self._snap = Snapshot()
         self._cmds: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self._stop = threading.Event()
         self._teleop_want = False
@@ -166,6 +210,13 @@ class ArmWorker:
         self._watchdog_trips = 0
         self._estop_outcome: Optional[tuple] = None
         self._payload_t = 0.0
+        # 速率统计（1 s 窗口）：状态帧 / 遥操链路各一组。见 _state_tick / _link_tick
+        self._state_n = 0
+        self._state_t0 = 0.0
+        self._state_hz = 0.0
+        self._link_n = 0
+        self._link_t0 = 0.0
+        self._link_hz = 0.0
 
     # ────────────────────────── 生命周期 ──────────────────────────
     def start(self) -> None:
@@ -197,10 +248,26 @@ class ArmWorker:
         """把一件事排到 worker 线程上执行。"""
         self._cmds.put(fn)
 
-    def set_teleop(self, on: bool) -> None:
-        """请求启动/停止遥操（异步）。"""
+    def set_teleop(self, on: bool, params: Optional[TeleopParams] = None) -> None:
+        """请求启动/停止遥操（异步）。
+
+        ⚠⚠ **角色（以及 arm_id / peer / 端口）在这里定**，不是构造时 ——
+        见 `TeleopParams`。启动时必须给 `params`（**同步**抛，别让错误留到线程里）；
+        停止时可以不给，沿用上一次那组。
+        """
+        if on and params is None:
+            raise ValueError(
+                "启动遥操必须给 params —— 角色/arm_id/peer/端口都是**遥操**参数，"
+                "连接时还不知道（见 TeleopParams）")
+
         def _do() -> None:
+            if on and params is not None:
+                self._params = params
             self._teleop_want = bool(on)
+
+        # ⚠ `_do` 在 **worker 线程**上执行（`_drain`），而 `_run_teleop` 也在那条
+        #    线程上读 `_params` ⇒ 没有竞态。且这里**先赋值 params 再置 want**，
+        #    顺序上也不会出现"want 已真、params 还是旧的"。
         self.post(_do)
 
     def set_payload(self, mass: float, com) -> None:
@@ -324,7 +391,12 @@ class ArmWorker:
             s.watchdog_trips = self._watchdog_trips
             if self._pub is not None:
                 s.matching = self._pub.matching
-            if self.role == ROLE_SLAVE:
+            # ⚠ 角色是**遥操参数** ⇒ 没启过遥操时快照里没有角色
+            #   （界面据此显示"未定"，而不是替用户猜一个）
+            s.role = self._params.role if self._params is not None else ""
+            s.state_hz = self._state_hz
+            s.link_hz = self._link_hz
+            if self._params is not None and self._params.role == ROLE_SLAVE:
                 s.frame_age = self._slot.peek_age(time.monotonic())
             return s
 
@@ -367,8 +439,45 @@ class ArmWorker:
             except Exception:                            # noqa: BLE001
                 log.exception("on_log 回调炸了")
 
+    def _state_tick(self) -> None:
+        """统计**电机状态帧**速率（1 s 窗口）。只被 SDK 读线程调用。
+
+        ⚠⚠ `Snapshot.state_hz` 从前**只声明、全仓无人赋值** ⇒ 恒为 0 ⇒
+        顶栏「控制频率」与主从链路卡那个 Hz 格子**永远显示 `—`** ——
+        用户 2026-09-29 报的就是这个。
+        """
+        self._state_n += 1
+        now = time.monotonic()
+        if self._state_t0 == 0.0:
+            self._state_t0 = now
+        elif now - self._state_t0 >= 1.0:
+            self._state_hz = self._state_n / (now - self._state_t0)
+            self._state_n, self._state_t0 = 0, now
+
+    def _link_tick(self) -> None:
+        """统计**遥操链路**速率（1 s 窗口）：主臂=发布、从臂=接收。
+
+        ⚠ 与 `_state_tick` **不是同一个量**：那个量 CDC 上的电机状态帧，
+        这个量 zenoh 上我们自己的遥操帧。主从链路卡那格标签是「发布/接收」，
+        用的该是这一个。
+        """
+        self._link_n += 1
+        now = time.monotonic()
+        if self._link_t0 == 0.0:
+            self._link_t0 = now
+        elif now - self._link_t0 >= 1.0:
+            self._link_hz = self._link_n / (now - self._link_t0)
+            self._link_n, self._link_t0 = 0, now
+
+    def _link_reset(self) -> None:
+        """清链路速率（会话开始/结束时调）—— 停了就该显示 `—`，不留上一个会话的数。"""
+        self._link_n = 0
+        self._link_t0 = 0.0
+        self._link_hz = 0.0
+
     def _push(self, st) -> None:
         """在 **SDK 读线程**上被调用 ⇒ 只写槽，不做别的。"""
+        self._state_tick()
         with self._lock:
             s = self._snap
             s.q = list(st.q)
@@ -453,13 +562,8 @@ class ArmWorker:
                 servo.hold_at_current(self._arm)         # ⛔ 绝不 disable
             except Exception as e:                       # noqa: BLE001
                 self._log(f"⚠ 收尾 movej 失败: {e}")
-        for ep in (self._pub, self._sub):
-            if ep is not None:
-                try:
-                    ep.close()                           # ⛔ 不 close ⇒ 进程永久挂死
-                except Exception:                        # noqa: BLE001
-                    log.exception("close zenoh 端点失败")
-        self._pub = self._sub = None
+        self._close_sub()
+        self._close_pub()                                # ⛔ 不 close ⇒ 进程永久挂死
         if self._arm is not None:
             try:
                 self._arm.close()                        # ⛔ 同上
@@ -468,30 +572,91 @@ class ArmWorker:
         with self._lock:
             self._snap.connected = False
 
+    # ────────────────────────── zenoh 端点 ──────────────────────────
+
+    def _ensure_pub(self, p: TeleopParams):
+        """主臂的发布端：**建一次、活一个进程**（跨遥操会话不重建）。
+
+        ⚠⚠ 实测过两个坑，都出在"每轮遥操拆了重建"上：
+        ① 遥操停下时没人关 ⇒ TCP 端口一直被这个对象引用着 ⇒ 第二次「启动」抛
+           `Can not create a new TCP listener bound to ...: Address already in use`，
+           **而且端口要等进程退出才回来**（表现：**只能启动一次**）；
+        ② 就算补上关闭，**同一端口上拆了重建**会让订阅↔发布的匹配**间歇性**
+           建立不起来（实测 12 轮里 5 轮 `matching=False`）。
+        参考实现也是这个形态：主臂发在**常驻** transport 上。
+
+        ⚠ 但 `arm_id` / 端口是**遥操参数**（用户随时可改）⇒ 参数变了必须重建。
+        所以比 `_pub_meta` 决定复用还是重建。
+        """
+        meta = (p.key, int(p.jport))
+        if self._pub is not None and self._pub_meta == meta:
+            return self._pub
+        self._close_pub()
+        self._pub = link.Listener(p.jport, p.key)
+        self._pub_meta = meta
+        return self._pub
+
+    def _close_pub(self) -> None:
+        pub, self._pub, self._pub_meta = self._pub, None, None
+        if pub is not None:
+            try:
+                pub.close()                              # ⛔ 同上，必须关
+            except Exception:                            # noqa: BLE001
+                log.exception("close zenoh 发布端点失败")
+
+    def _open_sub(self, p: TeleopParams):
+        """从臂的订阅端：**每会话建/关**。
+
+        ⚠ 与主臂**故意不一样**（照 `litearm-server` 的形态）：**只有主臂 bind
+        端口**（`Listener` 是 listen），从臂是连出去、不 bind ⇒ 从臂建/关很廉价，
+        而主臂一关一开就要重新抢端口。别把两端做成同一种。
+        """
+        self._close_sub()
+        self._sub = link.Connector(p.peer_host(), p.jport, p.key,
+                                   on_frame=self._on_wire)
+        return self._sub
+
+    def _close_sub(self) -> None:
+        sub, self._sub = self._sub, None
+        if sub is not None:
+            try:
+                sub.close()                              # ⛔ 不 close ⇒ 进程永久挂死
+            except Exception:                            # noqa: BLE001
+                log.exception("close zenoh 订阅端点失败")
+
     # ────────────────────────── 遥操 ──────────────────────────
     def _run_teleop(self) -> None:
+        p = self._params
+        if p is None:                                    # 不该发生：set_teleop 已同步拦过
+            self._log("⛔ 没有遥操参数 —— 不启动")
+            self._teleop_want = False
+            return
         try:
-            if self.role == ROLE_MASTER:
-                self._run_master()
+            if p.role == ROLE_MASTER:
+                self._run_master(p)
             else:
-                self._run_slave()
+                self._run_slave(p)
         except Exception as e:                           # noqa: BLE001
             self._log(f"⛔ 遥操异常退出: {e}")
             with self._lock:
                 self._snap.error = str(e)
         finally:
             self._teleop_want = False
+            self._link_reset()                           # 停了就该显示 `—`，不留旧数
+            # ⚠ 从臂的订阅是**每会话**建的 ⇒ 停遥操就得关（否则连接/端口不释放）
+            self._close_sub()
             try:
                 servo.hold_at_current(self._arm)         # 受控接管
             except Exception as e:                       # noqa: BLE001
                 self._log(f"⚠ 收尾 movej 失败: {e}")
 
 
-    def _run_master(self) -> None:
+    def _run_master(self, p: TeleopParams) -> None:
         """主臂：零重力拖动 → 定频采样 → 发布（spec §6）。**主臂不做任何钳位。**"""
         arm = self._arm
-        self._pub = link.Listener(self.jport, self.key)
-        self._log(f"主臂监听 {self.key} @ 端口 {self.jport}")
+        pub = self._ensure_pub(p)                        # ⚠ 常驻，不每轮重建（见 docstring）
+        self._link_reset()                               # 新会话 ⇒ 速率从 0 起算
+        self._log(f"主臂监听 {p.key} @ 端口 {p.jport}")
         arm.zero_g_start()
         time.sleep(0.5)                                  # 等过 engage 段
         dt = 1.0 / PUB_HZ
@@ -499,8 +664,9 @@ class ArmWorker:
         while self._teleop_want and not self._stop.is_set():
             st = arm.get_state(refresh=False).value
             if st is not None:
-                self._pub.put(wire.encode_teleop(st.q, st.dq, time.monotonic()))
+                pub.put(wire.encode_teleop(st.q, st.dq, time.monotonic()))
                 self._frames_sent += 1
+                self._link_tick()                        # 统计**发布**速率
             self._drain(0.0)                             # 顺手处理 GUI 投来的命令
             r = nxt - time.monotonic()
             if r > 0:
@@ -513,13 +679,13 @@ class ArmWorker:
         except Exception as e:                           # noqa: BLE001
             self._log(f"⚠ zero_g_stop 失败: {e}")
 
-    def _run_slave(self) -> None:
+    def _run_slave(self, p: TeleopParams) -> None:
         """从臂：订阅 → 钳位 → `slew_target` → `joint_follow`（0x08）（spec §5）。"""
         arm = self._arm
         self._limits = read_safe_limits(arm)             # 读不到会抛 ⇒ 拒启动
         self._log(f"软限位 {list(zip(self._limits.lo, self._limits.hi))}")
-        self._sub = link.Connector(self._peer_host(), self.jport, self.key,
-                                   on_frame=self._on_wire)
+        self._link_reset()                               # 新会话 ⇒ 速率从 0 起算
+        self._open_sub(p)
         # ── 对齐（照搬 `_do_align`）：等首帧 → 钳位 → **低速 movej** ──
         # ⚠ 少了这一步，从臂会由 `slew_target` 直接拉过去，速度上限是 `speed_limit`
         #    （J1 到 2.8 rad/s），比 `align_speed=0.15` 快近 20 倍 —— 那是**大幅甩动**。
@@ -588,10 +754,14 @@ class ArmWorker:
                      speed_limit=sl)
 
     def _peer_host(self) -> str:
-        peer = (self.peer or "").strip()
-        return peer or "127.0.0.1"
+        # 保留给测试/调试：真源已挪到 `TeleopParams.peer_host()`
+        p = self._params
+        return p.peer_host() if p is not None else "127.0.0.1"
 
     def _on_wire(self, payload: bytes) -> None:
         """**在 zenoh 线程上**被调用 ⇒ 只写槽。"""
         self._slot.put(payload, time.monotonic())
         self._frames_received += 1
+        # ⚠ 在**到达**处计数（不是在被消费处）—— LatestSlot 是 latest-wins，
+        #   被覆盖掉的帧也是真到了的，在消费处数会低估速率。
+        self._link_tick()

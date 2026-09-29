@@ -186,7 +186,10 @@ class LinkCard(Card):
 
         master = local_role == ROLE_MASTER
         self.t_hz.lab.setText("发布" if master else "接收")
-        self.t_hz.set_value(f"{s.state_hz:g}" if s.state_hz else "—")
+        # ⚠ 这格是「**遥操链路**的发布/接收速率」⇒ 用 `link_hz`。
+        #   从前用的是 `state_hz`（那是 CDC 上的**电机状态帧**率），而且那个字段
+        #   全仓无人赋值 ⇒ 恒 `—`。两者在**不同总线**上，不能混。
+        self.t_hz.set_value(f"{s.link_hz:.1f}" if s.link_hz else "—")
         self.t_frames.lab.setText("已发帧数" if master else "已收帧数")
         self.t_frames.set_value(str(s.frames_sent if master else s.frames_received))
         self.t_age.lab.setText("匹配" if master else "帧龄")
@@ -396,8 +399,9 @@ class TeleopPage(QtWidgets.QWidget):
         """「机械臂遥操」：**这些参数都是"遥操怎么跑"的要素**（用户裁决 2026-09-29）——
         角色（谁发布谁跟随）、对端地址、zenoh 端口、`arm_id`（决定 topic）。
 
-        ⚠ 它们在**点「连接臂」时**被 `_connect()` 读走去构造 `ArmWorker`，
-        所以**连上之后全部锁死**（改了对运行中的 worker 没有任何影响）。
+        ⚠⚠ 它们**不在连接时读** —— 连接只吃 CDC 口。这四个在**点「启动遥操」那一刻**
+        由 `main_window._toggle_teleop` 打包成 `arm_worker.TeleopParams` 交给 worker。
+        ⇒ **连上之后它们仍然可以改**，改了**下次启动生效**；只按 `teleop_active` 锁。
         """
         card = Card("机械臂遥操")
         self.role_badge = Badge("本机角色 主臂（发布）", "outline")
@@ -406,7 +410,7 @@ class TeleopPage(QtWidgets.QWidget):
         card.add(hint("主臂零重力拖动、发布关节流；从臂订阅并跟随。"
                       "两端的「主臂 ID」与端口必须一致。", "hint"))
 
-        # ── 角色（连上后不可改）──
+        # ── 角色（遥操时定 ⇒ 连上后仍可改，跑了遥操才锁）──
         self.seg_role = SegmentedControl(
             ["主臂（发布）", "从臂（跟随）"],
             0 if self.gs.role == ROLE_MASTER else 1)
@@ -422,15 +426,16 @@ class TeleopPage(QtWidgets.QWidget):
         self.ed_arm_id.setFixedWidth(92)
         card.add_row("主臂 IP", self.ed_peer, "端口", self.sp_port,
                      "主臂 ID", self.ed_arm_id)
-        card.add_row("", rc_label("↑ 角色/地址/端口在**点「连接臂」时**被读取"
-                                  "（ArmWorker 构造时定死）⇒ 连上后锁死；"
-                                  "要改请先点顶栏的「断开」"),
+        card.add_row("", rc_label("↑ 四个都是**遥操参数**：在点「启动遥操」时读取"
+                                  "⇒ 连上后仍可改（改了下次启动生效）；"
+                                  "遥操跑着时才锁"),
                      stretch_at_end=False)
-        # ⚠ 把"为什么锁"直接挂在控件上 —— 用户不会去读那行小字，但会悬停。
+        # ⚠ 把"什么时候读"直接挂在控件上 —— 用户不会去读那行小字，但会悬停。
         for w in (self.seg_role, self.ed_peer, self.sp_port, self.ed_arm_id):
-            w.setToolTip("这些值只在**点「连接臂」时**被读取（`ArmWorker` 构造时定死），"
-                         "所以连上后锁死 —— 改了也不会生效。\n"
-                         "要改请先点顶栏的「断开」，改完再连。")
+            w.setToolTip("这些值在**点「启动遥操」时**读取（`arm_worker.TeleopParams`），"
+                         "**不是**连接时。\n"
+                         "所以连上后可以随便改 —— 改了**下次启动生效**；"
+                         "遥操跑着的时候才锁。")
         for w in (self.ed_peer, self.ed_arm_id):
             w.editingFinished.connect(self._emit_changed)
         self.sp_port.valueChanged.connect(self._emit_changed)
@@ -716,8 +721,16 @@ class TeleopPage(QtWidgets.QWidget):
 
     # ── 刷新 ──
     def apply(self, s: Snapshot, peer: str, jport: int, arm_id: str) -> None:
-        master = (s.role or ROLE_MASTER) == ROLE_MASTER
-        self.role_badge.setText(f"本机角色 {'主臂（发布）' if master else '从臂（跟随）'}")
+        master = s.role == ROLE_MASTER
+        # ⚠⚠ 徽章的真源与**分段控件**保持一致（都是"下次要用的角色"），不能取快照里
+        #     那次**已启动**的角色 —— 否则会出现"控件拨到从臂、徽章还写主臂（发布）"，
+        #     又是同一个"两个真源"毛病。
+        #     遥操跑着时才以快照为准（那是**正在跑的**），并标注出来。
+        running = bool(s.teleop_active and s.role)
+        eff = s.role if running else self.role()
+        self.role_badge.setText(
+            f"本机角色 {'主臂（发布）' if eff == ROLE_MASTER else '从臂（跟随）'}"
+            + ("" if running else "（下次启动）"))
         self.link_card.update_from(s, peer, jport)
         self.status_card.update_from(s, peer, jport, arm_id)
         self.metrics.set_snapshot(s)
@@ -729,10 +742,25 @@ class TeleopPage(QtWidgets.QWidget):
 
         # ⚠ 连接状态**不在这里显示** —— 它归顶栏（胶囊 + 详情串），
         #   见 `main_window._on_state` → `TopBar.set_connection/set_detail`。
-        # ⚠ 连上之后角色/地址/CDC 全部锁死 —— `ArmWorker` 构造时就把它们吃掉了
-        for w in (self.seg_role, self.ed_peer, self.sp_port, self.ed_arm_id,
-                  self.cb_port, self.btn_rescan):
+        # ⚠ **CDC 口是真的不能热改**（它是**连接**参数）⇒ 连上后就该锁。
+        for w in (self.cb_port, self.btn_rescan):
             w.setEnabled(not s.connected)
+        # ⚠⚠ 而**角色 / 主臂 IP / 端口 / 主臂 ID 是「遥操参数」** —— 它们只在
+        #     点「启动遥操」那一刻被读（见 `arm_worker.TeleopParams`），
+        #     所以**连上后仍然可改**，改了下次启动生效。
+        #     只按 `teleop_active` 锁：遥操跑着的时候改它没意义，也容易让人误以为
+        #     "改了就生效"。
+        #     ⛔ 从前按 `connected` 锁死，是旧设计（角色在 `ArmWorker` 构造时定死）
+        #        逼出来的补丁 —— 症状就是"连上以后角色那个 Tab 点不动"。
+        locked = bool(s.teleop_active)
+        self.seg_role.setEnabled(not locked)
+        self.sp_port.setEnabled(not locked)
+        self.ed_arm_id.setEnabled(not locked)
+        # ⚠「主臂 IP」额外受**角色**门控：只有从臂才用得到它（主臂只监听、不连出去）。
+        #   ⚠ 真源是**界面上当前选的角色**（`self.role()`），不是快照里那次**已启动**
+        #     的角色 —— 角色是"启动时才读"的（`TeleopParams`），所以下次要用哪个，
+        #     只有界面知道。拿快照判会导致"拨到从臂了但框还是灰的"。
+        self.ed_peer.setEnabled(not locked and self.role() == ROLE_SLAVE)
 
         # ⚠ 「连接臂 / 断开」两个按钮的启停**不在这里** —— 它们由
         #   `main_window._relock` 按 `worker is None` 驱动（那是唯一真源：
@@ -784,6 +812,13 @@ class TeleopPage(QtWidgets.QWidget):
             self.grip_badge.set_state("出错", "danger")
         elif not g.connected:
             self.lab_grip.setText("未启动")
+            self.grip_badge.set_state("未启动", "outline")
+        elif not g.role:
+            # ⚠ 角色**未定**：连上了但还没启夹爪遥操。
+            #    角色是**遥操参数**（夹爪的角色跟着臂走，两者都在点「启动遥操」
+            #    那一刻才定）⇒ 这时**不许**替用户猜成从端（旧代码会掉进下面的
+            #    `else`，把"未定"渲染成"从端夹爪：跟随中"）。
+            self.lab_grip.setText("夹爪已连接 —— 角色未定（点「启动夹爪遥操」时才定）")
             self.grip_badge.set_state("未启动", "outline")
         elif g.role == ROLE_MASTER:
             self.lab_grip.setText(

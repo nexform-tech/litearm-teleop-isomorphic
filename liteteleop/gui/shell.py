@@ -103,7 +103,9 @@ class TopBar(QtWidgets.QFrame):
 
     def update_from(self, s) -> None:
         """从快照刷新右侧四个指标。⚠ 没数据一律 `—`，**不写 0**。"""
-        self.tiles["hz"].set_value(f"{s.state_hz:g}" if s.state_hz else "—")
+        # ⚠ 一位小数就够（`98.5096` 那种在顶栏没有意义）；⛔ 别写 `:g` ——
+        #   与下面温度那格同款理由：它会把浮点尾数原样吐出来。
+        self.tiles["hz"].set_value(f"{s.state_hz:.1f}" if s.state_hz else "—")
         self.tiles["load"].set_value(f"{s.payload_mass:g}" if s.payload_com else "—")
         # ⚠ 「最高关节温度」取 **MOS 温度** —— 与曲线卡的「温度」是同一路
         #   （studio 也只取 `mosTemp`，`useArmMetrics.ts:133`）。

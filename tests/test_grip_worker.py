@@ -48,12 +48,20 @@ def test_degenerate_construction_params_are_rejected(kw, match):
     判别力：去掉 `__init__` 里那三条 `ValueError` 时本用例必红。
     """
     with pytest.raises(ValueError, match=match):
-        GripWorker(ROLE_MASTER, "can0", **kw)
+        GripWorker("can0", **kw)
 
 
 def test_bad_role_is_rejected():
+    """⚠ 角色是**遥操参数** ⇒ 在 `set_teleop(True, role=…)` 上同步被拒。
+
+    与臂同款：① 非法值要拒；② **不给**也要拒（不能默认成主端）。
+    判别力：把 `set_teleop` 里那段校验删掉时本用例必红。
+    """
+    w = GripWorker("can0")
     with pytest.raises(ValueError, match="role"):
-        GripWorker("bogus", "can0")
+        w.set_teleop(True, role="bogus")
+    with pytest.raises(ValueError, match="role"):
+        w.set_teleop(True)
 
 
 # ════════════════════ §8.1 前置：拒启动 ════════════════════
@@ -81,7 +89,7 @@ def test_worker_refuses_before_enabling():
     我们要的是**先拒、后使能**。
     """
     g = FakeGrip(calibrated=False)
-    w = GripWorker(ROLE_MASTER, "can0", gripper_factory=lambda _c: g)
+    w = GripWorker("can0", gripper_factory=lambda _c: g)
     w.start()
     w.stop(timeout=5.0)
     assert g.enable_calls == 0, "拒绝启动必须发生在 enable() 之前"
@@ -123,10 +131,10 @@ def test_teardown_stops_session_and_disconnects():
     任何"顺手失能"的路径会当场 `AttributeError`。
     """
     g = FakeGrip()
-    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     w.start()
     time.sleep(0.15)
-    w.set_teleop(True)
+    w.set_teleop(True, ROLE_MASTER)
     time.sleep(0.2)
     w.stop(timeout=5.0)
     assert g.teleop_stops >= 1, "收尾必须 teleop_stop（交接持位）"
@@ -180,7 +188,7 @@ def test_enable_failure_is_not_silent():
     判别力：去掉 `_run` 里那句 `if not self._grip.enable(): raise` 时本用例必红。
     """
     g = FakeGrip(enable_ok=False)
-    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.25)
@@ -200,11 +208,11 @@ def test_teleop_start_failure_is_recorded():
     """
     g = FakeGrip()
     g.raise_on_teleop_start = RuntimeError("teleop is already running")
-    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True)
+        w.set_teleop(True, ROLE_MASTER)
         time.sleep(0.25)
         assert "already running" in w.snapshot().error, \
             f"teleop_start 的异常必须被记下来，实际 {w.snapshot().error!r}"
@@ -219,11 +227,11 @@ def test_master_status_maps_frames_to_sent_and_matching():
     g = FakeGrip()
     g.teleop_status_extra = {"openness": 0.4, "position_mm": 42.0, "force_n": 3.5,
                              "matching": True, "loop_hz": 48.0}
-    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True)
+        w.set_teleop(True, ROLE_MASTER)
         time.sleep(0.25)
         s = w.snapshot()
         assert s.teleop_active is True
@@ -247,12 +255,12 @@ def test_slave_status_maps_frames_to_received_and_watchdog():
                              "stale": True, "fault": "fault 11: MOS 过温",
                              "rejected": 3, "send_failed": 2,
                              "last_frame_age_ms": 250.0}
-    w = GripWorker(ROLE_SLAVE, "can1", gpeer="127.0.0.1", poll_s=0.02,
+    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
                    gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True)
+        w.set_teleop(True, ROLE_SLAVE)
         time.sleep(0.35)
         s = w.snapshot()
         assert s.frames_received > 0, "从端要把 frames 记成 received"
@@ -274,12 +282,12 @@ def test_slave_mismatch_warning_from_status():
     """
     g = FakeGrip()
     g.teleop_status_extra = {"openness": 0.5, "position_mm": 30.0}
-    w = GripWorker(ROLE_SLAVE, "can1", gpeer="127.0.0.1", poll_s=0.02,
+    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
                    gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True)
+        w.set_teleop(True, ROLE_SLAVE)
         time.sleep(0.25)
         assert "不一致" in w.snapshot().mismatch
     finally:
@@ -295,12 +303,12 @@ def test_status_without_session_does_not_zero_the_readout():
     """
     g = FakeGrip()
     g.teleop_status_extra = {"openness": 0.7, "position_mm": 70.0}
-    w = GripWorker(ROLE_SLAVE, "can1", gpeer="127.0.0.1", poll_s=0.02,
+    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
                    gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True)
+        w.set_teleop(True, ROLE_SLAVE)
         time.sleep(0.25)
         assert w.snapshot().openness == pytest.approx(0.7)
         w.set_teleop(False)                       # 停会话 ⇒ 状态回落到无会话形态
@@ -323,11 +331,11 @@ def test_self_ended_session_does_not_restart_storm():
     **之后**（即原顺序）时，本用例会因为 `teleop_starts` 一路涨而红。
     """
     g = FakeGrip()
-    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True)
+        w.set_teleop(True, ROLE_MASTER)
         time.sleep(0.2)
         assert len(g.teleop_starts) == 1
         g.teleop_running = False                  # 会话"自己"结束
@@ -352,13 +360,13 @@ def test_teleop_start_receives_the_right_arguments(role, gcan, gpeer):
     `watchdog_s` 是**秒**，本仓的 `watchdog_ms` 要除以 1000（传错就是量纲 bug）。
     """
     g = FakeGrip()
-    w = GripWorker(role, gcan, grip_id="gB", gpeer=gpeer, gport=17449,
+    w = GripWorker(gcan, grip_id="gB", gpeer=gpeer, gport=17449,
                    rate_hz=100.0, watchdog_ms=250.0, align=False,
                    poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True)
+        w.set_teleop(True, role)
         time.sleep(0.2)
         assert g.teleop_starts, "应当已经 teleop_start"
         kw = g.teleop_starts[0]
@@ -391,7 +399,7 @@ def test_stop_timeout_keeps_the_thread_reference():
             super().disconnect()
 
     g = _SlowDisconnect()
-    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.2)

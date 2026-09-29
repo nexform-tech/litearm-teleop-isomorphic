@@ -210,28 +210,171 @@ def test_topbar_master_vs_slave(qapp):
     w.close()
 
 
-def test_connection_fields_are_editable_then_lock(qapp):
-    """⚠ 连接参数是**真输入框**（不再是从只读页搬来的生效值）⇒ 必须能改、且连上后锁死。
+def test_connect_params_lock_on_connect_but_teleop_params_do_not(qapp):
+    """⚠⚠ **连接参数**与**遥操参数**的锁定时机**不一样**（用户裁决 2026-09-29）。
 
-    判别力：不锁的话，用户在连上之后改「主臂 IP / 端口 / 主臂 ID / 角色」会以为
-    自己改生效了 —— 而 `ArmWorker` 在**构造时**就把这几项吃掉了，改了一点用没有。
-    那正是本仓反复强调的"界面在撒谎"。反过来，未连接时锁住则是另一种谎
-    （明明还没连，却不让人改）。
+    · `CDC 口 / 重新扫描` = **连接**参数 —— 真不能热改 ⇒ 连上后就锁；
+    · `角色 / 主臂 IP / 端口 / 主臂 ID` = **遥操**参数 —— 只在点「启动遥操」那一刻
+      被读（`arm_worker.TeleopParams`）⇒ **连上后仍然可改**（改了下次启动生效），
+      只按 `teleop_active` 锁。
+
+    ⛔ 旧契约把六个一起按 `connected` 锁死，症状就是「**连上以后角色那个 Tab
+    点不动**」（用户 2026-09-29 报的）。
+    判别力：把这四个也按 `connected` 锁回去时本用例必红。
 
     ⚠ 「连接臂 / 断开」两个按钮**不在这组里** —— 它们按 `worker` 在不在驱动，
     见 `test_connect_and_disconnect_are_mutually_exclusive`。
     """
-    w = MainWindow(Settings())
-    fields = (w.page.seg_role, w.page.ed_peer, w.page.sp_port,
-              w.page.ed_arm_id, w.page.cb_port, w.page.btn_rescan)
-    w._on_state(Snapshot(role=ROLE_MASTER))              # 还没连上
-    assert all(f.isEnabled() for f in fields), "未连接时这些必须都能改"
-    s = _snap()
+    w = MainWindow(Settings(role=ROLE_SLAVE))     # 从臂：这样 ed_peer 也该是可用的
+    connect_fields = (w.page.cb_port, w.page.btn_rescan)
+    teleop_fields = (w.page.seg_role, w.page.sp_port, w.page.ed_arm_id)
+
+    w._on_state(Snapshot())                       # 还没连上
+    assert all(f.isEnabled() for f in connect_fields + teleop_fields)
+    assert w.page.ed_peer.isEnabled(), "未连接且是从臂 ⇒ 主臂 IP 要能填"
+
+    s = _snap(role=ROLE_SLAVE)                    # 连上，但没启遥操
+    s.connected = True
+    s.teleop_active = False
+    w._on_state(s)
+    assert not any(f.isEnabled() for f in connect_fields), \
+        "CDC 口是**连接**参数 ⇒ 连上后必须锁"
+    assert all(f.isEnabled() for f in teleop_fields), \
+        "⚠ 这四个是**遥操**参数 ⇒ 连上后仍然要能改（否则就是『点不动』那个 bug）"
+    assert w.page.ed_peer.isEnabled(), "从臂 ⇒ 主臂 IP 仍然要能填"
+
+    s.teleop_active = True                        # 遥操跑着 ⇒ 这时才锁
+    w._on_state(s)
+    assert not any(f.isEnabled() for f in teleop_fields), \
+        "遥操跑着的时候才锁这四个"
+    assert not w.page.ed_peer.isEnabled()
+    w.close()
+
+
+def test_master_hides_the_peer_field(qapp):
+    """⚠「主臂 IP」只有**从臂**用得到（主臂只监听、不连出去）⇒ 选主臂时该灰掉。"""
+    w = MainWindow(Settings(role=ROLE_MASTER))
+    s = _snap(role=ROLE_MASTER)
     s.connected = True
     w._on_state(s)
-    assert not any(f.isEnabled() for f in fields), \
-        "连上之后 角色/地址/CDC 必须全部锁死"
+    assert not w.page.ed_peer.isEnabled(), "主臂不需要填主臂 IP"
+    w.page.seg_role.set_current(1)                # 拨到从臂
+    w._on_state(s)
+    assert w.page.ed_peer.isEnabled(), "从臂要能填主臂 IP"
     w.close()
+
+
+def test_top_detail_has_no_dangling_separator(qapp):
+    """⚠ 顶栏详情串：① 角色未定时**不许**拼端点；② 不许出现尾部/中间空段。
+
+    判别力：把端点那句改回 `if snap.connected`（而不是 `if side and snap.connected`）
+    时，第一条断言会红 —— 那时会吐出 `'… ·  127.0.0.1:17447'`（双空格）。
+    """
+    w = MainWindow(Settings(role=ROLE_MASTER))
+    fw = "Litearm1.9.0-7J"
+
+    def feed(**kw):
+        s = _snap()
+        s.firmware = fw
+        s.connected = kw.get("connected", True)
+        s.role = kw.get("role", "")
+        w._on_state(s)
+        return w.top.lab_detail.toolTip()
+
+    assert feed(connected=True, role="") == fw, "角色未定 ⇒ 只留固件，不许拼端点"
+    assert feed(connected=False, role=ROLE_MASTER) == fw, "未连接 ⇒ 不许留尾部 ' · '"
+    txt = feed(connected=True, role=ROLE_MASTER)
+    assert txt == f"{fw} · 监听 127.0.0.1:17447", txt
+    assert "  " not in txt, "不许出现双空格（side 为空却拼了端点）"
+    w.close()
+
+
+def test_both_hz_tiles_read_their_own_field(qapp):
+    """⚠⚠ 两个「Hz」格子**不是同一个量**，且都**必须**能显示出来。
+
+    · 顶栏「控制频率」 = `state_hz`（CDC 上**电机状态帧**的实测速率）；
+    · 主从链路「发布/接收」 = `link_hz`（zenoh 上**遥操帧**的实测速率）。
+
+    判别力（两条独立）：
+      ① 把 `state_hz` 改回"只声明不赋值"⇒ 第一条断言红；
+      ② 把那格改回读 `state_hz` ⇒ 第二条断言红（就会显示成另一个量或 `—`）。
+    """
+    w = MainWindow(Settings(role=ROLE_MASTER))
+    s = _snap()
+    s.connected = True
+    s.role = ROLE_MASTER
+    s.state_hz = 97.0
+    s.link_hz = 198.0
+    w._on_state(s)
+    # ⚠ 断言**带一位小数**：既钉住真源，也钉住格式 —— 用 `:g` 会吐出 `98.5096` 那种尾巴
+    assert w.top.tiles["hz"].val.text() == "97.0", \
+        f"顶栏控制频率该读 state_hz，实际 {w.top.tiles['hz'].val.text()!r}"
+    assert w.page.link_card.t_hz.val.text() == "198.0", \
+        ("主从链路的发布 Hz 该读 link_hz，实际 "
+         f"{w.page.link_card.t_hz.val.text()!r}")
+
+    s.state_hz = 0.0                      # 无数据 ⇒ `—`，不写 0
+    s.link_hz = 0.0
+    w._on_state(s)
+    assert w.top.tiles["hz"].val.text() == "—"
+    assert w.page.link_card.t_hz.val.text() == "—"
+    w.close()
+
+
+def test_role_badge_follows_the_selector_not_the_running_role(qapp):
+    """⚠ 徽章必须与**分段控件**一致（都是"下次要用的角色"）。
+
+    判别力：让徽章改回取快照里那次**已启动**的角色时，第二条断言必红 ——
+    表现为"控件拨到从臂、徽章还写主臂（发布）"，又是"两个真源"。
+    """
+    w = MainWindow(Settings(role=ROLE_MASTER))
+    s = _snap(role="")                          # 连上但没启遥操 ⇒ 快照里角色未定
+    s.connected = True
+    s.teleop_active = False
+    w._on_state(s)
+    assert "主臂" in w.page.role_badge.text()
+    assert "下次启动" in w.page.role_badge.text(), "没在跑时要标注出来"
+
+    w.page.seg_role.set_current(1)              # 拨到从臂
+    w._on_state(s)
+    assert "从臂" in w.page.role_badge.text(), \
+        f"徽章没跟着控件走：{w.page.role_badge.text()!r}"
+
+    s.teleop_active = True                      # 跑着 ⇒ 以**正在跑的**为准，且不标注
+    s.role = ROLE_SLAVE
+    w._on_state(s)
+    assert "从臂" in w.page.role_badge.text()
+    assert "下次启动" not in w.page.role_badge.text()
+    w.close()
+
+
+def test_starting_teleop_reads_the_role_at_that_moment(qapp):
+    """⚠⚠ **角色在点「启动遥操」那一刻读**，不是连接时（用户裁决 2026-09-29）。
+
+    判别力：把 `_toggle_teleop` 改回"连接时/构造时读死"时本用例必红 ——
+    因为这里**先把界面拨到从臂再启动**，期望发出去的就是从臂。
+    """
+    from liteteleop.arm_worker import TeleopParams
+
+    w = MainWindow(Settings(role=ROLE_MASTER))
+    got = []
+
+    class _Rec:
+        def set_teleop(self, on, params=None):
+            got.append((on, params))
+
+    w.worker = _Rec()                             # type: ignore[assignment]
+    try:
+        w.page.seg_role.set_current(1)            # 拨到「从臂（跟随）」
+        w._toggle_teleop(True)
+        assert got and got[0][0] is True
+        p = got[0][1]
+        assert isinstance(p, TeleopParams), p
+        assert p.role == ROLE_SLAVE, f"启动时该读界面上那个角色，实际 {p.role}"
+        assert p.key and p.jport >= 0
+    finally:
+        w.worker = None
+        w.close()
 
 
 def test_connect_and_disconnect_are_mutually_exclusive(qapp):

@@ -17,6 +17,7 @@ from liteteleop.arm_worker import (
     ArmWorker,
     Snapshot,
     StateHookMissing,
+    TeleopParams,
     attach_state_hook,
 )
 
@@ -94,7 +95,7 @@ def test_estop_bypasses_a_worker_stuck_in_movej():
     判别力：若有人把 `emergency_stop` 改成投进 `_cmds` 队列，本用例会**超时失败**。
     """
     arm = _StuckArm()
-    w = ArmWorker(role=ROLE_MASTER)
+    w = ArmWorker()
     w._arm = arm
     threading.Thread(target=lambda: arm.movej([0.0] * 7), daemon=True).start()
     assert arm.in_movej.wait(1.0), "假臂没进 movej"
@@ -106,7 +107,7 @@ def test_estop_bypasses_a_worker_stuck_in_movej():
 
 
 def test_estop_without_arm_reports_failure():
-    w = ArmWorker(role=ROLE_MASTER)
+    w = ArmWorker()
     w.emergency_stop()
     assert w.emergency_outcome() == (False, "未连接")
 
@@ -116,7 +117,7 @@ def test_estop_outcome_captures_exception():
         def emergency_stop(self):
             raise RuntimeError("链路断了")
 
-    w = ArmWorker(role=ROLE_MASTER)
+    w = ArmWorker()
     w._arm = _Bad()
     w.emergency_stop()
     for _ in range(50):
@@ -131,14 +132,14 @@ def test_estop_outcome_captures_exception():
 
 def test_snapshot_defaults_are_safe():
     """未连接时快照必须是一份**安全的空值**，不是 None。"""
-    s = ArmWorker(role=ROLE_MASTER).snapshot()
+    s = ArmWorker().snapshot()
     assert isinstance(s, Snapshot)
     assert s.connected is False and s.teleop_active is False
     assert s.q == [] and s.err == []
 
 
 def test_snapshot_reflects_pushed_state():
-    w = ArmWorker(role=ROLE_MASTER)
+    w = ArmWorker()
     w._push(_FakeState([0.5] * 7))
     s = w.snapshot()
     assert s.q == [0.5] * 7
@@ -148,7 +149,7 @@ def test_snapshot_reflects_pushed_state():
 
 def test_push_does_not_require_on_state_callback():
     """`on_state=None` 也要能推（回调炸了不该影响 SDK 读线程）。"""
-    w = ArmWorker(role=ROLE_MASTER, on_state=None)
+    w = ArmWorker(on_state=None)
     w._push(_FakeState([0.0] * 7))                      # 不该抛
     assert w.snapshot().mode_name == "MOVE_J"
 
@@ -158,20 +159,200 @@ def test_on_state_callback_exception_is_swallowed():
     def boom(_s):
         raise ValueError("GUI 炸了")
 
-    w = ArmWorker(role=ROLE_MASTER, on_state=boom)
+    w = ArmWorker(on_state=boom)
     w._push(_FakeState([0.0] * 7))                      # 不该抛出去
 
 
 # ────────────────────────── 角色校验 ──────────────────────────
 
 def test_bad_role_rejected():
+    """⚠ 角色是**遥操参数**（不是构造参数）⇒ 非法值在 `TeleopParams` 上就被拒。"""
     with pytest.raises(ValueError, match="role"):
-        ArmWorker(role="observer")
+        TeleopParams(role="observer")
+
+
+def test_snapshot_role_is_undetermined_until_teleop_starts():
+    """⚠ 角色是**遥操参数** ⇒ 连上但没启遥操时快照里它该是空的（不许替用户猜）。
+
+    判别力：把 `Snapshot.role` 的默认值改回 `ROLE_MASTER`（或让 `snapshot()`
+    回落到某个默认角色）时第一条断言必红。
+    """
+    w = ArmWorker()
+    assert w.snapshot().role == "", "没启过遥操 ⇒ 角色未定"
+    w._params = TeleopParams(ROLE_SLAVE)
+    assert w.snapshot().role == ROLE_SLAVE
+
+
+def test_master_pub_is_resident_but_rebuilt_when_params_change(monkeypatch):
+    """⚠⚠ 主臂的发布端**建一次、活一个进程**（跨遥操会话不重建），
+    但 `arm_id` / 端口是**遥操参数** ⇒ 它们变了必须重建。
+
+    ⚠ 为什么必须常驻：每轮遥操拆了重建有**两个**实测过的后果 ——
+    ① 停下时没人关 ⇒ 端口不释放 ⇒ 第二次「启动」报 `Address already in use`
+    （表现：**只能启动一次**）；② 就算补上关闭，同端口拆了重建会让匹配
+    **间歇性**建立不起来（实测 12 轮里 5 轮 `matching=False`）。
+
+    判别力：改回"每轮新建"⇒ 前两条断言红；去掉 `_pub_meta` 比较 ⇒
+    最后那条「换了 arm_id 还复用旧端点」的断言红。
+    """
+    made = []
+
+    class _FakePub:
+        def __init__(self, port, key):
+            self.port, self.key, self.closed = port, key, False
+            made.append(self)
+
+        def put(self, _b):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(arm_worker.link, "Listener", _FakePub)
+    w = ArmWorker()
+    p1 = TeleopParams(ROLE_MASTER, arm_id="armA", jport=17447)
+    a = w._ensure_pub(p1)
+    assert w._ensure_pub(p1) is a, "同一组参数 ⇒ 必须复用（常驻）"
+    assert len(made) == 1, f"不该反复建，实际建了 {len(made)} 个"
+
+    p2 = TeleopParams(ROLE_MASTER, arm_id="armB", jport=17447)
+    c = w._ensure_pub(p2)
+    assert c is not a, "arm_id 变了 ⇒ 必须重建（否则发的还是旧 topic）"
+    assert len(made) == 2
+    assert a.closed, "旧端点必须关掉 —— 不关就是那个「端口不释放」的 bug"
+    assert not c.closed
+
+    w._close_pub()
+    assert c.closed
+
+
+class _TimeShim:
+    """替掉 `arm_worker` 里的 `time` —— 让速率统计的 1 s 窗口可控。
+
+    ⚠ 只 `monkeypatch.setattr(arm_worker, "time", shim)` 换掉**模块属性**，
+    不去动真的 `time` 模块（那会波及全进程）。
+    """
+
+    def __init__(self, t0: float = 1000.0):
+        self.t = t0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, _s: float) -> None:
+        pass
+
+
+def test_rate_counters_actually_advance(monkeypatch):
+    """⚠⚠ 两个速率必须**真的被算出来** —— 不是只在 dataclass 里声明。
+
+    `Snapshot.state_hz` 从前**全仓无人赋值**（恒 0）⇒ 顶栏「控制频率」与主从链路卡
+    那个 Hz 格子**永远显示 `—`**。用户 2026-09-29 报的就是这个。
+
+    判别力：把 `_push` 里的 `_state_tick()` / 发布环里的 `_link_tick()` /
+    `_on_wire` 里的 `_link_tick()` 任一去掉 ⇒ 对应断言必红。
+    """
+    shim = _TimeShim()
+    monkeypatch.setattr(arm_worker, "time", shim)
+    w = ArmWorker()
+
+    for _ in range(50):                                  # 不足 1 s ⇒ 不出数
+        w._state_tick()
+    assert w.snapshot().state_hz == 0.0, "不到 1 s 的窗口不该出数"
+    shim.t += 1.0
+    w._state_tick()                                      # 第 51 帧触发结算
+    assert 45 <= w.snapshot().state_hz <= 55, w.snapshot().state_hz
+
+    w._link_reset()                                      # 链路速率是独立一组
+    assert w.snapshot().link_hz == 0.0, "reset 后要归 0（停遥操就该显示 —）"
+    for _ in range(20):
+        w._link_tick()
+    shim.t += 1.0
+    w._link_tick()
+    assert 18 <= w.snapshot().link_hz <= 22, w.snapshot().link_hz
+
+
+def test_push_feeds_the_state_rate(monkeypatch):
+    """⚠⚠ **接线**判据：`_push`（每来一帧状态）必须喂 `_state_tick`。
+
+    判别力：去掉 `_push` 里那句 `self._state_tick()` 时本用例必红。
+    ⚠ 只单测 `_state_tick` 本身**抓不到"根本没人调它"** —— 而"只声明不赋值"
+    （这个字段从前的状态）恰恰就是"没人调"这一种，所以必须有这条。
+    """
+    shim = _TimeShim()
+    monkeypatch.setattr(arm_worker, "time", shim)
+    w = ArmWorker()
+    for _ in range(50):
+        w._push(_FakeState([0.0] * 7))
+    assert w.snapshot().state_hz == 0.0, "不到 1 s 的窗口不该出数"
+    shim.t += 1.0
+    w._push(_FakeState([0.0] * 7))
+    assert 45 <= w.snapshot().state_hz <= 55, \
+        f"状态帧速率没被 `_push` 喂出来：{w.snapshot().state_hz}"
+
+
+def test_master_loop_reports_a_publish_rate():
+    """⚠ **接线**：主臂发布环每发一帧要喂 `_link_tick`，否则「发布 Hz」永远是 `—`。
+
+    判别力：去掉 `_run_master` 里那句 `self._link_tick()` 时本用例必红。
+    起**真 zenoh** Listener（不是 mock），发满一个 1 s 窗口再断言。
+    """
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    class _Arm:
+        def zero_g_start(self):
+            pass
+
+        def zero_g_stop(self):
+            pass
+
+        def get_state(self, refresh=False):
+            class _S:
+                q = [0.0] * 7
+                dq = [0.0] * 7
+
+            class _R:
+                value = _S()
+
+            return _R()
+
+    w = ArmWorker()
+    w._arm = _Arm()
+    p = TeleopParams(ROLE_MASTER, jport=port)
+    w._teleop_want = True
+    th = threading.Thread(target=w._run_master, args=(p,), daemon=True)
+    try:
+        th.start()
+        time.sleep(2.2)                       # 0.5 s engage + 一个完整 1 s 窗口
+        w._teleop_want = False
+        th.join(timeout=3.0)
+        snap = w.snapshot()
+        assert snap.frames_sent > 50, f"没发出去几帧：{snap.frames_sent}"
+        assert snap.link_hz > 50, \
+            f"主臂发布速率没被统计出来：{snap.link_hz}（去掉 _link_tick 就会是 0）"
+    finally:
+        w._teleop_want = False
+        w._close_pub()
+
+
+def test_starting_teleop_requires_params():
+    """启动遥操**必须**给 params（角色/arm_id/peer/端口都在里面）。
+
+    ⚠ 必须**同步**抛 —— 若留到 worker 线程里再报，界面上表现为"点了按钮没反应"。
+    """
+    w = ArmWorker()
+    with pytest.raises(ValueError, match="params"):
+        w.set_teleop(True)
 
 
 def test_teleop_topic_matches_server_convention():
-    w = ArmWorker(role=ROLE_MASTER, arm_id="armB")
-    assert w.key == "litearm/v4/armB/teleop"
+    """topic 由**遥操参数**里的 `arm_id` 派生（不再挂在 worker 上）。"""
+    assert TeleopParams(ROLE_MASTER, arm_id="armB").key == "litearm/v4/armB/teleop"
 
 
 # ────────────── 调用顺序（真机踩过：movej 用了被改软的 mit_kp）──────────────
@@ -253,9 +434,9 @@ def test_slave_aligns_then_follows_and_writes_no_firmware_parameters(monkeypatch
         def __getattr__(self, name):
             raise AttributeError(name)
 
-    w = ArmWorker(role=ROLE_SLAVE)
+    w = ArmWorker()
     w._arm = _NoWriteArm()
-    w._run_slave()
+    w._run_slave(TeleopParams(role=ROLE_SLAVE))
     assert order == ["align", "follow"], f"顺序必须是 对齐 → 跟随，实际 {order}"
     # ⛔ 速度上限必须**逐字是 litearm-server 的配置值**（用户裁决 2026-09-28，真机实测）。
     #   曾按 kd 预算收紧（`0.30·tau_max/kd_eff`）⇒ J3/J4 只剩 **11%**、腕部只剩 **9~15%**
@@ -274,7 +455,7 @@ def test_align_move_timeout_is_thirty_seconds():
     ⚠ 但 `movej` **到位就立刻返回**，所以这只是**上限**、不是固定等待 —— 到点就跟。
     """
     assert arm_worker.ALIGN_MOVE_TIMEOUT == 30.0
-    assert ArmWorker(role=ROLE_SLAVE).move_timeout == 30.0
+    assert ArmWorker().move_timeout == 30.0
 
 
 # ────────────── 臂维护动作：使能 / 清错 / 复位 / 回零 ──────────────
@@ -319,7 +500,7 @@ def test_maintenance_commands_reach_the_arm():
     """四个维护动作都要**真的落到 SDK 上**（名字别接错）。"""
     for method, sdk in (("enable_arm", "enable"), ("clear_faults", "clear_faults"),
                         ("reset_arm", "reset"), ("go_home", "home")):
-        w = ArmWorker(role=ROLE_MASTER)
+        w = ArmWorker()
         w._arm = _MaintArm()
         getattr(w, method)()
         _drain_once(w)
@@ -331,7 +512,7 @@ def test_go_home_refuses_when_the_arm_is_not_enabled():
 
     判别力：把那个预检删掉，本用例会红（`home()` 会被调用）。
     """
-    w = ArmWorker(role=ROLE_MASTER)
+    w = ArmWorker()
     w._arm = _MaintArm(enabled=False)
     w.go_home()
     _drain_once(w)
@@ -341,7 +522,7 @@ def test_go_home_refuses_when_the_arm_is_not_enabled():
 
 def test_maintenance_failure_is_visible_not_swallowed():
     """失败要**记进快照**（界面看得见），不能只写一行日志。"""
-    w = ArmWorker(role=ROLE_MASTER)
+    w = ArmWorker()
     w._arm = _MaintArm(boom="clear_faults")
     w.clear_faults()
     _drain_once(w)
@@ -350,7 +531,7 @@ def test_maintenance_failure_is_visible_not_swallowed():
 
 def test_a_successful_maintenance_clears_the_previous_error():
     """一次成功的手动操作 ⇒ 清掉旧错误，否则界面会一直挂着上一次的错。"""
-    w = ArmWorker(role=ROLE_MASTER)
+    w = ArmWorker()
     w._arm = _MaintArm()
     with w._lock:
         w._snap.error = "上一次的旧错"
@@ -367,7 +548,7 @@ def test_maintenance_on_a_missing_arm_says_so():
     （界面上这条路径其实到不了：`_relock` 没连接时就把四键禁掉了，这里是兜底。）
     """
     logs = []
-    w = ArmWorker(role=ROLE_MASTER, on_log=logs.append)
+    w = ArmWorker(on_log=logs.append)
     w._arm = None
     w.enable_arm()
     _drain_once(w)

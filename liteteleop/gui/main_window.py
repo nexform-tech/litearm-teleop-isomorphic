@@ -26,7 +26,7 @@ import time
 
 from PyQt5 import QtCore, QtWidgets
 
-from ..arm_worker import ArmWorker, Snapshot
+from ..arm_worker import ROLE_MASTER, ROLE_SLAVE, ArmWorker, Snapshot, TeleopParams
 from ..grip_worker import GripSnapshot, GripWorker
 from ..settings import Settings, load_settings, save_settings
 from . import theme
@@ -166,16 +166,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect(self) -> None:
         if self.worker is not None:
-            self._log("已经连接（先关闭窗口再改角色）")
+            self._log("已经连接（先点顶栏的「断开」）")
             return
-        self.s.role = self.page.role()
         self._save()
+        # ⚠⚠ 连接**只吃连接参数**（CDC 口）。角色 / arm_id / peer / 端口都是
+        #     **遥操**参数，在点「启动遥操」时才读 —— 见 `TeleopParams`。
+        #     与 litearm-server 同形（它的 transport 启动时就建好、**不按 mode 分叉**）。
         self.worker = ArmWorker(
-            role=self.s.role, port=self.s.cdc_port or None, arm_id=self.s.arm_id,
-            peer=self.s.peer, jport=self.s.jport,
+            port=self.s.cdc_port or None,
             on_state=self.bridge.on_state, on_log=self.bridge.on_log)
         self.worker.start()
-        self._log(f"正在连接（角色={self.s.role}）…")
+        self._log("正在连接臂（角色在点「启动遥操」时才定）…")
 
     def _disconnect(self) -> None:
         """断开：停遥操 → 受控接管 movej → 关 zenoh → 关臂（**不失能**）。
@@ -200,7 +201,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker = None
         # ⚠ 必须把界面那份快照也复位：`_teardown` 只改 worker 自己那份、不会推给界面，
         #   留着旧的"已连接"会让 `_relock` 继续按已连接判定、字段也不解锁。
-        self._last = Snapshot(role=self.s.role)
+        self._last = Snapshot()          # ⚠ 角色未定（还没启遥操）
         self.page.apply(self._last, self.s.peer, self.s.jport, self.s.arm_id)
         self.top.update_from(self._last)
         self.top.set_connection(False, "未连接")
@@ -212,8 +213,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_teleop(self, on: bool) -> None:
         if self.worker is None:
             return
-        self._log("启动遥操" if on else "停止遥操（受控接管 movej）")
-        self.worker.set_teleop(on)
+        if not on:
+            self._log("停止遥操（受控接管 movej）")
+            self.worker.set_teleop(False)
+            return
+        # ⚠⚠ **角色/arm_id/peer/端口在这一刻读**，不是连接时 —— 见 `TeleopParams`。
+        #    所以连上之后这四个控件仍然可以改，改了**下次启动生效**
+        #    （界面按 `teleop_active` 锁，不是按 `connected`）。
+        params = TeleopParams(role=self.page.role(), arm_id=self.s.arm_id,
+                              peer=self.s.peer, jport=self.s.jport)
+        self._log(f"启动遥操（角色={'主臂' if params.role == ROLE_MASTER else '从臂'}"
+                  f" · {params.key} · 端口 {params.jport}）")
+        self.worker.set_teleop(True, params)
 
     def _arm_action(self, what: str) -> None:
         """臂维护动作（使能/清错/复位/回零）—— 排到 worker 线程上执行。
@@ -289,7 +300,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("   （夹爪遥操已停用；臂遥操不受影响）")
             return None
         self.grip = GripWorker(
-            role=self.page.role(), gcan=v["gcan"], grip_id=v["grip_id"],
+            gcan=v["gcan"], grip_id=v["grip_id"],
             gpeer=v["gpeer"], gport=v["gport"], align=v["align"],
             on_state=self.bridge.grip_state.emit, on_log=self.bridge.on_log)
         self.grip.start()
@@ -305,8 +316,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if w is None:
             self.page.btn_grip.setChecked(False)
             return
-        self._log("启动夹爪遥操")
-        w.set_teleop(True)
+        # ⚠ 夹爪的角色**跟着臂走** ⇒ 也在这一刻读（不是连接时、也不是建 worker 时）
+        role = self.page.role()
+        self._log(f"启动夹爪遥操（角色={'主臂' if role == ROLE_MASTER else '从臂'}，跟随臂）")
+        w.set_teleop(True, role)
 
     def _on_grip_state(self, g: GripSnapshot) -> None:
         # ⚠ 本槽在 **Qt 主线程**跑（信号跨线程排队），碰控件是安全的
@@ -367,13 +380,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.top.set_connection(False, "出错", kind="bad")
             self.top.set_detail(f"⛔ {snap.error}", role="danger")
         else:
-            master = (snap.role or "master") == "master"
+            master = snap.role == ROLE_MASTER
             self.top.set_connection(snap.connected,
                                     "已连接" if snap.connected else "未连接")
-            side = "监听" if master else "连接"
-            self.top.set_detail(" · ".join(x for x in (
-                snap.firmware or "",
-                f"{side} {self.s.peer}:{self.s.jport}" if snap.connected else "")) or "—")
+            # ⚠ 角色**未定**时（连上但还没启遥操）不写"监听/连接" —— 那是猜的。
+            # ⚠⚠ 而且**端点只在 side 非空时才拼**：从前那句 `if snap.connected` 挂错了
+            #     对象 ⇒ 角色未定时会吐出 `"… ·  127.0.0.1:17447"`（**双空格**），
+            #     未连接时会吐出 `"… · "`（**尾部悬挂一个分隔符**）。
+            side = "监听" if master else ("连接" if snap.role == ROLE_SLAVE else "")
+            parts = [snap.firmware or ""]
+            if side and snap.connected:
+                parts.append(f"{side} {self.s.peer}:{self.s.jport}")
+            self.top.set_detail(" · ".join(p for p in parts if p) or "—")
         self.page.log_badge.set_state(
             "已连接" if snap.connected else "未连接",
             "ok" if snap.connected else "outline")
