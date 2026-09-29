@@ -63,33 +63,33 @@ __all__ = [
 ]
 
 # ── 参数真值 ────────────────────────────────────────────────────────────────
-#: ⛔ **不是 litearm-server 的值** —— 有实测依据（2026-09-28）。
+#: **照抄 litearm-server 的 `litearm.yaml` 的 `joint_follow.speed_limit`**（2026-09-29）。
 #:
-#: server 的那份 `[2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]` 来自一个**没有固件安全层**的
-#: 系统：它走 CAN **直连电机**，且 `joint_follow` 每步都主动豁免了检查 ——
+#: ## 为什么现在能照抄了（这天之前不能）
 #:
-#:     hw.assert_operational(measured_overspeed_factor=float('inf'),   # 超速检查关掉
-#:                           skip_position=True)                        # 位置检查跳过
+#: 这份值来自一个**没有固件安全层**的系统：server 走 CAN **直连电机**，且
+#: `joint_follow` 每步都主动豁免了检查（`measured_overspeed_factor=inf` +
+#: `skip_position=True`）。而我们的固件**有**独立的超速判据
+#: （`|dq| > jp->vel_max × 1.5` 连续 5 拍 ⇒ 锁存 `joint_fault` ⇒ 停发该轴控制帧
+#: ⇒ 电机静默 ⇒ 80 ms 后 `FB_STALE`），而且固件的 `slew_linear` 原先按
+#: `jp->vel_max` 推进参考 —— 那张表是 **`movej` 的"满速语义"**，不是"跟随该跑多快"。
 #:
-#: 我们经过 STM32 固件，而固件有**独立的**超速判据：
+#: ⇒ 那天之前照抄拿不到速度，只会得到「**从臂永远在追**」：真机实测滞后
+#:   **0.35 rad（20°）**、J2 的指令-实测差值一度 0.31 rad。表现就是用户报的
+#:   「快速拖动时到末端过冲、再回拉」—— 那不是阻尼不够，是**追不上**。
 #:
-#:     safety_check.c:  |dq| > jp->vel_max × 1.5   连续 5 拍 ⇒ 锁存 joint_fault
-#:     固件整臂表:      vel_max = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]  ⇒ 阈值 2.6~3.0
+#: ## 两处必须同时改才生效
 #:
-#: ⇒ 拿 server 的 5/13 rad/s 会**持续越线**：从臂不会更快，只会锁存掉力
-#:   （锁存 ⇒ 固件停发该轴控制帧 ⇒ 达妙电机"收帧才回状态" ⇒ 静默 ⇒ 80 ms 后 `FB_STALE`）。
-#:   真机实录（`21:04:17`）：`OVERSPEED` 首拍即报，5 拍后 J3 锁存，J4 随后跟进。
+#:     PC 侧（本表）              决定 `slew_target` 放行多快
+#:     固件 `s_jf_vel_max`        决定 `slew_linear` 放行多快（**只对 joint_follow 会话**）
 #:
-#: ⚠ **那条判据现在可以在 `CMD_JOINT_FOLLOW` 会话里豁免**（S2，照 server 的
-#:   `measured_overspeed_factor=inf`）。但**本表照取不误**，理由与豁免无关：
-#:     · 固件的 `slew_linear` 就是按 `vel_max` 推进参考的 ⇒ **这才是从臂本来就有的
-#:       速度**：PC 给的目标若快于它，多出来的部分只会变成跟踪误差，不会变成速度；
-#:     · `vel_max` 是**编译期常量**（`defaults.c`），SDK 无任何写入口
-#:       （`set_joint_limit` 只改限位）⇒ 想更快必须改固件重烧。
-#:
-#: ⇒ **这不是"变慢"**：它就是从臂的速度上限，只是位置命令由 PC 给，所以这张表要在
-#:   PC 侧一并执行。
-DEFAULT_SPEED_LIMIT = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]
+#: ⚠ **固件那张表是逐值照抄本表的**（`control_loop.c` 的 `s_jf_vel_max`）——
+#:   改这里必须同步改那里：两级 serially 串联，**谁小谁说了算**。
+#: ⚠ 通用路径（`move_j` / `move_js` / `move_mit_all`）仍受 `jp->vel_max` 约束，
+#:   一点没变 —— 这是刻意的，见 spec §5 第 4 条（通用路径不得被削弱）。
+#: ⚠ 位置护栏（`clamp_to_limits` + 固件 `law_wall`）**仍然保留**：server 也保留它，
+#:   关掉会让从臂撞机械限位（J4 上端只有 2°）。
+DEFAULT_SPEED_LIMIT = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]
 DEFAULT_ACCEL_LIMIT = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]
 DEFAULT_ENGAGE_SEC = 0.3
 

@@ -323,21 +323,25 @@ def test_default_payload_is_the_gripper_the_user_gave():
 # ────────── 限速：必须落在固件的速度包络之内（绕不过去的硬约束）──────────
 
 def test_speed_limit_stays_within_the_firmware_velocity_envelope():
-    """⛔ `speed_limit` 必须 ≤ 固件整臂表的 `vel_max` —— 否则必然锁存掉力。
+    """⛔ `speed_limit` 必须 ≤ **固件 joint_follow 专用表** `s_jf_vel_max`。
 
-    固件 `safety_check.c`：`|dq| > jp->vel_max × 1.5` 连续 5 拍 ⇒ 锁存 `joint_fault`
-    ⇒ 固件**停发该轴控制帧** ⇒ 达妙电机"收帧才回状态"⇒ 静默 ⇒ 80 ms 后 `FB_STALE`。
-    真机实录：`OVERSPEED` 首拍即报，5 拍后锁存。
+    ⚠ 对标物 2026-09-29 换过。原先比的是 `jp->vel_max`（固件整臂表
+    `[2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]`）—— 那张表是 **`movej` 的"满速语义"**，
+    固件却拿它当所有模式的 slew 上限，于是把 joint_follow 也锁在 2.0。真机表现：
+    「从臂永远在追」（实测滞后 0.35 rad / 20°）。现已给 joint_follow 加专用表
+    （`control_loop.c` 的 `s_jf_vel_max`，逐值照抄 server）。
 
-    ⚠ `vel_max` 是**编译期常量**（`defaults.c`），SDK 只暴露 `kp/kd/tau_max/q_min/q_max`
-    ⇒ **不改固件就绕不过去**。server 能无视它，是因为走 CAN 直连电机。
+    为什么仍要"≤"：两级 slew **串联**（PC `slew_target` → 固件 `slew_linear`），
+    **谁小谁说了算**。PC 若大于固件那张表，多出来的部分不会变成速度，
+    只会让 `q_cmd` 空超前、跟踪误差读数虚高。
 
-    判别力：把 `DEFAULT_SPEED_LIMIT` 改回 server 的 `[2.8,3.4,5,5,10,8,13]`，本用例立刻红。
+    判别力：改任一端的表而不同步另一端，本用例立刻红。
     """
     from liteteleop import servo
-    vel_max = [2.0, 2.0, 1.75, 1.75, 2.0, 2.0, 2.0]        # 固件 defaults.c 的整臂表
-    for i, (sl, vm) in enumerate(zip(servo.DEFAULT_SPEED_LIMIT, vel_max)):
-        assert sl <= vm, f"J{i+1} speed_limit={sl} 越过固件 vel_max={vm}"
+    # 固件 control_loop.c 的 s_jf_vel_max（= litearm.yaml 的 joint_follow.speed_limit）
+    jf_vel_max = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]
+    for i, (sl, vm) in enumerate(zip(servo.DEFAULT_SPEED_LIMIT, jf_vel_max)):
+        assert sl <= vm, f"J{i+1} speed_limit={sl} 越过固件 s_jf_vel_max={vm}"
 
 
 # ─────────── joint_follow 帧：只有 4 组，且墙区抬高 kd ───────────
@@ -373,24 +377,28 @@ def test_wall_zone_raises_kd_by_the_configured_extra():
 
 # ────────────── 限位内缩量 ──────────────
 
-def test_limit_margin_does_not_latch_at_limits():
-    """目标贴限位 + 最坏冲过，仍须落在固件锁存死区之内。
+def test_limit_margin_stays_in_a_sane_band():
+    """`DEFAULT_LIMIT_MARGIN` 取 server 值，落在 [0.005, J4 上端) 之间。
 
-    ⚠ 判据形态 2026-09-28 修正。固件 `safety_check.c` 的锁存条件是
-    `q_meas > q_max + 0.05`，而 `q_meas ≤ q_max − margin + overshoot`：
+    ⚠ 判据形态 2026-09-29 换掉了。旧判据是 `margin ≥ overshoot − 0.05`
+    （依据：固件锁存条件 `q_meas > q_max + 0.05`）。**那个前提已不成立**：
+    joint_follow 会话里位置判据**已豁免**（S2）⇒ 贴限位**不会**锁存掉力，
+    「盖住死区」这个诉求随之消失。
 
-        不锁存  ⟺  overshoot ≤ 0.05 + margin  ⟺  **margin ≥ overshoot − 0.05**
-        原式「margin ≥ 0.05 + overshoot」把 0.05 加成而非减掉 ⇒ 要求翻倍，
-        正是 margin 被抬到 0.14 的原因（见 safety.py 的注释）。
+    ⚠ 为什么不再按 `overshoot` 反推：`overshoot = 13 × 6.7ms ≈ 0.087 rad`，
+    反推会要求 margin ≈ 0.037 —— 那会**白吃行程**（J4 上端总共才 2°），
+    而 server 用同样的 0.01 + 13 rad/s 跑得很好。真正兜底的是固件 `law_wall`
+    （距限位 `wall_margin` 就给排斥力矩）与已豁免的锁存判据。
 
-    判别力：谁把 `DEFAULT_SPEED_LIMIT` 调大（overshoot 随之变大）到盖过 0.05+margin，
-    本用例立刻红。
+    ⚠ 代价如实记：13 rad/s 下实测仍可能冲过软限位零点几度、**贴近物理硬限位**
+    （软限位距它只有 1°）。这是 server 同样接受的取舍，不是本仓引入的。
+
+    判别力：下界拦「把防撞余量砍光」，上界拦「吃没 J4 行程」
+    （后者另有 `test_limit_margin_keeps_j4_usable` 专门守）。
     """
-    from liteteleop import safety, servo
-    overshoot = max(servo.DEFAULT_SPEED_LIMIT) * 2 * 0.003333   # 最快轴 × 2 次往返
-    assert safety.DEFAULT_LIMIT_MARGIN >= overshoot - 0.05, (
-        f"margin={safety.DEFAULT_LIMIT_MARGIN} 盖不住 overshoot={overshoot:.4f}"
-        f"（需 ≥ {overshoot - 0.05:.4f}）")
+    from liteteleop import safety
+    assert 0.005 <= safety.DEFAULT_LIMIT_MARGIN < 0.0175, (
+        f"margin={safety.DEFAULT_LIMIT_MARGIN} 超出合理区间 [0.005, J4 上端 0.0175)")
 
 
 def test_limit_margin_keeps_j4_usable():
