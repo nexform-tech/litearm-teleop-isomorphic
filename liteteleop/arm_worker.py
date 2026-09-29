@@ -210,8 +210,12 @@ class ArmWorker:
             with self._lock:
                 self._snap.payload_mass = m
                 self._snap.payload_com = list(c)
-            clamped = (abs(m - float(mass)) > 1e-9
-                       or any(abs(a - float(b)) > 1e-9 for a, b in zip(c, com)))
+            # ⚠ 容差按 **float32 往返**定：读回值是从固件的 f32 解出来的，而
+            #   `mass`/`com` 是 Python double —— 0.6 在 f32 里是 0.6000000238…，
+            #   差约 2.4e-8。原先用 1e-9 会把它**误判成"被固件钳过"**（实测踩到：
+            #   0.6 kg / 质心 0.03 m 本来就在 [0,20]/[-1,1] 内，却报了钳位告警）。
+            clamped = (abs(m - float(mass)) > 1e-5
+                       or any(abs(a - float(b)) > 1e-5 for a, b in zip(c, com)))
             self._log(f"载荷已设：{m:.3f} kg，质心 {[round(v, 4) for v in c]} m"
                       + ("   ⚠ **被固件钳过**（给的值超出 [0,20]/[-1,1]）" if clamped else ""))
         self.post(_do)
