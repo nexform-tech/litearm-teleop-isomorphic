@@ -411,7 +411,6 @@ def _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall=None) -> None:
     ⚠ 本通道上固件**豁免**「位置越界」与「超速」两条**锁存**判据（照 server 的
     `skip_position=True` + `measured_overspeed_factor=inf`）⇒ 越界不再锁存掉力。
     但豁免的是「发现越界就锁存掉力」这个**动作**，不是「越界」本身 —— 所以①②③必须都留着。
-    详见 `docs/superpowers/specs/2026-09-28-joint-follow-in-firmware-design.md` §3.4。
 
     ⚠ 指令与实测**是两组不同的值**：`q_cmd/dq_cmd` 下发给电机；固件算 G 与墙吃
     `q_meas/dq_meas`（照搬 server）。实测读缓存 ⇒ **不额外花往返**。

@@ -9,11 +9,13 @@ drags the leader arm in zero gravity; the follower arm tracks it over a zenoh
 point-to-point link. A gripper can be teleoperated over the same pair of
 machines, on its own bus and its own link.
 
+Chinese translation: [README.zh-CN.md](README.zh-CN.md). This file is the
+authoritative one; where the two disagree, this one wins.
+
 ## Status
 
 The arm path and the gripper path are both implemented. The arm path has been
-validated on hardware; the gripper path has not. Track the remaining gripper
-work in `docs/superpowers/plans/2026-09-28-gripper-teleop.md`, task 8.
+validated on hardware; the gripper path has not.
 
 Implemented and covered by the offline suite: the wire protocol codec, the zenoh
 point-to-point link, the pure-logic safety layer, the firmware `joint_follow`
@@ -75,9 +77,8 @@ through a pull request; direct pushes to `main` are blocked by branch protection
 ## Known traps
 
 Every entry below was observed, in source or on hardware, and each one has cost
-someone time. The full version lives in
-`docs/superpowers/specs/2026-09-28-isomorphic-teleop-design.md` §10; when the two
-disagree, the spec wins.
+someone time. This is the only copy; the internal design notes it was once
+condensed from are not published.
 
 ### Motion and feedforward
 
