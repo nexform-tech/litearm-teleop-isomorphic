@@ -436,9 +436,19 @@ def test_setup_gains_are_the_server_default_config():
     ⇒ 25 是**已知会滞后**的档。真机实测复现了：用户报「明显延迟，而且会很软」。
 
     判别力：把 `SETUP_K` 改回 25（或换成任何别的档），本用例立刻红。
+
+    ⚠ **J2 的 `B` 是本仓唯一记录在案的偏离**（server 1.0 → 我们 2.0，2026-09-29）：
+    肩部托着整条臂 ⇒ 负载惯量最大 ⇒ 同样 K/B 下阻尼比 `ζ = B/(2√(K·J))` 最小
+    ⇒ 实测过冲最大（0.252 rad，其余轴都 ≤0.17）。依据见 `servo.py` 里 SETUP_B 的注释。
+    **除 J2 外任何位置偏离 server ⇒ 本用例立刻红。**
     """
     assert servo.SETUP_K == [60.0, 60.0, 60.0, 60.0, 40.0, 40.0, 40.0]
-    assert servo.SETUP_B == [1.0, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8]
+    server_b = [1.0, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8]
+    assert servo.SETUP_B[1] == 2.0, (
+        "J2 的 B = 2.0 是本仓唯一在案的一处偏离；要改动请连同本判据和依据一起改，"
+        "别无声改掉")
+    assert (servo.SETUP_B[:1] + servo.SETUP_B[2:]) == (server_b[:1] + server_b[2:]), (
+        f"除 J2 外其余轴必须与 server 逐值相同 —— server={server_b}，实际={servo.SETUP_B}")
 
 
 def test_engage_gains_are_softer_than_the_follow_gains():
