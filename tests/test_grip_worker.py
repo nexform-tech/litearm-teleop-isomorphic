@@ -150,6 +150,24 @@ def test_sdk_pin_accepts_the_target_and_rejects_the_other_copy():
         gw.assert_sdk_pinned(bad)
 
 
+def test_sdk_src_is_overridable_by_env(monkeypatch):
+    """⚠ `LITEGRIP_SRC` 覆盖 SDK **位置** —— 与 `__main__.py` 的 `LITEARM_SRC` 同款。
+
+    硬编码的是 `/home/llx/litegrip-python/src`，别的机器上那份不存在，而
+    `assert_sdk_pinned` 又要求落点必须与它相符 ⇒ 不改代码就根本起不来。
+    覆盖的只是位置，判据一字未变。
+
+    判别力：把 `GRIP_SDK_SRC` 改回裸字符串常量时本用例必红。
+    """
+    import importlib
+    monkeypatch.setenv("LITEGRIP_SRC", "/opt/litegrip/src")
+    try:
+        assert importlib.reload(gw).GRIP_SDK_SRC == "/opt/litegrip/src"
+    finally:
+        monkeypatch.delenv("LITEGRIP_SRC", raising=False)
+        importlib.reload(gw)
+
+
 # ════════════════════ §8 rule 10：失败必须可见（不能静默死掉）════════════════════
 
 def test_enable_failure_is_not_silent():

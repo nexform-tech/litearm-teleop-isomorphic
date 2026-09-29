@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from dataclasses import dataclass
@@ -55,7 +56,12 @@ _MISMATCH_WINDOW = (0.15, 0.85)
 #: （`teleop_start`/`close_sign`/`calibrated` 只在目标那份有）⇒ 走错仓从
 #: `AttributeError` 到**静默语义漂移**都可能。
 #: 用户裁决 2026-09-28：SDK 采用 `litegrip-python`。
-GRIP_SDK_SRC = "/home/llx/litegrip-python/src"
+#: ⚠ 位置可用 `LITEGRIP_SRC` 覆盖 —— 与 `__main__.py` 的 `LITEARM_SRC` 同款。
+#:   判据（导入后核落点）一字未变，覆盖的只是**位置**：机器不同、检出目录不同时
+#:   不必改代码。（硬编码的那台是 `/home/llx`，别的机器上没有。）
+#: ⚠ 覆盖值要**绝对路径**：`litegrip.__file__` 永远是绝对路径，给相对路径会
+#:   在 `assert_sdk_pinned` 上直接报错，而不是按 CWD 静默解析。
+GRIP_SDK_SRC = os.environ.get("LITEGRIP_SRC", "/home/llx/litegrip-python/src")
 
 
 class GripNotReady(RuntimeError):
