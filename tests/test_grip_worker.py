@@ -1,65 +1,33 @@
-"""`GripWorker` —— 换算 / 前置 / 收尾 / 两端环（真 zenoh 回环，非 mock）。"""
-import socket
+"""`GripWorker` —— 构造护栏 / 前置 / 收尾 / **SDK 状态 → 界面快照** 的映射。
+
+⚠⚠ 遥操本身（协议、环、watchdog、对齐、交接、非有限值拒收）已**下沉到 litegrip
+SDK**（`LiteGrip.teleop_start/teleop_stop/teleop_status`）⇒ 本文件**只**测这层包装：
+它把 SDK 的状态字典翻成界面要的 `GripSnapshot`。那些语义的用例在
+`litegrip-python/tests/test_teleop.py`（本仓不再重复，也不再维护第二份实现）。
+
+⚠⚠ CI **不装 litegrip**（`.github/workflows/ci.yml` 只装 `pytest` + `zenoh`）
+⇒ 这里一律走 `FakeGrip` 替身，绝不 `import litegrip`。
+"""
 import sys
-import threading
 import time
 import types
 
 import pytest
 
 from liteteleop import grip_worker as gw
-from liteteleop import link
 from liteteleop.grip_worker import (ROLE_MASTER, ROLE_SLAVE, GripNotReady,
-                                    GripWorker, check_ready,
-                                    clamp_to_calibrated, mm_to_openness,
-                                    openness_to_rad, travel_mm_of)
+                                    GripWorker, check_ready, travel_mm_of)
 from tests.fake_grip import NORMAL, REVERSE, FakeCfg, FakeGrip
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
-
-
-# ════════════════════ §6.1 换算：close_sign 回归网 ════════════════════
-
-@pytest.mark.parametrize("mount,cfg", [
-    ("normal", FakeCfg(**NORMAL)),
-    ("reverse", FakeCfg(**REVERSE)),
-])
-def test_openness_maps_onto_both_calibrated_limits(mount, cfg):
-    """`openness=0` → 闭合限位；`openness=1` → 张开限位。**两种装法都必须成立**。
-
-    ⚠ 反装那组在**漏掉 `close_sign`** 时必红 —— 那正是参考实现
-    （`gripper_teleop.py:155-163`）的真实缺陷，这条就是它的回归网。
-    """
-    assert openness_to_rad(cfg, 0.0) == pytest.approx(cfg.pos_closed_rad)
-    assert openness_to_rad(cfg, 1.0) == pytest.approx(cfg.pos_open_rad)
-
+# ════════════════════ 换算（本仓只留 travel_mm 一处）════════════════════
 
 def test_travel_mm_matches_sdk_template():
-    """正装模板 `1.605 rad × 74.8` ≈ 120.05 mm，与 `max_stroke_mm=120` 吻合。"""
+    """正装模板 `1.605 rad × 74.8` ≈ 120.05 mm，与 `max_stroke_mm=120` 吻合。
+
+    ⚠ 只留这一条换算：`openness↔rad` 的换算现在**只在 SDK 里**，本仓不该有副本。
+    """
     assert travel_mm_of(FakeCfg(**NORMAL)) == pytest.approx(120.054, abs=0.01)
-
-
-def test_mm_to_openness_inverts_openness_to_rad():
-    """读侧（SDK 的 mm）与写侧（我们的 rad）必须互逆。"""
-    cfg = FakeCfg(**NORMAL)
-    for o in (0.0, 0.2, 0.5, 0.8, 1.0):
-        q = openness_to_rad(cfg, o)
-        mm = (cfg.pos_closed_rad - q) * cfg.close_sign * cfg.rad_to_mm
-        assert mm_to_openness(cfg, mm) == pytest.approx(o)
-
-
-def test_clamp_to_calibrated_handles_both_mounts():
-    n, r = FakeCfg(**NORMAL), FakeCfg(**REVERSE)
-    assert clamp_to_calibrated(n, 99.0) == pytest.approx(n.pos_closed_rad)
-    assert clamp_to_calibrated(n, -99.0) == pytest.approx(n.pos_open_rad)
-    assert clamp_to_calibrated(r, 99.0) == pytest.approx(r.pos_open_rad)
-    assert clamp_to_calibrated(r, -99.0) == pytest.approx(r.pos_closed_rad)
 
 
 # ════════════════════ 构造期就拒退化参数（别留到线程里才崩）════════════════════
@@ -69,12 +37,15 @@ def test_clamp_to_calibrated_handles_both_mounts():
     (dict(rate_hz=-1.0), "rate_hz"),
     (dict(watchdog_ms=0.0), "watchdog_ms"),
     (dict(watchdog_ms=-5.0), "watchdog_ms"),
+    (dict(poll_s=0.0), "poll_s"),
+    (dict(poll_s=-1.0), "poll_s"),
 ])
 def test_degenerate_construction_params_are_rejected(kw, match):
-    """⚠ `rate_hz <= 0` 会在环里 `1.0 / rate_hz` 抛 ZeroDivisionError；
-    `watchdog_ms <= 0` 不崩但会让从端**永远**判 stale ⇒ 一动不动（静默无用）。
+    """⚠ `rate_hz <= 0` / `watchdog_ms <= 0` 会被 SDK 的 `GripperTeleop` 拒掉；
+    `watchdog_ms <= 0` 的语义是"从端**永远**判 stale ⇒ 一动不动"（能启动、但什么都
+    不做的静默无用配置）。从线程里抛出来的表现只是"点了按钮没反应" ⇒ 构造时就拒。
 
-    判别力：去掉 `__init__` 里那两条 `ValueError` 时本用例必红。
+    判别力：去掉 `__init__` 里那三条 `ValueError` 时本用例必红。
     """
     with pytest.raises(ValueError, match=match):
         GripWorker(ROLE_MASTER, "can0", **kw)
@@ -103,7 +74,12 @@ def test_check_ready_rejects_zero_rad_to_mm():
 
 
 def test_worker_refuses_before_enabling():
-    """⚠ 断言 `enable()` **一次都没被调用** —— 未标定的夹爪不该先上一次电再被拒。"""
+    """⚠ 断言 `enable()` **一次都没被调用** —— 未标定的夹爪不该先上一次电再被拒。
+
+    这正是本仓**留着** `check_ready` 的唯一理由：SDK 的检查发生在 `teleop_start`
+    里，而那时调用方已经 `enable()` 过了（`enable` 后 `teleop_start` 才拒）。
+    我们要的是**先拒、后使能**。
+    """
     g = FakeGrip(calibrated=False)
     w = GripWorker(ROLE_MASTER, "can0", gripper_factory=lambda _c: g)
     w.start()
@@ -117,13 +93,13 @@ def test_worker_refuses_before_enabling():
 def test_factory_keeps_motor_enabled_on_disconnect(monkeypatch):
     """⚠⚠ `_default_gripper_factory` 必须显式传 `disable_on_disconnect=False`。
 
-    `LiteGrip.__init__` 的默认值是 **True**（`gripper.py:205`）—— 不传的话
+    `LiteGrip.__init__` 的默认值是 **True**（`gripper.py:225`）—— 不传的话
     `disconnect()` 会走 `self._can.disconnect(disable=True)` → `self.disable()`
-    （`protocols/can_bus.py:92`）⇒ **掉力、松开**，让收尾那帧持位帧白做。
+    （`protocols/can_bus.py`）⇒ **掉力、松开**，让收尾那帧持位帧白做。
     **删掉这个 kwarg 时本用例必红。**
 
     ⚠ 断言打在**构造参数**上：本设计里 worker 是直接 `g.disconnect()` 的，
-    行为在**构造时**就已决定（不是 litearm-device 那种 adapter 加锁层）。
+    行为在**构造时**就已决定。
     """
     seen = {}
 
@@ -139,19 +115,24 @@ def test_factory_keeps_motor_enabled_on_disconnect(monkeypatch):
     assert seen.get("disable_on_disconnect") is False
 
 
-def test_master_handoff_exits_zero_gravity():
-    """主端停下时必须退零重力（那一步本身就是一帧按当前位的持位帧）。"""
+def test_teardown_stops_session_and_disconnects():
+    """收尾顺序（spec §8 rule 5）：`teleop_stop()` **然后** `disconnect()`。
+
+    `teleop_stop()` 让夹爪交接持位（主端退零重力 / 从端补一帧当前位），
+    `disconnect()` 也**不失能**。⚠ `FakeGrip` **故意没有 `disable()`** ⇒
+    任何"顺手失能"的路径会当场 `AttributeError`。
+    """
     g = FakeGrip()
-    w = GripWorker(ROLE_MASTER, "can0", gripper_factory=lambda _c: g)
-    try:
-        w.start()
-        time.sleep(0.3)
-        w.set_teleop(True)
-        time.sleep(0.4)
-    finally:
-        w.stop(timeout=5.0)
-    assert g.zero_gravity_exits >= 1
+    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    w.start()
+    time.sleep(0.15)
+    w.set_teleop(True)
+    time.sleep(0.2)
+    w.stop(timeout=5.0)
+    assert g.teleop_stops >= 1, "收尾必须 teleop_stop（交接持位）"
     assert g.disconnects >= 1, "收尾必须 disconnect（否则进程可能挂死）"
+    assert w.snapshot().connected is False
+    assert w.snapshot().teleop_active is False
 
 
 # ════════════════════ §9.4 SDK 钉死断言 ════════════════════
@@ -169,276 +150,213 @@ def test_sdk_pin_accepts_the_target_and_rejects_the_other_copy():
         gw.assert_sdk_pinned(bad)
 
 
-# ════════════════════ §7.3 主从标定一致性诊断 ════════════════════
-
-def test_mismatch_warning_fires_on_different_travel():
-    w = GripWorker(ROLE_SLAVE, "can1")
-    w._cfg = FakeCfg(**NORMAL)                   # travel ≈ 120 mm
-    w._check_mismatch(0.5, 30.0)                 # 主端 travel ≈ 60 mm
-    assert "不一致" in w._mismatch
-
-
-def test_mismatch_warns_once_only():
-    w = GripWorker(ROLE_SLAVE, "can1")
-    w._cfg = FakeCfg(**NORMAL)
-    w._check_mismatch(0.5, 30.0)
-    first = w._mismatch
-    w._check_mismatch(0.5, 3.0)                  # 后来一致了也不撤回、不再叠加
-    assert w._mismatch == first
-
-
-def test_mismatch_window_excludes_clamped_openness():
-    """⚠ `openness→1` 时比值会报出主端**原始** `position_mm`（大于其真实 travel）
-    ⇒ 会误报「不一致」。饱和区必须排除。"""
-    w = GripWorker(ROLE_SLAVE, "can1")
-    w._cfg = FakeCfg(**NORMAL)
-    w._check_mismatch(1.0, 400.0)
-    assert not w._mismatch
-    w._check_mismatch(0.05, 3.0)
-    assert not w._mismatch
-
-
-# ════════════════════ 失败必须可见（不能静默死掉）════════════════════
-
-def test_exception_inside_the_loop_is_recorded():
-    """⚠⚠ 环里抛异常时，`snapshot().error` **必须**有内容。
-
-    否则界面只会显示「未启动」，用户看不到任何原因 —— 正是本仓哲学反对的
-    「连上了但界面不动」。`error` 也是**错误恢复**的触发条件
-    （`main_window._on_grip_state` 靠它丢掉 worker 让用户能重试）。
-
-    判别力：把 `_run_teleop` 的 `except` 里那句 `self._snap.error = str(e)`
-    删掉时本用例必红。
-    """
-    class _BadSend(FakeGrip):
-        def send_mit_frame(self, *a, **k):
-            raise RuntimeError("CAN 发送失败")
-
-    g = _BadSend()
-    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
-                   gripper_factory=lambda _c: g)
-    try:
-        w.start()
-        time.sleep(0.35)
-        w.set_teleop(True)
-        time.sleep(0.4)
-        err = w.snapshot().error
-        assert "CAN 发送失败" in err, f"环里的异常没被记下来，error={err!r}"
-    finally:
-        w.stop(timeout=5.0)
-
-
-def test_uncalibrated_error_is_recorded_and_loop_never_started():
-    """未标定 ⇒ 记 error，且**主端 Listener 都不该建**（`_run` 在建之前就抛了）。"""
-    g = FakeGrip(calibrated=False)
-    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
-                   gripper_factory=lambda _c: g)
-    try:
-        w.start()
-        time.sleep(0.35)
-        assert "未标定" in w.snapshot().error
-        assert w._pub is None, "拒绝启动时不该已经占住端口"
-    finally:
-        w.stop(timeout=5.0)
-
-
-# ════════════════════ §8 rule 9：协议边界必须拒非有限值 ════════════════════
-
-def _listen_and_publish(port, key):
-    """起一个裸发布端（模拟"坏主端"）。"""
-    return link.Listener(port, key)
-
-
-def test_slave_rejects_non_finite_frames_and_holds():
-    """⚠⚠ 一条 `openness=NaN` 的帧**必须**被拒，且**保持不动**。
-
-    不拒的话实测后果（危险一侧且静默）：
-
-        _clamp01(NaN)            = nan
-        openness_to_rad(cfg,NaN) = nan
-        clamp_to_calibrated(NaN) = pos_closed_rad   ← min(hi, NaN) 返回 hi
-
-    ⇒ 一条 NaN 帧把从端命令到**全闭限位**，而 `error` 是空的。
-    `±inf` 同样会被折成端点。
-
-    判别力：去掉 `_slave_loop` 里那个 `math.isfinite` 分支时，本用例会因为
-    `q` 变成全闭限位而红。
-    """
-    from liteteleop import link as _link
-    from liteteleop import grip_wire as _gw
-
-    port = _free_port()
-    sg = FakeGrip(position_rad=-0.7)
-    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
-                   rate_hz=100.0, align=False, gripper_factory=lambda _c: sg)
-    pub = _link.Listener(port, _gw.gripper_teleop_topic("gA"))
-    try:
-        s.start()
-        time.sleep(0.3)
-        s.set_teleop(True)
-        time.sleep(0.3)
-        sg.clear_sent()
-        for bad in (float("nan"), float("inf"), float("-inf")):
-            for _ in range(5):
-                pub.put(_gw.encode_gripper_teleop(bad, bad, 0.0, time.monotonic()))
-                time.sleep(0.01)
-        time.sleep(0.3)
-        qs = [f["q"] for f in sg.sent]
-        assert qs, "从端必须在持续发帧（持位）"
-        assert all(abs(q - (-0.7)) < 1e-9 for q in qs), \
-            f"收到非有限值帧后**必须保持不动**（-0.7），实际 q={sorted(set(round(q, 4) for q in qs))}"
-        assert s.snapshot().rejected >= 1, "被拒的帧要计数（不静默）"
-        assert s.snapshot().frames_received == 0, "非有限值帧不算收到有效帧"
-    finally:
-        s.stop(timeout=5.0)
-        pub.close()
-
-
-def test_align_rejects_non_finite_first_frame_and_holds():
-    """⚠⚠ **`align=True`（默认值！）时，非有限值的首帧也必须被跳过。**
-
-    这是我前面几轮全漏掉的一条路径：对齐用的 `_wait_first_frame` 曾经直接把
-    解出来的 tuple 返回给 `openness_to_rad` → `goto_rad`，而
-    `_clamp01(NaN)` 是 NaN、SDK 的 `goto_rad` 会把 NaN **折成端点**
-    ⇒ 夹爪被"吸"到全闭（正常装法 `hi == pos_closed_rad`），
-    而且 `rejected` 同时在涨、`error` 为空 —— 环里的守卫拦不住这条路。
-
-    实测证据（修前）：`goto_rad q=[nan]` 且此后 MIT 指令全是 `0.114`。
-
-    判别力：去掉 `_wait_first_frame` 里的 `math.isfinite` 检查时本用例必红。
-    ⚠ 我这里**故意用 `align=True`** —— 旧用例全用 `align=False`，所以从没走到这一格。
-    """
-    port = _free_port()
-    sg = FakeGrip(position_rad=-0.7)
-    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
-                   rate_hz=100.0, align=True, gripper_factory=lambda _c: sg)
-    pub = link.Listener(port, gw.gripper_teleop_topic("gA"))
-    stop = threading.Event()
-
-    def flood():
-        while not stop.is_set():
-            pub.put(gw.encode_gripper_teleop(float("nan"), float("nan"),
-                                             0.0, time.monotonic()))
-            time.sleep(0.005)
-
-    th = threading.Thread(target=flood, daemon=True)
-    try:
-        s.start()
-        time.sleep(0.3)
-        th.start()
-        s.set_teleop(True)
-        time.sleep(1.2)
-        assert sg.gotos == [], f"非有限值的首帧**不许**进 goto_rad，实际 {sg.gotos}"
-        qs = [f["q"] for f in sg.sent]
-        assert qs, "对齐等待期间也必须继续发持位帧（停发会掉力）"
-        assert all(abs(q - (-0.7)) < 1e-9 for q in qs), \
-            ("必须保持本机实测位置 -0.7，实际 "
-             f"{sorted(set(round(q, 4) for q in qs))}")
-        assert s.snapshot().rejected >= 1, "被跳过的帧要计数"
-        assert s.snapshot().frames_received == 0, "非有限值帧不算收到有效帧"
-    finally:
-        stop.set()
-        th.join(timeout=1.0)
-        s.stop(timeout=5.0)
-        pub.close()
-
-
-def test_non_finite_force_or_position_field_is_also_rejected():
-    """⚠ **四个字段都要判** —— `force_n` 现在也会显示在界面上。"""
-    from liteteleop import grip_wire as _gw
-
-    port = _free_port()
-    sg = FakeGrip(position_rad=-0.7)
-    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
-                   rate_hz=100.0, align=False, gripper_factory=lambda _c: sg)
-    pub = link.Listener(port, _gw.gripper_teleop_topic("gA"))
-    try:
-        s.start()
-        time.sleep(0.3)
-        s.set_teleop(True)
-        time.sleep(0.3)
-        sg.clear_sent()
-        for _ in range(5):                    # openness 有限，但 force_n 是 NaN
-            pub.put(_gw.encode_gripper_teleop(0.5, 60.0, float("nan"), time.monotonic()))
-            time.sleep(0.01)
-        time.sleep(0.25)
-        assert s.snapshot().frames_received == 0, "force_n 非有限值的帧也要拒"
-        assert s.snapshot().rejected >= 1
-        assert all(abs(f["q"] - (-0.7)) < 1e-9 for f in sg.sent), "必须保持不动"
-    finally:
-        s.stop(timeout=5.0)
-        pub.close()
-
-
-# ════════════════════ §8 rule 10：SDK 的失败信号必须被消费 ════════════════════
+# ════════════════════ §8 rule 10：失败必须可见（不能静默死掉）════════════════════
 
 def test_enable_failure_is_not_silent():
     """⚠⚠ `enable()` 失败**必须**报出来。
 
-    真 SDK **不抛** —— 只返回一个 falsy 的 `EnableResult`
-    （`EnableResult.__bool__` 就是 `self.ok`），此后 `send_mit_frame` 恒返回 `False`。
-    不查的实测后果：`error=''`、`connected=True`、`frames_sent` 一直涨，
-    而**电机根本没使能（夹爪是软的）** —— 界面还在显示"已发 N 帧 · 跟随中"。
+    真 SDK **不抛** —— 只返回一个 falsy 的 `EnableResult`，此后 `send_mit_frame`
+    恒返回 `False`。不查的实测后果：`error=''`、`connected=True`、
+    `frames_sent` 一直涨，而**电机根本没使能（夹爪是软的）**。
 
     判别力：去掉 `_run` 里那句 `if not self._grip.enable(): raise` 时本用例必红。
     """
     g = FakeGrip(enable_ok=False)
-    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
-                   gripper_factory=lambda _c: g)
+    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
-        time.sleep(0.4)
+        time.sleep(0.25)
         snap = w.snapshot()
         assert "使能失败" in snap.error, f"enable 失败必须记进 error，实际 {snap.error!r}"
         assert g.enable_calls == 1
-        assert snap.frames_sent == 0, "使能失败就不该进环发帧"
+        assert g.teleop_starts == [], "使能失败就不该去 teleop_start"
     finally:
         w.stop(timeout=5.0)
 
 
-def test_send_failure_is_counted():
-    """⚠ `send_mit_frame` 返回 `False` 时**要计数**（真 SDK 未使能时不抛）。"""
-    g = FakeGrip(enable_ok=False)
-    # 让 enable 成功但发送失败（模拟"使能了、CAN 却发不出去"）
-    g.enable_ok = True
-    orig = g.send_mit_frame
-    g.send_mit_frame = lambda *a, **k: (orig(*a, **k), False)[1]
-    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
-                   gripper_factory=lambda _c: g)
-    try:
-        w.start()
-        time.sleep(0.35)
-        w.set_teleop(True)
-        time.sleep(0.4)
-        assert w.snapshot().send_failed >= 1, \
-            f"send_mit_frame 返回 False 必须计数，实际 {w.snapshot().send_failed}"
-    finally:
-        w.stop(timeout=5.0)
+def test_teleop_start_failure_is_recorded():
+    """`teleop_start` 抛（`TeleopNotReady` / `TeleopBusyError` / …）⇒ 记 error。
 
-
-def test_gripper_own_fault_code_is_surfaced():
-    """⚠ 夹爪**自己**报的 `error_code` 要消费掉。
-
-    spec §7.4 偏离 #2 说「不 poll 就永远看不到夹爪自己的故障」——
-    可**只 poll 不看 `error_code` 等于没做**。SDK 语义：`1`=已使能、`0`=已失能、
-    其它=真实故障（`litegrip/constants.py:73-95`）。
-
-    判别力：去掉 `_note_grip_fault` 调用时本用例必红。
+    `error` 也是**错误恢复**的触发条件（`main_window._on_grip_state` 靠它丢掉
+    worker 让用户能重试）⇒ 不能吞。
     """
-    g = FakeGrip(fault_code=0xB)              # 0xB = MOS 过温
-    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
-                   gripper_factory=lambda _c: g)
+    g = FakeGrip()
+    g.raise_on_teleop_start = RuntimeError("teleop is already running")
+    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
-        time.sleep(0.35)
+        time.sleep(0.15)
         w.set_teleop(True)
-        time.sleep(0.4)
-        fault = w.snapshot().fault
-        assert "11" in fault, f"error_code 要报出来，实际 {fault!r}"
-        assert "过温" in fault, "要说明是什么故障"
+        time.sleep(0.25)
+        assert "already running" in w.snapshot().error, \
+            f"teleop_start 的异常必须被记下来，实际 {w.snapshot().error!r}"
     finally:
         w.stop(timeout=5.0)
 
+
+# ════════════════════ SDK 状态 → GripSnapshot 的映射 ════════════════════
+
+def test_master_status_maps_frames_to_sent_and_matching():
+    """主端：`frames` → `frames_sent`（不是 received），`matching` 透传。"""
+    g = FakeGrip()
+    g.teleop_status_extra = {"openness": 0.4, "position_mm": 42.0, "force_n": 3.5,
+                             "matching": True, "loop_hz": 48.0}
+    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True)
+        time.sleep(0.25)
+        s = w.snapshot()
+        assert s.teleop_active is True
+        assert s.frames_sent > 0, "主端要把 frames 记成 sent"
+        assert s.frames_received == 0
+        assert s.matching is True
+        assert s.openness == pytest.approx(0.4)
+        assert s.position_mm == pytest.approx(42.0)
+        assert s.force_n == pytest.approx(3.5)
+        assert s.loop_hz == pytest.approx(48.0)
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_slave_status_maps_frames_to_received_and_watchdog():
+    """从端：`frames` → `frames_received`；`stale` 的**假→真跳变**要计一次
+    `watchdog_trips`（不是每拍都加）；`frame_age` 由 `last_frame_age_ms` 换算。
+    """
+    g = FakeGrip()
+    g.teleop_status_extra = {"openness": 0.6, "position_mm": 60.0, "force_n": 1.0,
+                             "stale": True, "fault": "fault 11: MOS 过温",
+                             "rejected": 3, "send_failed": 2,
+                             "last_frame_age_ms": 250.0}
+    w = GripWorker(ROLE_SLAVE, "can1", gpeer="127.0.0.1", poll_s=0.02,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True)
+        time.sleep(0.35)
+        s = w.snapshot()
+        assert s.frames_received > 0, "从端要把 frames 记成 received"
+        assert s.frames_sent == 0
+        assert s.stale is True
+        assert s.watchdog_trips == 1, "stale 一直为真也只算一次跳变"
+        assert s.frame_age == pytest.approx(0.25)
+        assert s.rejected == 3
+        assert s.send_failed == 2
+        assert "过温" in s.fault
+        assert s.matching is False, "matching 是主端字段"
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_slave_mismatch_warning_from_status():
+    """§7.3：从端从 `position_mm / openness` 反推主端 travel ≈ 60 mm，
+    与本端 120 mm 差太多 ⇒ 告警一次（挡"主从装了不同型号夹爪"）。
+    """
+    g = FakeGrip()
+    g.teleop_status_extra = {"openness": 0.5, "position_mm": 30.0}
+    w = GripWorker(ROLE_SLAVE, "can1", gpeer="127.0.0.1", poll_s=0.02,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True)
+        time.sleep(0.25)
+        assert "不一致" in w.snapshot().mismatch
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_status_without_session_does_not_zero_the_readout():
+    """⚠ 会话没起来时 `teleop_status()` 只有 `{"active": False, "mode": None}`
+    （**没有 `topic`**）—— 那不是一份状态，别拿它把上一帧的读数清成 0。
+
+    判别力：把 `_update` 里的 `has_session` 判据去掉（无条件覆盖）时，
+    本用例会因为读数被清零而红。
+    """
+    g = FakeGrip()
+    g.teleop_status_extra = {"openness": 0.7, "position_mm": 70.0}
+    w = GripWorker(ROLE_SLAVE, "can1", gpeer="127.0.0.1", poll_s=0.02,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True)
+        time.sleep(0.25)
+        assert w.snapshot().openness == pytest.approx(0.7)
+        w.set_teleop(False)                       # 停会话 ⇒ 状态回落到无会话形态
+        time.sleep(0.25)
+        assert w.snapshot().openness == pytest.approx(0.7), \
+            "无会话的状态不是一份读数，不该把上一帧清成 0"
+    finally:
+        w.stop(timeout=5.0)
+
+
+# ════════════════════ 会话自行结束时**不重启风暴** ════════════════════
+
+def test_self_ended_session_does_not_restart_storm():
+    """⚠⚠ SDK 的会话自己结束（CAN 出错 / 环退出）时 `_want` 还是 True。
+
+    若判序是"想启动 且 没在跑 ⇒ 启动"，就**每一拍都重启一次**（重启风暴）。
+    本仓明确收手：清 `_want`、让界面弹回「启动」，由用户决定要不要再来一次。
+
+    判别力：把 `_poll_loop` 里"会话自行结束"那条移到 `_want and not running`
+    **之后**（即原顺序）时，本用例会因为 `teleop_starts` 一路涨而红。
+    """
+    g = FakeGrip()
+    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True)
+        time.sleep(0.2)
+        assert len(g.teleop_starts) == 1
+        g.teleop_running = False                  # 会话"自己"结束
+        time.sleep(0.3)
+        assert len(g.teleop_starts) == 1, "会话自行结束不许被反复重启"
+        assert w._want is False, "要收手（清 _want），否则下一拍又重启"
+        assert w.snapshot().teleop_active is False
+    finally:
+        w.stop(timeout=5.0)
+
+
+# ════════════════════ 传给 SDK 的实参 ════════════════════
+
+@pytest.mark.parametrize("role,gcan,gpeer", [
+    (ROLE_MASTER, "can0", "127.0.0.1"),
+    (ROLE_SLAVE, "can1", "10.0.0.5"),
+])
+def test_teleop_start_receives_the_right_arguments(role, gcan, gpeer):
+    """⚠ 模式、`link`、`host`、端口、`grip_id`、`watchdog_s`、`rate_hz` 都要对。
+
+    `host` 的规矩：**主端只监听 ⇒ 传 None**；从端必须传对端地址。
+    `watchdog_s` 是**秒**，本仓的 `watchdog_ms` 要除以 1000（传错就是量纲 bug）。
+    """
+    g = FakeGrip()
+    w = GripWorker(role, gcan, grip_id="gB", gpeer=gpeer, gport=17449,
+                   rate_hz=100.0, watchdog_ms=250.0, align=False,
+                   poll_s=0.02, gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True)
+        time.sleep(0.2)
+        assert g.teleop_starts, "应当已经 teleop_start"
+        kw = g.teleop_starts[0]
+        assert kw["mode"] == role
+        assert kw["link"] == "zenoh"
+        assert kw["host"] == (None if role == ROLE_MASTER else gpeer)
+        assert kw["port"] == 17449
+        assert kw["grip_id"] == "gB"
+        assert kw["align"] is False
+        assert kw["watchdog_s"] == pytest.approx(0.25)
+        assert kw["rate_hz"] == pytest.approx(100.0)
+    finally:
+        w.stop(timeout=5.0)
+
+
+# ════════════════════ 收尾超时：不许清掉线程引用 ════════════════════
 
 def test_stop_timeout_keeps_the_thread_reference():
     """⚠ 收尾超时时**不能**清掉 `self._thread`。
@@ -455,11 +373,10 @@ def test_stop_timeout_keeps_the_thread_reference():
             super().disconnect()
 
     g = _SlowDisconnect()
-    w = GripWorker(ROLE_MASTER, "can0", gport=_free_port(), rate_hz=100.0,
-                   gripper_factory=lambda _c: g)
+    w = GripWorker(ROLE_MASTER, "can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
-        time.sleep(0.35)
+        time.sleep(0.2)
         w.stop(timeout=0.2)                   # 故意短于 disconnect 的 1.5 s
         assert w.is_alive() is True, "超时后线程仍在跑，必须能被问到"
         assert w._thread is not None, "超时时不许清掉线程引用"
@@ -467,190 +384,3 @@ def test_stop_timeout_keeps_the_thread_reference():
         assert w.is_alive() is False
     finally:
         w.stop(timeout=5.0)
-
-
-def test_master_refuses_to_publish_non_finite():
-    """主端读数坏掉时**不发帧** ⇒ 从端 watchdog 超时转持位（安全那一侧）。"""
-    class _BadRead(FakeGrip):
-        def get_state(self, wait: bool = True):
-            from tests.fake_grip import FakeState
-            return FakeState(position_rad=float("nan"), position_mm=float("nan"),
-                             force_n=0.0)
-
-    g = _BadRead()
-    w = GripWorker(ROLE_MASTER, "can0", grip_id="gA", gport=_free_port(),
-                   rate_hz=100.0, gripper_factory=lambda _c: g)
-    try:
-        w.start()
-        time.sleep(0.35)
-        w.set_teleop(True)
-        time.sleep(0.4)
-        snap = w.snapshot()
-        assert snap.frames_sent == 0, f"读数非有限值就不该发帧，实际发了 {snap.frames_sent}"
-        assert snap.rejected >= 1, "被拒的帧要计数（不静默）"
-    finally:
-        w.stop(timeout=5.0)
-
-
-# ════════════════════ 两端环（真 zenoh 回环）════════════════════
-
-def _pair(port: int, rate_hz: float = 100.0):
-    mg, sg = FakeGrip(), FakeGrip()
-    m = GripWorker(ROLE_MASTER, "can0", grip_id="gA", gport=port,
-                   rate_hz=rate_hz, gripper_factory=lambda _c: mg)
-    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
-                   rate_hz=rate_hz, align=True, gripper_factory=lambda _c: sg)
-    return m, s, mg, sg
-
-
-def test_master_to_slave_follows():
-    """主端手掰 → 从端跟到位（端到端，真 zenoh）。"""
-    port = _free_port()
-    m, s, mg, sg = _pair(port)
-    try:
-        m.start()
-        time.sleep(0.3)
-        m.set_teleop(True)
-        time.sleep(0.5)
-        s.start()
-        time.sleep(0.3)
-        s.set_teleop(True)
-        time.sleep(1.5)
-        assert s.snapshot().frames_received > 0, "从端一帧都没收到"
-
-        mg.drag_to(openness_to_rad(mg.config, 0.5))
-        deadline = time.monotonic() + 3.0
-        want = openness_to_rad(sg.config, 0.5)
-        while time.monotonic() < deadline:
-            if sg.last_sent_q() is not None and abs(sg.last_sent_q() - want) < 0.05:
-                break
-            time.sleep(0.05)
-        assert sg.last_sent_q() == pytest.approx(want, abs=0.05)
-    finally:
-        s.stop(timeout=5.0)
-        m.stop(timeout=5.0)
-
-
-def test_watchdog_holds_position_when_master_stops():
-    """⚠ 主端停发 ⇒ 从端 **持位**：q 一动不动，但**继续发帧**（否则掉力）。"""
-    port = _free_port()
-    m, s, mg, sg = _pair(port)
-    try:
-        m.start()
-        time.sleep(0.3)
-        m.set_teleop(True)
-        time.sleep(0.5)
-        s.start()
-        time.sleep(0.3)
-        s.set_teleop(True)
-        time.sleep(1.0)
-
-        mg.drag_to(openness_to_rad(mg.config, 0.7))
-        deadline = time.monotonic() + 3.0
-        want = openness_to_rad(sg.config, 0.7)
-        while time.monotonic() < deadline:
-            if sg.last_sent_q() is not None and abs(sg.last_sent_q() - want) < 0.05:
-                break
-            time.sleep(0.05)
-        held = sg.last_sent_q()
-        assert held == pytest.approx(want, abs=0.05)
-
-        m.set_teleop(False)                      # 主端停发
-        time.sleep(0.4)                          # 等过 200 ms watchdog
-        sg.clear_sent()
-        time.sleep(0.5)
-
-        assert s.snapshot().stale is True, "watchdog 应该已判 stale"
-        assert s.snapshot().watchdog_trips >= 1
-        assert len(sg.sent) > 0, "stale 之后仍必须继续发帧（MIT 模式停发会掉力）"
-        assert all(f["q"] == pytest.approx(held, abs=1e-9) for f in sg.sent), \
-            "持位：q 必须在整段 stale 期间一动不动"
-        assert all(f["kp"] > 0 for f in sg.sent), "持位帧必须带刚度，不能是零力矩帧"
-    finally:
-        s.stop(timeout=5.0)
-        m.stop(timeout=5.0)
-
-
-def test_slave_without_first_frame_sends_measured_position_not_zero():
-    """⚠⚠ 首帧没到时若把 `q` 初始化成 `0.0`，那是一个**真实位置指令**
-    （正装 `0.0 rad` = 全开）⇒ 可能直冲机械限位。
-    入口必须取**本机实测位置** —— 这条就是那个兜底的回归网。"""
-    port = _free_port()                          # ⚠ 故意没有主端在监听
-    sg = FakeGrip(position_rad=-0.7)
-    s = GripWorker(ROLE_SLAVE, "can1", grip_id="gA", gpeer="127.0.0.1", gport=port,
-                   rate_hz=100.0, align=False, gripper_factory=lambda _c: sg)
-    try:
-        s.start()
-        time.sleep(0.3)
-        s.set_teleop(True)
-        time.sleep(0.6)
-        assert len(sg.sent) > 0, "没收到帧也必须持续发帧"
-        assert sg.sent[0]["q"] == pytest.approx(-0.7), \
-            "入口必须取本机实测位置（-0.7），不能是 0.0"
-    finally:
-        s.stop(timeout=5.0)
-
-
-def test_teleop_can_be_restarted_repeatedly():
-    """⚠⚠ 「停止 → 再启动」必须还能用，而且要**每轮都通**。
-
-    这里钉住两个实测过的真 bug（2026-09-28，都是本仓自己踩的）：
-
-    1. 主端 `Listener` 若每轮遥操拆了重建：遥操停下后端口不释放 ⇒ 第二次启动
-       必定 `Can not create a new TCP listener bound to ...: Address already in use`，
-       而且端口要等**进程退出**才回来（表现：**只能启动一次**）。
-    2. 就算补上关闭，**同一端口上拆了重建**会让订阅↔发布匹配**间歇性**建立不起来
-       —— 实测 12 轮里 5 轮 `matching=False`（主端照发、从端一帧收不到）。
-
-    判别力：把 `_run` 里那句常驻 `link.Listener` 挪回 `_master_loop` 时，
-    本用例会在第 2 轮就红（报错或 `matching` 为假）。
-    """
-    port = _free_port()
-    m, s, mg, sg = _pair(port, rate_hz=100.0)
-    try:
-        m.start()
-        time.sleep(0.3)
-        s.start()
-        time.sleep(0.3)
-        prev_m, prev_s = 0, 0
-        for i in range(4):
-            m.set_teleop(True)
-            s.set_teleop(True)
-            time.sleep(0.5)
-            snap_m, snap_s = m.snapshot(), s.snapshot()
-            assert not snap_m.error, f"第{i + 1}轮主端报错: {snap_m.error}"
-            assert not snap_s.error, f"第{i + 1}轮从端报错: {snap_s.error}"
-            assert snap_m.matching is True, f"第{i + 1}轮主端没有订阅者（匹配失败）"
-            assert snap_m.frames_sent > prev_m, f"第{i + 1}轮主端没发出新帧"
-            assert snap_s.frames_received > prev_s, f"第{i + 1}轮从端没收到新帧"
-            prev_m, prev_s = snap_m.frames_sent, snap_s.frames_received
-            m.set_teleop(False)
-            s.set_teleop(False)
-            time.sleep(0.3)
-    finally:
-        s.stop(timeout=5.0)
-        m.stop(timeout=5.0)
-
-
-def test_align_moves_slave_toward_master_first_frame():
-    """对齐：先 `goto_rad` 到首帧位置，再进高频跟随。"""
-    port = _free_port()
-    m, s, mg, sg = _pair(port)
-    try:
-        m.start()
-        time.sleep(0.3)
-        mg.drag_to(openness_to_rad(mg.config, 0.8))
-        m.set_teleop(True)
-        time.sleep(0.6)
-        s.start()
-        time.sleep(0.3)
-        s.set_teleop(True)
-        s._want = True                            # 已经在 _run 里
-        deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline and not sg.gotos:
-            time.sleep(0.05)
-        assert sg.gotos, "对齐应当调用 goto_rad"
-        assert sg.gotos[0]["q"] == pytest.approx(openness_to_rad(sg.config, 0.8), abs=0.05)
-    finally:
-        s.stop(timeout=5.0)
-        m.stop(timeout=5.0)
