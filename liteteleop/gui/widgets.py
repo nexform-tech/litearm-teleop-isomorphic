@@ -1,4 +1,10 @@
-"""常驻控件：关节表 + 状态条（spec §8）。"""
+"""常驻控件：7 轴关节表（spec §8）。
+
+⚠ 原来这里还有一个 `StatusStrip`（底部常驻状态条）。**2026-09-29 删掉了** ——
+设计稿里没有底部状态条，那几格被**顶栏的指标组**和**主从链路卡的指标块**取代了
+（`shell.TopBar` / `pages.LinkCard`）。判据（主臂显示"已发"、从臂显示"已收"）
+原样搬到了链路卡，没有丢。
+"""
 from __future__ import annotations
 
 from typing import List, Optional
@@ -8,7 +14,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from ..arm_worker import Snapshot
 from ..wire import N_JOINTS
 
-__all__ = ["JointTable", "StatusStrip", "OK_BRUSH", "BAD_BRUSH"]
+__all__ = ["JointTable", "OK_BRUSH", "BAD_BRUSH", "ERR_ENABLED"]
 
 OK_BRUSH = QtGui.QColor(0x20, 0x7a, 0x30)      # 正常
 BAD_BRUSH = QtGui.QColor(0xb0, 0x20, 0x20)     # 异常（红底白字）
@@ -23,17 +29,44 @@ class JointTable(QtWidgets.QTableWidget):
 
     温度**只显示数值**，不判阈值 —— 固件的温度锁存已反映在 `err`/`joint_fault` 上，
     界面另发明一套阈值就是制造第二份真相（spec §8）。
+
+    ⚠ `compact=True` 给「遥操页左栏」用（那里只有 ~430px 宽）。它**只换表头文案与字体**，
+    **列数与判据一律不变** —— `err != 1 才高亮` 这条口径在任何模式下都成立。
+    ⛔ 别在紧凑模式下砍掉 `t_coil` 或 `err` 列：那是拿"放不下"当借口改判据。
     """
 
     COLS = ["关节", "q (rad)", "dq (rad/s)", "tau (Nm)", "t_mos (°C)", "t_coil (°C)", "err"]
+    #: 紧凑表头（窄栏用）。列序与 `COLS` **逐一对应**，不许增删列。
+    COLS_COMPACT = ["J", "q", "dq", "tau", "t_mos", "t_coil", "err"]
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, compact: bool = False):
         super().__init__(N_JOINTS, len(self.COLS), parent)
-        self.setHorizontalHeaderLabels(self.COLS)
+        self._compact = compact
+        self.setHorizontalHeaderLabels(self.COLS_COMPACT if compact else self.COLS)
         self.verticalHeader().setVisible(False)
         self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.setShowGrid(False)
+        if compact:
+            # ⚠⚠ 紧凑模式**不能靠 `QHeaderView.Stretch`**：它按表头构造时的长度算列宽，
+            #   离屏实测出来是 `91×7 = 637px`，而左栏只有 ~420px
+            #   ⇒ **最后一列（err）被裁掉**，而 err 恰恰是唯一的判据列。
+            #   改成显式分配：`Interactive` 模式 + `resizeEvent` 里均分。
+            for c in range(self.columnCount()):
+                self.horizontalHeader().setSectionResizeMode(
+                    c, QtWidgets.QHeaderView.Interactive)
+            # ⚠ 字体必须用 `setFont` 直接设 —— 只写在 QSS 里改不动 Qt 算行高用的字体，
+            #   实测行高仍是 25px（QSS 是绘制期生效），7 行就装不下被裁。
+            f = QtGui.QFont(self.font())
+            f.setPixelSize(11)
+            self.setFont(f)
+            self.horizontalHeader().setFont(f)
+            self.verticalHeader().setDefaultSectionSize(21)
+            self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self._lock_height()
+        else:
+            self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         for r in range(N_JOINTS):
             self.setItem(r, 0, QtWidgets.QTableWidgetItem(f"J{r + 1}"))
             for c in range(1, len(self.COLS)):
@@ -55,39 +88,27 @@ class JointTable(QtWidgets.QTableWidget):
             it.setBackground(BAD_BRUSH if bad else OK_BRUSH)
             it.setForeground(QtGui.QColor("white"))
 
+    # ── 紧凑模式：显式均分列宽 + 高度贴合 ──
+    def _lock_height(self) -> None:
+        """把高度钉成「实测表头 + 7 行」。
 
-class StatusStrip(QtWidgets.QWidget):
-    """常驻状态条：模式 | 使能 | 遥操 | 频率 | 帧龄 | 故障。"""
+        ⚠⚠ **必须在 `resizeEvent` 里反复重算，不能在 `__init__` 里算一次。**
+        构造那一刻表头还没按最终字体量过高（实测差 3px），于是固定高度偏小、
+        **最后一行 J7 被裁掉** —— 而这一列里恰好有 `err` 这个唯一判据。
+        """
+        h = (self.horizontalHeader().height()
+             + sum(self.rowHeight(r) for r in range(N_JOINTS)) + 2)
+        if h != self.height():
+            self.setFixedHeight(h)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(8, 2, 8, 2)
-        self._labels = {}
-        for key in ("模式", "使能", "遥操", "频率", "匹配/帧龄", "故障"):
-            lab = QtWidgets.QLabel(f"{key}: —")
-            lab.setFrameShape(QtWidgets.QFrame.StyledPanel)
-            lay.addWidget(lab)
-            self._labels[key] = lab
-
-    def update_from(self, s: Snapshot) -> None:
-        self._labels["模式"].setText(f"模式: {s.mode_name or '—'}")
-        self._labels["使能"].setText(f"使能: {'是' if s.enabled else '否'}")
-        self._labels["遥操"].setText(f"遥操: {'运行中' if s.teleop_active else '停止'}")
-        if s.role == "master":
-            self._labels["频率"].setText(f"已发: {s.frames_sent}")
-            self._labels["匹配/帧龄"].setText(
-                f"订阅: {'已匹配' if s.matching else '未匹配'}")
-        else:
-            self._labels["频率"].setText(f"已收: {s.frames_received}")
-            age = "—" if s.frame_age is None else f"{s.frame_age * 1000:.0f} ms"
-            self._labels["匹配/帧龄"].setText(f"帧龄: {age}")
-        faults: List[str] = []
-        if s.faulted:
-            faults.append("FAULT")
-        if s.joint_fault:
-            faults.append(f"joint_fault=0x{s.joint_fault:x}")
-        faults.extend(s.flag_names)
-        if s.error:
-            faults.append(s.error)
-        self._labels["故障"].setText("故障: " + ("、".join(faults) if faults else "无"))
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        if not self._compact:
+            return
+        n = self.columnCount()
+        avail = self.viewport().width()
+        if avail > 0:
+            each = max(28, avail // n)      # 夹一个下限，太窄就让文字自己省略
+            for c in range(n):
+                self.setColumnWidth(c, each)
+        self._lock_height()

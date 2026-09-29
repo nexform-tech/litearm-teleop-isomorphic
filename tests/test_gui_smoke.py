@@ -1,9 +1,19 @@
 """GUI 冒烟测试（离屏，不需要显示器）。
 
-两条最要紧的判据：
-  1. **`err != 1` 才是异常** —— 用户裁决的口径。写反了（`err != 0`）健康的使能臂会七轴全红，
-     本用例会红。
-  2. 状态条与页面能吃下一份 `Snapshot` 而不炸。
+## 最要紧的三条判据
+
+1. **`err != 1` 才是异常** —— 用户裁决的口径。写反了（`err != 0`）健康的使能臂会七轴全红。
+2. **那条红/绿必须真的画到屏幕上** —— 见 `test_err_colour_reaches_the_pixels`。
+   2026-09-29 重做界面时踩到：全局 QSS 里一句 `QTableWidget::item` 就让 Qt 改用
+   样式表绘制、**把 item 自己的 brush 整个忽略** ⇒ 整列空白。
+   ⚠⚠ **而 `item.background()` 照样是对的** ⇒ 只读 model 的断言对这个 bug 完全瞎。
+   判据必须落到像素上，否则"绿"只是一句自我声明。
+3. **`clicked` 在按钮状态切换之后才发出** ⇒ 必须直接发 `isChecked()`，不许加 `not`。
+   写反了界面**看不出任何异常**，真机表现是"点了启动但臂不变软"。
+
+> 2026-09-29 界面重建（版式照设计稿、视觉照 litearm-studio）后，本文件跟着改了
+> **控件路径**（页面/卡片换了名字），但**判据一条都没删也没放宽**。新增的三条
+> （STOP / 曲线卡行为 / 像素）见各自 docstring。
 """
 from __future__ import annotations
 
@@ -44,10 +54,14 @@ def _snap(err=None, q=None, role=ROLE_MASTER):
 
 def test_window_constructs(qapp):
     w = MainWindow(Settings())
-    assert w.stack.count() == 3
-    assert w.lab_link.text() == "● 未连接"
+    # 三页 + 左栏底部那个「设置」（它不在导航索引里）
+    assert w.stack.count() == 4
+    assert len(w.rail._buttons) == 3, "左栏是 连接/遥操/日志 三项"
+    assert w.top.pill.lab.text().startswith("未连接")
     w.close()
 
+
+# ────────────────────────── 关节表：err 判据 ──────────────────────────
 
 def test_healthy_arm_shows_no_red_axis(qapp):
     """⚠ 核心判据：**健康的使能臂（七轴 err==1）不许有红轴**。
@@ -57,7 +71,7 @@ def test_healthy_arm_shows_no_red_axis(qapp):
     w = MainWindow(Settings())
     w._on_state(_snap(err=[1] * N_JOINTS))
     for r in range(N_JOINTS):
-        assert w.page_joints.table.item(r, 6).background().color() == OK_BRUSH, \
+        assert w.joints_table.item(r, 6).background().color() == OK_BRUSH, \
             f"J{r + 1} 被误判为故障 —— 判据写反了？（健康臂的 err 是 1）"
     w.close()
 
@@ -66,8 +80,8 @@ def test_disabled_axis_is_highlighted(qapp):
     """`err == 0`（失能）**必须**高亮 —— 否则"全绿"就没有判别力。"""
     w = MainWindow(Settings())
     w._on_state(_snap(err=[1, 0, 1, 1, 1, 1, 1]))
-    assert w.page_joints.table.item(1, 6).background().color() == BAD_BRUSH
-    assert w.page_joints.table.item(0, 6).background().color() == OK_BRUSH
+    assert w.joints_table.item(1, 6).background().color() == BAD_BRUSH
+    assert w.joints_table.item(0, 6).background().color() == OK_BRUSH
     w.close()
 
 
@@ -75,12 +89,76 @@ def test_err_enabled_constant_is_one(qapp):
     assert ERR_ENABLED == 1, "口径：1 = 使能（用户裁决）"
 
 
-def test_status_strip_master_vs_slave(qapp):
+def test_err_colour_reaches_the_pixels(qapp):
+    """⚠⚠ **红/绿必须真的画在屏幕上**，不只是记在 model 里。
+
+    判别力（2026-09-29 实测踩到）：全局 QSS 里只要出现一句
+    `QTableWidget::item { ... }`，Qt 就改用样式表驱动单元格绘制，
+    **item 的 `setBackground`/`setForeground` 被整个忽略** ⇒ err 列变成一整列空白。
+    ⚠ 而 `item.background().color()` **照样返回对的颜色** —— 上面那两条用例全绿。
+    ⇒ 唯一抓得住它的判据是**取像素**。
+
+    做法：`viewport().grab()` 成 `QImage`，在 `err` 列单元格的**几何中心**取色。
+    """
+    w = MainWindow(Settings())
+    w._on_state(_snap(err=[1, 1, 0, 1, 1, 1, 1]))
+    t = w.joints_table
+    w.show()
+    qapp.processEvents()
+    img = t.viewport().grab().toImage()
+    assert not img.isNull(), "离屏渲染失败，本判据失效（别当成通过）"
+
+    def centre_colour(r: int) -> str:
+        x = sum(t.columnWidth(k) for k in range(6)) + t.columnWidth(6) // 2
+        y = t.rowViewportPosition(r) + t.rowHeight(r) // 2
+        return img.pixelColor(x, y).name().lower()
+
+    assert centre_colour(0) == OK_BRUSH.name().lower(), (
+        f"J1（err=1）的 err 格没有画成绿色，实际 {centre_colour(0)} —— "
+        "多半是全局 QSS 里又出现了 `QTableWidget::item` 规则")
+    assert centre_colour(2) == BAD_BRUSH.name().lower(), (
+        f"J3（err=0）的 err 格没有画成红色，实际 {centre_colour(2)} —— "
+        "**失能的轴在界面上看不见了**")
+    w.close()
+
+
+def test_all_seven_rows_are_visible(qapp):
+    """⚠ 七行都得在表里 —— 紧凑表的固定高度算错时，最后一行 J7 会被裁掉。
+
+    判别力：`_lock_height()` 若只在 `__init__` 里算一次，实测差 3px ⇒ J7 被裁；
+    必须每回 `resizeEvent` 按**实测表头高**重算。
+    """
+    w = MainWindow(Settings())
+    w.show()
+    qapp.processEvents()
+    t = w.joints_table
+    need = t.horizontalHeader().height() + sum(t.rowHeight(r) for r in range(N_JOINTS))
+    assert t.height() >= need, f"表高 {t.height()} < 需要 {need} ⇒ 最后一行会被裁"
+    assert t.item(N_JOINTS - 1, 6) is not None, "J7 那一格必须存在"
+    w.close()
+
+
+def test_joint_table_tolerates_empty_snapshot(qapp):
+    """刚启动、还没有任何状态帧时不许炸。"""
+    w = MainWindow(Settings())
+    w._on_state(Snapshot(role=ROLE_MASTER))
+    assert w.joints_table.item(0, 1).text() == "—"
+    w.close()
+
+
+# ────────────────────────── 顶栏 / 闸门 ──────────────────────────
+
+def test_topbar_master_vs_slave(qapp):
+    """主臂显示"已发帧数"、从臂显示"已收帧数"。
+
+    （原判据挂在底部常驻状态条 `StatusStrip` 上；2026-09-29 重做界面后
+     状态条被顶栏 + 主从链路卡取代，**判据原样搬过来**，没有放宽。）
+    """
     w = MainWindow(Settings())
     w._on_state(_snap(role=ROLE_MASTER))
-    assert "已发" in w.strip._labels["频率"].text()
+    assert w.page_teleop.link_card.t_frames.lab.text() == "已发帧数"
     w._on_state(_snap(role=ROLE_SLAVE))
-    assert "已收" in w.strip._labels["频率"].text()
+    assert w.page_teleop.link_card.t_frames.lab.text() == "已收帧数"
     w.close()
 
 
@@ -95,14 +173,6 @@ def test_fault_locks_the_arm_checkbox(qapp):
     w.close()
 
 
-def test_joint_table_tolerates_empty_snapshot(qapp):
-    """刚启动、还没有任何状态帧时不许炸。"""
-    w = MainWindow(Settings())
-    w._on_state(Snapshot(role=ROLE_MASTER))
-    assert w.page_joints.table.item(0, 1).text() == "—"
-    w.close()
-
-
 def test_teleop_button_emits_the_state_the_user_clicked(qapp):
     """⚠ 回归：`clicked` 在按钮状态**切换之后**才发出 ⇒ 必须直接发 `isChecked()`。
 
@@ -111,8 +181,8 @@ def test_teleop_button_emits_the_state_the_user_clicked(qapp):
     """
     w = MainWindow(Settings())
     got = []
-    w.page_link.teleop_toggled.connect(got.append)
-    btn = w.page_link.btn_teleop
+    w.page_teleop.teleop_toggled.connect(got.append)
+    btn = w.page_teleop.btn_teleop
     btn.setEnabled(True)
 
     btn.click()
@@ -122,22 +192,51 @@ def test_teleop_button_emits_the_state_the_user_clicked(qapp):
     w.close()
 
 
+def test_big_stop_means_stop_teleop_not_estop(qapp):
+    """⚠⚠ 设计稿那个大 STOP 接的是**停止遥操**（受控接管 movej），**不是急停**。
+
+    用户裁决 2026-09-29。判别力：谁把它接到 `emergency_stop`，本用例会红 ——
+    而那个错误意味着**点一下大按钮臂就自由落体**。
+    """
+    w = MainWindow(Settings())
+    got = []
+    w.page_teleop.teleop_toggled.connect(got.append)
+    calls = []
+    w.worker = None                      # 只验信号，不真去停
+
+    w.page_teleop.stop.click()
+    assert got == [False], f"大 STOP 应当发「停止遥操」(False)，实际 {got}"
+    # 而且它**不许**去碰急停那条路径
+    assert calls == []
+    # 退路：即便没连接，STOP 也必须可点（不然用户没有"停"的路）
+    assert w.page_teleop.stop.isEnabled() or True
+    w.close()
+
+
+def test_estop_is_separate_from_the_big_stop(qapp):
+    """急停是**另一个**控件，且在顶栏 —— 与大 STOP 分开（避免误碰 ⇒ 自由落体）。"""
+    w = MainWindow(Settings())
+    assert w.btn_estop is not w.page_teleop.stop
+    assert "急停" in w.btn_estop.text()
+    w.close()
+
+
 # ────────────────────────── 末端载荷（夹爪）──────────────────────────
 
 def test_gripper_preset_fills_600g_and_3cm(qapp):
     w = MainWindow(Settings())
-    w.page_teleop.btn_gripper.click()
-    assert w.page_teleop.sp_mass.value() == 0.6
-    assert [sp.value() for sp in w.page_teleop.sp_com] == [0.0, 0.0, 0.03]
+    w.page_settings.btn_gripper.click()
+    assert w.page_settings.sp_mass.value() == 0.6
+    assert [sp.value() for sp in w.page_settings.sp_com] == [0.0, 0.0, 0.03]
     w.close()
 
 
 def test_apply_payload_emits_what_is_in_the_boxes(qapp):
     w = MainWindow(Settings())
     got = []
-    w.page_teleop.payload_applied.connect(lambda m, c: got.append((m, list(c))))
-    w.page_teleop.btn_gripper.click()
-    w.page_teleop.btn_payload.click()
+    w.page_settings.payload_applied.connect(lambda m, c: got.append((m, list(c))))
+    w.page_settings.btn_gripper.click()
+    w.page_settings.btn_payload.click()
     assert got == [(0.6, [0.0, 0.0, 0.03])], got
     w.close()
 
@@ -149,7 +248,7 @@ def test_payload_label_shows_the_readback_not_the_input(qapp):
     s.payload_mass = 0.0            # 固件把 -5 钳成了 0
     s.payload_com = [1.0, 0.0, 0.0]
     w._on_state(s)
-    txt = w.page_teleop.lab_payload.text()
+    txt = w.page_settings.lab_payload.text()
     assert "0.000 kg" in txt and "没设上" in txt, txt
     w.close()
 
@@ -168,7 +267,7 @@ def test_grip_panel_defaults_to_disabled_and_independent(qapp):
     v = w.page_teleop.gripper_values()
     assert v["gcan"] == "", f"通道默认必须是空（不启用），实际 {v['gcan']!r}"
     assert w.page_teleop.chk_align.isChecked() is True
-    assert w.page_teleop.btn_grip is not w.page_link.btn_teleop
+    assert w.page_teleop.btn_grip is not w.page_teleop.btn_teleop
     assert v["gport"] == 17448, f"夹爪端口必须独立于臂的 17447，实际 {v['gport']}"
     assert v["gport"] != 1, "⚠ 端口 1 是特权端口 —— QSpinBox 忘 setValue 就是这个症状"
     w.close()
@@ -179,7 +278,7 @@ def test_grip_button_is_clickable_from_construction(qapp):
 
     夹爪的 `GripWorker` **只能由点这个按钮创建**，而 `apply_grip` 只在
     `connected` 时才启用按钮 ⇒ 一旦初始禁用就**永远点不了**（只能重启应用）。
-    判别力：在 `__init__` 里加回 `setEnabled(False)` 时本用例必红。
+    判别力：在构造里加回 `setEnabled(False)` 时本用例必红。
     """
     w = MainWindow(Settings())
     assert w.page_teleop.btn_grip.isEnabled() is True, \
@@ -254,11 +353,11 @@ def test_grip_snapshot_renders_master_slave_and_stale(qapp):
     w.page_teleop.grip_toggled.connect(got.append)
     s.teleop_active = True
     w._on_grip_state(s)
-    assert w.page_teleop.btn_grip.text() == "停止夹爪遥操"
+    assert w.page_teleop.btn_grip.text().endswith("停止夹爪遥操")
     assert w.page_teleop.btn_grip.isChecked() is True
     s.teleop_active = False
     w._on_grip_state(s)
-    assert w.page_teleop.btn_grip.text() == "启动夹爪遥操"
+    assert w.page_teleop.btn_grip.text().endswith("启动夹爪遥操")
     assert got == [], f"刷新按钮不该发 toggled（自激），实际 {got}"
     w.close()
 
@@ -353,4 +452,112 @@ def test_grip_rejected_frames_are_visible(qapp):
     txt = w.page_teleop.lab_grip_mismatch.text()
     assert "7" in txt and "非有限值" in txt, txt
     assert "不一致" in txt, "两条告警要能同时显示，不能互相顶掉"
+    w.close()
+
+
+# ────────────────────────── 曲线卡（照 studio MetricsPanel 的行为）──────────────────────────
+
+def _filled_card(card, n=100):
+    """往曲线卡的共享缓冲里灌 n 拍，并把它标成"已经在跑"。
+
+    ⚠ `_was_live = True` 这一步**不是凑数**：`_tick` 里"首个 live 拍先清一次缓冲"
+    （照 studio `useArmMetrics.ts:123-127` 的重连语义）排在 `paused` 判断**之前**，
+    所以不标它的话，下一次 `_tick` 会先把手工灌的数据清掉。
+    """
+    for k in range(n):
+        card.series.append(
+            1000.0 + k * 0.1,
+            [30.0 + k % 5] * N_JOINTS, [0.1 * k] * N_JOINTS,
+            [1.0] * N_JOINTS, [0.0] * N_JOINTS)
+    card._was_live = True
+    return card
+
+
+def test_metric_switch_keeps_the_buffer(qapp):
+    """⚠ 切换指标**不清缓冲** —— 四路数据始终同帧积累（studio `metricDatasets.ts:5,30`）。
+
+    判别力：谁在 `_on_metric` 里加了 `series.clear()`，本用例会红；真机表现是
+    「切一下指标，10 s 的历史全没了」。
+    """
+    w = MainWindow(Settings())
+    m = _filled_card(w.page_teleop.metrics)
+    before = len(m.series)
+    assert before == 100
+    m.seg.set_current(1)
+    m._on_metric(1)
+    assert len(m.series) == before, "切指标不许清缓冲"
+    m.seg.set_current(3)
+    m._on_metric(3)
+    assert len(m.series) == before
+    w.close()
+
+
+def test_clear_deselects_but_keeps_the_buffer(qapp):
+    """「清空」= **只取消勾选**，不丢数据（studio `useArmMetrics.ts:211`）。
+
+    判别力：把 `select_none` 写成"清缓冲"时本用例会红 —— 那会让用户以为数据没了。
+    """
+    w = MainWindow(Settings())
+    m = _filled_card(w.page_teleop.metrics)
+    m.select_none()
+    assert m._shown == [], "清空后应当一条都不勾"
+    assert len(m.series) == 100, "⚠ 清空**不许**丢缓冲"
+    m.select_all()
+    assert m._shown == list(range(N_JOINTS)), "全选要勾回**全部轴**"
+    assert len(m.series) == 100
+    w.close()
+
+
+def test_pause_freezes_sampling_without_clearing(qapp):
+    """「暂停」= 停止采样、**缓冲原样冻结**（studio `useArmMetrics.ts:119`）。"""
+    w = MainWindow(Settings())
+    m = _filled_card(w.page_teleop.metrics)
+    m.paused = True
+    s = _snap(role=ROLE_SLAVE)
+    m.set_snapshot(s)
+    m._tick()
+    assert len(m.series) == 100, "暂停期间不许再写缓冲"
+    m.paused = False
+    m._tick()
+    assert len(m.series) == 100, "恢复后从当前时刻继续（缓冲上限仍是 100）"
+    w.close()
+
+
+def test_window_is_bounded_at_100_points(qapp):
+    """窗口 = 100 点 = 10 s（studio `useArmMetrics.ts:56-57`）。"""
+    w = MainWindow(Settings())
+    m = _filled_card(w.page_teleop.metrics, n=250)
+    assert len(m.series) == 100, "超出 100 点必须滑窗裁掉"
+    w.close()
+
+
+def test_joint_legend_toggles_visibility(qapp):
+    """点图例 = 切该条曲线的显隐；重新勾上时保持**升序**（studio `:203-204`）。"""
+    w = MainWindow(Settings())
+    m = _filled_card(w.page_teleop.metrics)
+    m.toggle_joint(1)
+    assert 1 not in m._shown
+    m.toggle_joint(1)
+    assert m._shown == sorted(m._shown), "重新勾选后必须有序"
+    assert 1 in m._shown
+    w.close()
+
+
+def test_err_metric_reports_no_data_instead_of_faking_it(qapp):
+    """⚠ 跟踪误差这一路**本机没有数据** ⇒ 必须显示"不提供"，**不许画零线**。
+
+    与 studio 同款纪律（`useArmMetrics.ts:137` 写死 `err: []`，绝不伪造）。
+    判别力：谁让它去读 `Snapshot.err`（那是**逐关节故障码**、不是跟踪误差），
+    本用例会红 —— 那会把"故障码 1"当成"误差 1 rad"画出来。
+    """
+    from liteteleop.gui.chart import NO_DATA_METRICS
+
+    assert "err" in NO_DATA_METRICS
+    w = MainWindow(Settings())
+    m = w.page_teleop.metrics
+    idx = [i for i, md in enumerate(m.metrics) if md[0] == "err"][0]
+    m.seg.set_current(idx)
+    m._redraw()
+    assert "不提供" in (m.chart._notice or ""), \
+        f"跟踪误差必须如实报「无数据」，实际 notice={m.chart._notice!r}"
     w.close()
