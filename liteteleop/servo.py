@@ -393,6 +393,12 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         # slew / 钳位 / 状态监视的开销，光按 CDC 单次往返算会高估）。
         _ticks = 0
         _work_s = 0.0
+        # 逐轴跟踪误差极值：`q_cmd − q_meas` 的最大值（滞后）与最小值（**过冲**）。
+        # ⚠ 为什么必须逐轴：「到末端看到过冲」是**多关节的复合**，末端一个可见偏差
+        #   可能来自某个轴的大过冲，也可能是几个轴的小过冲叠加 —— 只有逐轴才分得清，
+        #   而要压过冲只能按轴调 `B`（腕部惯量小，通常要加得更多）。
+        _err_hi = [0.0] * N_JOINTS
+        _err_lo = [0.0] * N_JOINTS
 
         while not should_stop():
             _t_work0 = time.monotonic()
@@ -429,6 +435,12 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             #    这一段让故障**发生的那一拍**就留下 `flags`/`joint_fault`/`err` 与跟踪误差。
             _snap = arm.get_state(refresh=False).value
             if _snap is not None and hasattr(_snap, "joints"):
+                for _i in range(min(N_JOINTS, len(_snap.q))):
+                    _d = q_cmd[_i] - float(_snap.q[_i])
+                    if _d > _err_hi[_i]:
+                        _err_hi[_i] = _d
+                    if _d < _err_lo[_i]:
+                        _err_lo[_i] = _d
                 _cur = (tuple(getattr(_snap, "flag_names", ()) or ()),
                         int(getattr(_snap, "joint_fault", 0) or 0),
                         tuple(int(j.err) for j in _snap.joints))
@@ -472,6 +484,17 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                     "不符，`slew_target` 的每拍推进量会偏小（跟随变慢）。"
                     "把 `DEFAULT_HZ` 调到 ≈ %.0f 或更低。",
                     _hz, hz, _hz)
+            # 逐轴过冲/滞后（过冲阈值 2 mrad —— 低于它算正常跟踪噪声，不报）
+            _over = "、".join(f"J{i + 1}={_err_lo[i]:+.4f}"
+                             for i in range(N_JOINTS) if _err_lo[i] < -0.002)
+            log.info("从臂跟踪误差峰值：最大滞后 %.4f rad；过冲（实测超前指令）：%s",
+                     max(_err_hi), _over or "无（各轴均 < 2 mrad）")
+            if _over:
+                log.warning(
+                    "⚠ 上述轴在到位时**冲过了指令值** —— 这就是「过冲」。"
+                    "压它靠加大**该轴**的 `B`（阻尼）：`servo.SETUP_B`（当前 %s）。"
+                    "⚠ 别减 `K` —— 减 K 会变软变拖沓（那是另一个不希望的观感）。",
+                    SETUP_B)
         return True
     finally:
         pass
