@@ -251,6 +251,7 @@ class TeleopPage(QtWidgets.QWidget):
     grip_toggled = QtCore.pyqtSignal(bool)
     grip_settings_changed = QtCore.pyqtSignal()
     connect_clicked = QtCore.pyqtSignal()
+    disconnect_clicked = QtCore.pyqtSignal()
     settings_changed = QtCore.pyqtSignal()
     #: 臂维护动作：`"enable"` / `"clear"` / `"reset"` / `"home"`（见 `_build_arm_card`）
     arm_action = QtCore.pyqtSignal(str)
@@ -366,6 +367,20 @@ class TeleopPage(QtWidgets.QWidget):
         self.btn_connect.clicked.connect(self.connect_clicked.emit)  # type: ignore[arg-type]
         lay.addWidget(self.btn_connect)
 
+        # ⚠ 断开：**收尾与关窗完全同路**（停遥操 → 受控接管 movej → 关 zenoh → 关臂），
+        #   所以断开后臂仍然**使能并持位**，不是自由落体。
+        # ⚠ 与「连接臂」互斥启用（由 `main_window._relock` 按 `worker is None` 驱动）——
+        #   没有这一步就只能关掉整个程序才能换口/换角色（真机双臂时很别扭）。
+        self.btn_disconnect = QtWidgets.QPushButton("断开")
+        self.btn_disconnect.setProperty("variant", "outline")
+        self.btn_disconnect.setFixedWidth(80)
+        self.btn_disconnect.setToolTip(
+            "断开：停遥操 → 受控接管 movej → 关 zenoh → 关臂。\n"
+            "⛔ **不失能** —— 臂保持使能与当前位置，不会自由落体。")
+        self.btn_disconnect.clicked.connect(
+            self.disconnect_clicked.emit)               # type: ignore[arg-type]
+        lay.addWidget(self.btn_disconnect)
+
         #: 端口告警：**只在需要时说话**（检测到多条 / 一条都没检测到）。
         #: ⚠ 顶栏放不下换行的长文案 ⇒ 这里用短句，完整说明进下拉的 tooltip。
         self.lab_port_note = QtWidgets.QLabel("")
@@ -407,8 +422,15 @@ class TeleopPage(QtWidgets.QWidget):
         self.ed_arm_id.setFixedWidth(92)
         card.add_row("主臂 IP", self.ed_peer, "端口", self.sp_port,
                      "主臂 ID", self.ed_arm_id)
-        card.add_row("", rc_label("↑ 角色/地址/端口属于遥操配置；连上后锁死"),
+        card.add_row("", rc_label("↑ 角色/地址/端口在**点「连接臂」时**被读取"
+                                  "（ArmWorker 构造时定死）⇒ 连上后锁死；"
+                                  "要改请先点顶栏的「断开」"),
                      stretch_at_end=False)
+        # ⚠ 把"为什么锁"直接挂在控件上 —— 用户不会去读那行小字，但会悬停。
+        for w in (self.seg_role, self.ed_peer, self.sp_port, self.ed_arm_id):
+            w.setToolTip("这些值只在**点「连接臂」时**被读取（`ArmWorker` 构造时定死），"
+                         "所以连上后锁死 —— 改了也不会生效。\n"
+                         "要改请先点顶栏的「断开」，改完再连。")
         for w in (self.ed_peer, self.ed_arm_id):
             w.editingFinished.connect(self._emit_changed)
         self.sp_port.valueChanged.connect(self._emit_changed)
@@ -711,7 +733,10 @@ class TeleopPage(QtWidgets.QWidget):
         for w in (self.seg_role, self.ed_peer, self.sp_port, self.ed_arm_id,
                   self.cb_port, self.btn_rescan):
             w.setEnabled(not s.connected)
-        self.btn_connect.setEnabled(not s.connected)
+
+        # ⚠ 「连接臂 / 断开」两个按钮的启停**不在这里** —— 它们由
+        #   `main_window._relock` 按 `worker is None` 驱动（那是唯一真源：
+        #   快照说"已连接"不等于 worker 还在，反之亦然）。
 
         # 遥操状态文本
         if s.error:

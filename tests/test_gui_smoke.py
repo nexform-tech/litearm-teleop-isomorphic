@@ -217,17 +217,106 @@ def test_connection_fields_are_editable_then_lock(qapp):
     自己改生效了 —— 而 `ArmWorker` 在**构造时**就把这几项吃掉了，改了一点用没有。
     那正是本仓反复强调的"界面在撒谎"。反过来，未连接时锁住则是另一种谎
     （明明还没连，却不让人改）。
+
+    ⚠ 「连接臂 / 断开」两个按钮**不在这组里** —— 它们按 `worker` 在不在驱动，
+    见 `test_connect_and_disconnect_are_mutually_exclusive`。
     """
     w = MainWindow(Settings())
     fields = (w.page.seg_role, w.page.ed_peer, w.page.sp_port,
-              w.page.ed_arm_id, w.page.cb_port, w.page.btn_rescan, w.page.btn_connect)
+              w.page.ed_arm_id, w.page.cb_port, w.page.btn_rescan)
     w._on_state(Snapshot(role=ROLE_MASTER))              # 还没连上
     assert all(f.isEnabled() for f in fields), "未连接时这些必须都能改"
     s = _snap()
     s.connected = True
     w._on_state(s)
     assert not any(f.isEnabled() for f in fields), \
-        "连上之后 角色/地址/CDC/连接按钮 必须全部锁死"
+        "连上之后 角色/地址/CDC 必须全部锁死"
+    w.close()
+
+
+def test_connect_and_disconnect_are_mutually_exclusive(qapp):
+    """⚠ 顶栏「连接臂 / 断开」**互斥启用**，判据是 `worker` 在不在。
+
+    判别力两个方向：
+      · 两个同时可点 ⇒ 可能对同一个 CDC 口开两次（新的报串口打不开）；
+      · 两个同时不可点 ⇒ 没有换口/换角色的路，只能重启程序（真机双臂时很别扭）。
+    ⚠ 取的是 `worker is None`，**不是**快照的 `connected`：断开后快照要等我们复位，
+    中间有一瞬"快照说已连接、worker 已经没了"。
+    """
+    w = MainWindow(Settings())
+    w._on_state(_snap())
+    assert w.page.btn_connect.isEnabled(), "没连上时应当能点「连接臂」"
+    assert not w.page.btn_disconnect.isEnabled(), "没连上时没有什么可断的"
+
+    class _W:
+        def shutdown(self, timeout=8.0):
+            pass
+
+        def is_alive(self):
+            return False
+
+    w.worker = _W()          # type: ignore[assignment]
+    w._relock()
+    assert not w.page.btn_connect.isEnabled(), "已经连上了，别再点连接"
+    assert w.page.btn_disconnect.isEnabled(), "连上了就必须给一条断开的路"
+
+    w.worker = None
+    w._relock()
+    assert w.page.btn_connect.isEnabled() and not w.page.btn_disconnect.isEnabled()
+    w.close()
+
+
+def test_disconnect_hands_over_and_never_disables(qapp):
+    """⚠⚠ 断开 = 停遥操 → 受控接管 movej → 关 zenoh → 关臂，**绝不失能**。
+
+    判别力：谁在断开路径上调了 `arm.disable()`，臂就会**自由落体**。
+    这里用假 worker 只暴露 `shutdown`（**故意不给 `disable`**）—— 一旦代码去调它，
+    会直接 `AttributeError` 炸出来。
+    """
+    w = MainWindow(Settings())
+
+    class _W:
+        def __init__(self):
+            self.calls = []
+
+        def shutdown(self, timeout=8.0):
+            self.calls.append(timeout)
+
+        def is_alive(self):
+            return False
+
+    wk = _W()
+    w.worker = wk          # type: ignore[assignment]
+    w._disconnect()
+    assert wk.calls, "必须走 shutdown（那才是停遥操+受控接管的收尾）"
+    assert w.worker is None, "收尾完成后要解除连接，否则换不了口/角色"
+    # ⚠ `MainWindow._log` 是**直接写进日志控件**的（不走 bridge 信号）⇒ 读控件文本。
+    assert "不失能" in w.log.toPlainText(), w.log.toPlainText()
+    assert w._last is not None and w._last.connected is False, \
+        "界面那份快照必须复位，否则 _relock 还按已连接判定"
+    w.close()
+
+
+def test_disconnect_refuses_while_teardown_is_still_running(qapp):
+    """⚠⚠ 收尾**没跑完就不许解除连接** —— 线程还占着 CDC 口与 zenoh 端口。
+
+    判别力：清了引用的话，用户马上再点「连接臂」就会去抢同一个口，
+    表现是"串口打不开 / Address already in use"，而原因已经看不出来了。
+    """
+    w = MainWindow(Settings())
+
+    class _W:
+        def shutdown(self, timeout=8.0):
+            pass
+
+        def is_alive(self):
+            return True                      # ← 收尾还没完
+
+    wk = _W()
+    w.worker = wk          # type: ignore[assignment]
+    w._disconnect()
+    assert w.worker is wk, "收尾没完就不许清引用（否则新连接会抢同一个口）"
+    assert "尚未完成" in w.log.toPlainText(), w.log.toPlainText()
     w.close()
 
 

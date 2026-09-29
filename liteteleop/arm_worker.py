@@ -172,6 +172,17 @@ class ArmWorker:
         self._thread = threading.Thread(target=self._run, name="ArmWorker", daemon=True)
         self._thread.start()
 
+    def is_alive(self) -> bool:
+        """worker 线程还在跑吗。
+
+        ⚠ 收尾路径必须问它 —— `shutdown()` 只是 join 到超时，**超时不代表线程没了**：
+        它还占着 **CDC 口**与 **zenoh 端口**，这时再建一个 worker 会抢同一份资源
+        （新连接报 Address already in use / 串口打不开）。与 `GripWorker.is_alive`
+        同款判据。
+        """
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
     def shutdown(self, timeout: float = 8.0) -> None:
         """停遥操 → 关 zenoh → 关臂。**幂等**。"""
         self._stop.set()

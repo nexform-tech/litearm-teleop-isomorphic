@@ -105,6 +105,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── 接线 ──
         self.page.connect_clicked.connect(self._connect)
+        self.page.disconnect_clicked.connect(self._disconnect)
         self.page.settings_changed.connect(self._save)
         self.page.teleop_toggled.connect(self._toggle_teleop)
         self.page.grip_toggled.connect(self._toggle_grip)
@@ -148,6 +149,10 @@ class MainWindow(QtWidgets.QMainWindow):
         #   确认框自动摘掉，而那一刻**正是**要按"清错→复位"的时候。
         #   绑上勾选就等于"最需要它的时候它不可用"。
         # 遥操跑着的时候四键一律禁用：它们会和伺服环抢臂。
+        # ⚠ 「连接臂 / 断开」按 **worker 是否还在** 驱动（不是按快照的 connected）：
+        #   断开之后快照要等我们自己复位，中间会有一瞬"快照说已连接、worker 已没了"。
+        self.page.btn_connect.setEnabled(self.worker is None)
+        self.page.btn_disconnect.setEnabled(self.worker is not None)
         self.page.btn_enable.setEnabled(armed and connected and not live)
         self.page.btn_home.setEnabled(armed and connected and not live)
         self.page.btn_clear.setEnabled(connected and not live)
@@ -171,6 +176,38 @@ class MainWindow(QtWidgets.QMainWindow):
             on_state=self.bridge.on_state, on_log=self.bridge.on_log)
         self.worker.start()
         self._log(f"正在连接（角色={self.s.role}）…")
+
+    def _disconnect(self) -> None:
+        """断开：停遥操 → 受控接管 movej → 关 zenoh → 关臂（**不失能**）。
+
+        ⚠ 收尾顺序与关窗**完全同路**（都走 `ArmWorker.shutdown` → `_teardown`）⇒
+        断开后臂保持**使能并停在当前位置**，不是自由落体。
+        ⚠⚠ **收尾没跑完就不许解除连接**：超时那次 join 只是"没等到"，线程仍占着
+        **CDC 口与 zenoh 端口**，这时再连一个新的会让两者抢同一份资源。
+        所以这里跟夹爪那条错误恢复同一个套路：报告 + 让用户再点一次。
+        """
+        w = self.worker
+        if w is None:
+            return
+        self._log("正在断开：停遥操 → 受控接管 movej → 关 zenoh → 关臂（**不失能**）…")
+        # ⚠ 用短超时：收尾是 `movej(实测位姿)`，到位即返回，正常是毫秒级；
+        #   别让 Qt 主线程为了一个理论上限卡 8 s（与关窗那条同款取舍）。
+        w.shutdown(timeout=3.0)
+        if w.is_alive():
+            self._log("⚠ 收尾尚未完成（线程还占着 CDC 口与 zenoh 端口）—— "
+                      "暂不解除连接；请稍后再点一次「断开」")
+            return
+        self.worker = None
+        # ⚠ 必须把界面那份快照也复位：`_teardown` 只改 worker 自己那份、不会推给界面，
+        #   留着旧的"已连接"会让 `_relock` 继续按已连接判定、字段也不解锁。
+        self._last = Snapshot(role=self.s.role)
+        self.page.apply(self._last, self.s.peer, self.s.jport, self.s.arm_id)
+        self.top.update_from(self._last)
+        self.top.set_connection(False, "未连接")
+        self.top.set_detail("—")
+        self.page.log_badge.set_state("未连接", "outline")
+        self._relock()
+        self._log("✓ 已断开（臂保持使能与当前位置）")
 
     def _toggle_teleop(self, on: bool) -> None:
         if self.worker is None:
