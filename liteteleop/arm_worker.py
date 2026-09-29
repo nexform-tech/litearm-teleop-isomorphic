@@ -472,7 +472,8 @@ class ArmWorker:
         self._log(f"限位墙已接线：margin={wall.margin} rad  "
                   f"stiffness={wall.stiffness}  damping={wall.damping}")
         self._log(f"从臂跟随：K={servo.SETUP_K} B={servo.SETUP_B}"
-                  f"（litearm.yaml 默认档，随 0x08 帧下发）")
+                  f"（⚠ 不是 yaml 默认档 —— 2026-09-29 起有意整体放大以压过冲，"
+                  f"见 servo.SETUP_K 注释；随 0x08 帧每拍下发）")
         self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
         self._log(f"每拍 1 次下发（CMD_JOINT_FOLLOW；G + 限位墙由**固件**算）"
                   f"⇒ 节拍 {SLAVE_HZ:.0f} Hz（收尾会打印实测值）")

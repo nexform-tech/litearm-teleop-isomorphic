@@ -1,7 +1,8 @@
 """从臂伺服环的离线测试（用假臂，不需要硬件）。
 
 覆盖三件真机上不好反复验的事：
-  1. **K/B 逐帧是 server 的值**（`litearm.yaml` 的 `joint_follow:` 段，真值见 `servo.SETUP_K`）
+  1. **K/B 逐帧下发的是本仓的增益**（基线取自 `litearm.yaml` 的 `joint_follow:` 段，
+     但 2026-09-29 起**有意整体放大**以压制快速拖动下的过冲 —— 依据见 `servo.SETUP_K`）
   2. 参考生成确实经过 `slew_target`（速度/加速度受限、且**永不发 NaN**）
   3. 实测 **23 ms** 量级的 `all_joint_params()` **只在启动时读一次**，绝不进循环
   4. `joint_follow` 的帧**只有四组**（q/dq/kp/kd）—— **没有 `tau`**，`G` 由固件算
@@ -198,8 +199,8 @@ def test_follow_sends_the_server_gains_on_every_frame():
     _run(arm, [0.1] * N_JOINTS)
     assert arm.mit_calls, "一帧都没发出去"
     for _q, _dq, kp, kd in arm.mit_calls:
-        assert kp == list(servo.SETUP_K), f"K 不是 server 的 {servo.SETUP_K}"
-        assert kd == list(servo.SETUP_B), f"B 不是 server 的 {servo.SETUP_B}"
+        assert kp == list(servo.SETUP_K), f"K 不是 `servo.SETUP_K` 的 {servo.SETUP_K}"
+        assert kd == list(servo.SETUP_B), f"B 不是 `servo.SETUP_B` 的 {servo.SETUP_B}"
 
 
 
@@ -428,27 +429,62 @@ def test_limit_margin_keeps_j4_usable():
 
 # ────────────── 增益必须是 server 默认配置的那一份 ──────────────
 
-def test_setup_gains_are_the_server_default_config():
-    """⛔ 逐值比对 `litearm.yaml` 的 `joint_follow:` 段 —— **server 默认加载的就是它**。
+def test_setup_gains_are_deliberately_stiffer_than_server():
+    """K/B **有意偏离 server**（2026-09-29）—— 本用例锁的是**偏离的方向**，不是数值本身。
 
-    ⚠⚠ **别抄 `litearm_balanced.yaml`**：那份是 `[25]×7 / [0.5]×7`，而它的历史注释写着
-    「从 25 全一律**提高**以改善主从遥操的**滞后/追不上**手感（2026-08-13）」
-    ⇒ 25 是**已知会滞后**的档。真机实测复现了：用户报「明显延迟，而且会很软」。
+    背景（完整依据见 `servo.py` 里 `SETUP_K` / `SETUP_B` 的注释）：
+      server 的 `K=60 / B=1.0` 是**为慢速遥操定的**；快速拖动下它必然过冲，而且
+      **server 自己也有**（用户复述「150Hz 的也有」）。真机实测滞后 **0.2919 rad**、
+      J2 过冲 **0.2516 rad**，两者**比值 0.86** —— 这是欠阻尼二阶系统的标志。
+      机理：`q_cmd` 一停，从臂身后还欠着滞后量没还，它带着速度扑上去 ⇒ 冲过头再被拉回
+      （用户原话「有点过冲然后回拉的感觉」）。
 
-    判别力：把 `SETUP_K` 改回 25（或换成任何别的档），本用例立刻红。
+    绝对过冲 = **滞后 × 过冲率**，两个因子各压一路：
+      滞后 ∝ 1/K ⇒ 提 K；   过冲率 = f(ζ)、ζ = B/(2√(K·J)) ⇒ **同步提 B**。
 
-    ⚠ **J2 的 `B` 是本仓唯一记录在案的偏离**（server 1.0 → 我们 2.0，2026-09-29）：
-    肩部托着整条臂 ⇒ 负载惯量最大 ⇒ 同样 K/B 下阻尼比 `ζ = B/(2√(K·J))` 最小
-    ⇒ 实测过冲最大（0.252 rad，其余轴都 ≤0.17）。依据见 `servo.py` 里 SETUP_B 的注释。
-    **除 J2 外任何位置偏离 server ⇒ 本用例立刻红。**
+    ⇒ 钉四条不变量（比"逐值等于某个数"更有判别力）：
+      ① **K 整体严格高于 server 基线** —— 否则退回"必然过冲"的那一档；
+      ② **每轴 ζ 不许下降**：`(B/B_server) / √(K/K_server) ≥ 1.2`。
+         ⚠⚠ 这条抓的是**"只提 K 不提 B"**这个真实错误 —— ζ 会随 √K 下降，
+            把提 K 的收益吃掉一部分。**它是本用例存在的主要理由。**
+      ③ **B 不许超过固件上限** —— 超了会被 `MIT_KD_MAX` **静默钳住**，表上"看起来"
+         满足等比、实际值与意图不符，属静默失败（这一条是"判据的判据"）。
+      ④ **J2 仍是 B 最大的那一轴**（肩部托着整条臂 ⇒ 惯量最大 ⇒ ζ 最小 ⇒ 过冲最大）。
+
+    ⚠ 判别力已逐条实跑验证：`SETUP_B` 改回 server 原值 ⇒ ① + ② 红（min ζ 比 1.00×）；
+      "只提 K 不提 B" ⇒ ② 红（0.55×）；`SETUP_K` 改回 60 ⇒ ① 红；
+      J2 的 B 写 6.0 ⇒ ③ 红；把 J1 的 B 抬到超过 J2 ⇒ ④ 红。
+    ⚠⚠ **④ 的已知盲区（如实记账，别假装它抓得住）**：把 J2 的 B 降到与其余轴同倍（3.0）
+      时本用例**仍然全绿** —— 那种改法 ζ 仍达标（1.64×）、J2 也仍最大。
+      它的病灶是 **J2 的绝对 ζ 仍最低**，而判它需要各轴惯量 `J`（`ζ = B/(2√(K·J))`），
+      本仓没有 J 的实测值 ⇒ **这一格判不了**，只能靠真机统计 + `servo.py` 的注释守着。
     """
-    assert servo.SETUP_K == [60.0, 60.0, 60.0, 60.0, 40.0, 40.0, 40.0]
+    server_k = [60.0, 60.0, 60.0, 60.0, 40.0, 40.0, 40.0]
     server_b = [1.0, 1.0, 1.0, 1.0, 0.8, 0.8, 0.8]
-    assert servo.SETUP_B[1] == 2.0, (
-        "J2 的 B = 2.0 是本仓唯一在案的一处偏离；要改动请连同本判据和依据一起改，"
-        "别无声改掉")
-    assert (servo.SETUP_B[:1] + servo.SETUP_B[2:]) == (server_b[:1] + server_b[2:]), (
-        f"除 J2 外其余轴必须与 server 逐值相同 —— server={server_b}，实际={servo.SETUP_B}")
+
+    # ① 整体更硬 —— 本仓的刻意选择
+    assert all(k > s for k, s in zip(servo.SETUP_K, server_k)), (
+        f"K 必须整体高于 server 基线 {server_k} —— 退回那一档就等于接受"
+        f"「快速拖动必然过冲」；实际 {servo.SETUP_K}")
+
+    # ② 提 K 必须配提 B，否则 ζ 会随 √K 下降
+    for i, (k, b, sk, sb) in enumerate(zip(servo.SETUP_K, servo.SETUP_B, server_k, server_b)):
+        ratio = (b / sb) / math.sqrt(k / sk)
+        assert ratio >= 1.2, (
+            f"J{i + 1} 的 ζ 只到 server 的 {ratio:.2f}× —— K 提上去了但 B 没跟上，"
+            f"ζ 会被 √K 拉低 ⇒ 过冲率变差，吃掉提 K 的收益。"
+            f"K={k}（server {sk}）、B={b}（server {sb}）")
+
+    # ③ 别写超上限的值（固件 control_loop.c:45）
+    _MIT_KD_MAX = 5.0
+    assert all(b <= _MIT_KD_MAX for b in servo.SETUP_B), (
+        f"B 超过固件 `MIT_KD_MAX={_MIT_KD_MAX}` 会被**静默钳住** —— 表上看着对、"
+        f"实际值不符，属静默失败。要更高得先改固件。实际 {servo.SETUP_B}")
+
+    # ④ 病灶轴不能掉队
+    assert servo.SETUP_B[1] == max(servo.SETUP_B), (
+        f"J2 是肩部关节、托着整条臂 ⇒ 负载惯量最大 ⇒ ζ 最小、过冲最大，"
+        f"必须是 B 最大的那一轴；实际 {servo.SETUP_B}")
 
 
 def test_engage_gains_are_softer_than_the_follow_gains():
