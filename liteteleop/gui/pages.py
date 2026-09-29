@@ -462,8 +462,14 @@ class TeleopPage(QtWidgets.QWidget):
         card = Card("夹爪遥操")
         self.grip_badge = Badge("未启动", "outline")
         card.header.addWidget(self.grip_badge)
-        card.add(hint("从夹爪订阅主夹爪开合度并跟随；需填写主夹爪 IP 与主夹爪 ID。",
-                      "hint"))
+        # ⚠ 说清「夹爪的主/从**跟着臂走**」—— 界面上没有、也不需要夹爪角色控件
+        #   （用户裁决 2026-09-29：没有必要，夹爪的角色随着臂走）。
+        #   ⛔ 别再加那种控件；但这句话得留着，否则"主夹爪的配置在哪里"会成为
+        #   一个反复被问的问题（我真被问过一次）。
+        card.add(hint("夹爪与臂是**两条独立链路**（各自的 CAN / zenoh / 开关），"
+                      "但**主从跟着臂走**：臂当主 ⇒ 本夹爪是主端（监听发布）；"
+                      "臂当从 ⇒ 本夹爪是从端（要填主夹爪 IP）。"
+                      "两端 <code>grip_id</code> 与端口必须一致。", "hint"))
 
         self.ed_gcan = QtWidgets.QLineEdit(self.gs.gcan)
         # ⚠ `can0` 只是**占位提示**，不是默认值 —— 未填通道 ⇒ 不启用夹爪遥操。
