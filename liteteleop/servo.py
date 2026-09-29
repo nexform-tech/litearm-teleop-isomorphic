@@ -98,10 +98,14 @@ DEFAULT_ENGAGE_SEC = 0.3
 #: 否则限速参考按错周期算（每拍推进量 = `speed_limit × dt_nom`）。
 #:
 #: ⚠ **S4 之后每拍只 1 次往返**（`CMD_JOINT_FOLLOW` 一次下发；`get_gravity` 已由固件
-#:   内算取代）⇒ 实测单往返 3.333 ms，硬件上能到 ~300 Hz。**150 是主动选的保守节拍，
-#:   不是上限** —— 要提速改这个数即可（server 的 `control_loop_hz` 是 250）。
+#:   内算取代）⇒ 实测单往返 3.333 ms ⇒ 硬件上限 ~300 Hz。取 **250**，与 litearm-server
+#:   的 `control_loop_hz` 同值。
+#: ⚠ 曾经用的 150 是 MIT 路线（每拍 2 次往返）时代的**上限**；省掉一次往返之后它只是
+#:   一个主动的保守值 —— 2026-09-29 提到 250。
+#: ⚠⚠ **别凭上面的算术再往上加**：Python 那圈还有 slew / 钳位 / 状态监视的开销。
+#:   `follow()` 收尾会打印**实测**节拍与单拍净耗时，实际跟不上设定时会告警 —— 以那个为准。
 #: ⚠ 与主臂的 `pub_hz = 200` 是两个不同的数，别混。
-DEFAULT_HZ = 150.0
+DEFAULT_HZ = 250.0
 
 #: **对齐**：照搬 `teleop_manager` 的三个默认值。
 #: `align_speed` 是"多快挪到主臂位姿"，不是跟随速度 —— 它必须慢。
@@ -384,8 +388,14 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         next_tick = base + dt_nom
         # ⚠ 固件状态监视的上一拍快照（见循环里那段）
         _prev_fw = None
+        # 节拍统计 —— **纯观测，不进控制律**。用来回答"这个 hz 填得住吗"：
+        # `dt_nom` 必须贴近真实周期，而真实周期只有跑起来才知道（Python 那圈还有
+        # slew / 钳位 / 状态监视的开销，光按 CDC 单次往返算会高估）。
+        _ticks = 0
+        _work_s = 0.0
 
         while not should_stop():
+            _t_work0 = time.monotonic()
             if duration_s is not None and time.monotonic() - base >= duration_s:
                 break
 
@@ -437,12 +447,31 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                         [round(v, 3) for v in _snap.q])
                     _prev_fw = _cur
 
+            # 单拍**净**耗时（算到 sleep 之前 ⇒ 不含主动等待的那段）
+            _work_s += time.monotonic() - _t_work0
+            _ticks += 1
+
             r = next_tick - time.monotonic()
             if r > 0:
                 time.sleep(r)
             next_tick += dt_nom
             if next_tick < time.monotonic():
                 next_tick = time.monotonic() + dt_nom
+
+        if _ticks:
+            _el = time.monotonic() - base
+            _hz = _ticks / _el if _el > 0 else 0.0
+            _w_ms = _work_s / _ticks * 1000.0
+            log.info("从臂节拍：设定 %.0f Hz / 实测 %.1f Hz（%d 拍 / %.1f s）；"
+                     "单拍净耗时 %.2f ms ⇒ 理论上限 ≈ %.0f Hz",
+                     hz, _hz, _ticks, _el, _w_ms,
+                     (1000.0 / _w_ms) if _w_ms > 0 else float("inf"))
+            if _hz < hz * 0.9:
+                log.warning(
+                    "⚠ 实测节拍 %.1f Hz 明显低于设定 %.0f Hz —— 说明 `dt_nom` 与真实周期"
+                    "不符，`slew_target` 的每拍推进量会偏小（跟随变慢）。"
+                    "把 `DEFAULT_HZ` 调到 ≈ %.0f 或更低。",
+                    _hz, hz, _hz)
         return True
     finally:
         pass

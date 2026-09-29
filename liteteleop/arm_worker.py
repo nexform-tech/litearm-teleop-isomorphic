@@ -471,7 +471,7 @@ class ArmWorker:
                   f"（litearm.yaml 默认档，随 0x08 帧下发）")
         self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
         self._log(f"每拍 1 次下发（CMD_JOINT_FOLLOW；G + 限位墙由**固件**算）"
-                  f"⇒ 节拍 {SLAVE_HZ:.0f} Hz（硬件上限 ~300 Hz，150 是保守值）")
+                  f"⇒ 节拍 {SLAVE_HZ:.0f} Hz（收尾会打印实测值）")
 
         def provider():
             payload, _ts = self._slot.take()
