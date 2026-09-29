@@ -1,14 +1,20 @@
 """入口：`python -m liteteleop`。
 
-⛔ **SDK 入口钉死在 `/home/llx/litearm-python/src`**（用户裁决）——
+⛔ **SDK 入口默认钉死在 `/home/llx/litearm-python/src`**（用户裁决）——
 本机 `sys.path` 上还挂着另一份 `litearm`（gitee 克隆，停在 `chore/sync-repo-standards`），
 会被**静默**抢先 import。判据不是"我设了 PYTHONPATH"，而是**导入后断言 + 打印**。
+
+⚠ 路径可用环境变量 `LITEARM_SRC` 覆盖 —— CI 上 checkout 的是**同一个公开仓**
+（`nexform-tech/litearm-python`），只是落在 runner 的工作目录里，硬编码路径不存在。
+⚠ 覆盖的只是**位置**；下面的"导入后核落点"判据一字未变 —— 所以它保护的东西
+（"别让另一份 litearm 静默抢先"）在两边同样成立。
 """
 from __future__ import annotations
 
+import os
 import sys
 
-SDK_SRC = "/home/llx/litearm-python/src"
+SDK_SRC = os.environ.get("LITEARM_SRC", "/home/llx/litearm-python/src")
 
 
 def _pin_sdk() -> None:

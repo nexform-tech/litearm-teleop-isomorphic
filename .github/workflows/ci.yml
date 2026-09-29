@@ -42,10 +42,27 @@ jobs:
         with:
           python-version: "3.11"
 
+      # The SDK is not on PyPI; it lives in the public nexform-tech/litearm-python
+      # repository and is pinned by path (see liteteleop/__main__.py). Check it out
+      # so the suite resolves the same `litearm` it does on a developer's machine.
+      # ⚠ Into `.litearm-sdk/`, not the repository root — a root checkout would drop
+      #   that project's tests/ next to ours. `pytest tests` is scoped, but keeping
+      #   the two trees apart means neither can be collected by accident.
+      - name: Checkout litearm SDK
+        uses: actions/checkout@v4
+        with:
+          repository: nexform-tech/litearm-python
+          path: .litearm-sdk
+
+      # ⚠ The PyPI distribution is `eclipse-zenoh`; the *import* name is `zenoh`.
+      #   Installing "zenoh" fails with "from versions: none" before any test runs
+      #   — which is exactly what this workflow did until 2026-09-29.
       - name: Install dependencies
-        run: python3 -m pip install --upgrade pip && python3 -m pip install pytest "zenoh>=1.6"
+        run: python3 -m pip install --upgrade pip && python3 -m pip install pytest "eclipse-zenoh>=1.6"
 
       - name: Run test suite
+        env:
+          LITEARM_SRC: ${{ github.workspace }}/.litearm-sdk/src
         run: python3 -m pytest tests -q
 
       - name: Lint Markdown
