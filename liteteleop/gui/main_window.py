@@ -264,6 +264,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.s.gpeer = v["gpeer"]
         self.s.gport = v["gport"]
         self.s.grip_id = v["grip_id"]
+        self.s.grip_torque_limit_nm = v["torque_limit_nm"]
         self._save()
 
     def _ensure_grip_worker(self) -> "GripWorker | None":
@@ -302,6 +303,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.grip = GripWorker(
             gcan=v["gcan"], grip_id=v["grip_id"],
             gpeer=v["gpeer"], gport=v["gport"], align=v["align"],
+            torque_limit_nm=v["torque_limit_nm"],
             on_state=self.bridge.grip_state.emit, on_log=self.bridge.on_log)
         self.grip.start()
         return self.grip

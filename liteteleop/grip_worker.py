@@ -27,8 +27,9 @@ from typing import Callable, Optional
 log = logging.getLogger("liteteleop.grip")
 
 __all__ = ["ROLE_MASTER", "ROLE_SLAVE", "GRIP_RATE_HZ", "GRIP_WATCHDOG_MS",
-           "POLL_S", "GRIP_SDK_SRC", "GripNotReady", "GripSnapshot", "GripWorker",
-           "assert_sdk_pinned", "pin_grip_sdk", "check_ready", "travel_mm_of"]
+           "POLL_S", "GRIP_SDK_SRC", "TORQUE_LIMIT_NM", "GripNotReady",
+           "GripSnapshot", "GripWorker", "assert_sdk_pinned", "pin_grip_sdk",
+           "check_ready", "travel_mm_of"]
 
 ROLE_MASTER = "master"
 ROLE_SLAVE = "slave"
@@ -41,6 +42,12 @@ GRIP_WATCHDOG_MS = 200.0
 
 #: 界面快照的刷新周期（秒）。SDK 自己按 `rate_hz` 跑环，这里只是**读**它的状态。
 POLL_S = 0.1
+
+#: 从端夹爪的**力矩上限**（Nm）默认值。超过就卸力（SDK 侧 `torque_limit_nm`）。
+#: ⚠ 这个值取决于**打印件有多脆**，是 per-machine 的，不是型号常量：
+#: 先用 1.0 起步，第一次跑起来看界面上的 `torque_nm` 再定。
+#: ⚠ 与跟随增益强相关 —— `kp` 是 Nm/rad，所以 1.0 Nm 只对应一点点位置误差。
+TORQUE_LIMIT_NM = 1.0
 
 #: 主从 `travel_mm` 偏差超过这个比例就告警（spec §7.3）。
 _MISMATCH_TOL = 0.15
@@ -161,6 +168,10 @@ class GripSnapshot:
     rejected: int = 0                   # 被**协议边界**丢弃的帧（非有限值，见 §8 rule 9）
     send_failed: int = 0                # send_mit_frame 返回 False 的次数（§8 rule 10）
     fault: str = ""                     # 夹爪自己报的 error_code != 1（§8 rule 10）
+    # ── 从端力矩保护（SDK 的 `torque_limit_nm`，见 issue #20）──
+    torque_nm: float = 0.0              # 从端**自己**的力矩读数（= 电流信号）
+    over_torque: bool = False           # 已超限卸力（锁存中）
+    torque_trips: int = 0               # 本次会话卸力次数
     mismatch: str = ""                  # 主从标定不一致告警（§7.3），空 = 无
     error: str = ""
 
@@ -175,7 +186,7 @@ class GripWorker:
                  rate_hz: float = GRIP_RATE_HZ,
                  kp: Optional[float] = None, kd: Optional[float] = None,
                  align: bool = True, watchdog_ms: float = GRIP_WATCHDOG_MS,
-                 poll_s: float = POLL_S,
+                 poll_s: float = POLL_S, torque_limit_nm: float = TORQUE_LIMIT_NM,
                  gripper_factory: Optional[Callable[[str], object]] = None,
                  on_state: Optional[Callable[[GripSnapshot], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
@@ -197,6 +208,10 @@ class GripWorker:
             raise ValueError(f"watchdog_ms 必须 > 0，收到 {watchdog_ms!r}")
         if not float(poll_s) > 0.0:
             raise ValueError(f"poll_s 必须 > 0，收到 {poll_s!r}")
+        # ⚠ 0 是**合法**的（SDK 语义：关闭堵转保护）⇒ 只拒负数。
+        if float(torque_limit_nm) < 0.0:
+            raise ValueError(
+                f"torque_limit_nm 必须 >= 0（0 = 关闭保护），收到 {torque_limit_nm!r}")
         self.gcan = gcan
         self.grip_id = grip_id
         self.gpeer = gpeer
@@ -207,6 +222,7 @@ class GripWorker:
         self.align = bool(align)
         self.watchdog_ms = float(watchdog_ms)
         self.poll_s = float(poll_s)
+        self.torque_limit_nm = float(torque_limit_nm)
         self._topic = f"litearm/v4/{grip_id}/gripper_teleop"
         self._factory = gripper_factory or _default_gripper_factory
         self._on_state = on_state
@@ -222,6 +238,7 @@ class GripWorker:
         self._session = False               # 本次会话是否已经 teleop_start 过
         self._watchdog_trips = 0
         self._prev_stale = False
+        self._prev_over_torque = False
         self._mismatch = ""
         self._mismatch_checked = False
 
@@ -354,14 +371,19 @@ class GripWorker:
             host=None if self._role == ROLE_MASTER else self.gpeer,
             port=self.gport, grip_id=self.grip_id,
             kp=self.kp, kd=self.kd, align=self.align,
-            watchdog_s=self.watchdog_ms / 1000.0, rate_hz=self.rate_hz)
+            watchdog_s=self.watchdog_ms / 1000.0, rate_hz=self.rate_hz,
+            torque_limit_nm=self.torque_limit_nm)
         self._session = True
+        self._prev_over_torque = False
         if self._role == ROLE_MASTER:
             self._log(f"主端夹爪：零重力拖动 · 发布 {self._topic} @ 端口 {self.gport}"
                       f" · {self.rate_hz:.0f} Hz")
         else:
+            limit = ("关闭" if self.torque_limit_nm == 0.0
+                     else f"{self.torque_limit_nm:.2f} Nm")
             self._log(f"从端夹爪：订阅 {self._topic} @ {self.gpeer}:{self.gport} "
-                      f"· align={self.align} · watchdog={self.watchdog_ms:.0f} ms")
+                      f"· align={self.align} · watchdog={self.watchdog_ms:.0f} ms "
+                      f"· 力矩上限 {limit}")
         return st
 
     # ────────────────────── 快照 ──────────────────────
@@ -389,6 +411,9 @@ class GripWorker:
             s.rejected = int(st.get("rejected", 0) or 0)
             s.send_failed = int(st.get("send_failed", 0) or 0)
             s.fault = str(st.get("fault", "") or "")
+            s.torque_nm = float(st.get("torque_nm", 0.0) or 0.0)
+            s.over_torque = bool(st.get("over_torque", False))
+            s.torque_trips = int(st.get("torque_trips", 0) or 0)
             s.stale = bool(st.get("stale", False))
             s.frame_age = None if age_ms is None else float(age_ms) / 1000.0
             s.matching = bool(st.get("matching")) if master else False
@@ -400,6 +425,11 @@ class GripWorker:
             self._log(f"⚠ watchdog 超时 {self.watchdog_ms:.0f} ms "
                       "—— **持位**（继续发帧：不掉力、不松开、不重连）")
         self._prev_stale = s.stale
+        if s.over_torque and not self._prev_over_torque:
+            self._log(f"⚠ 从端夹爪力矩超限（{s.torque_nm:+.2f} Nm 对上限 "
+                      f"{self.torque_limit_nm:.2f} Nm）—— **就地卸力**，夹爪不再顶住；"
+                      "主端张开一点即自动恢复跟随")
+        self._prev_over_torque = s.over_torque
         with self._lock:
             s.watchdog_trips = self._watchdog_trips
         if not master:

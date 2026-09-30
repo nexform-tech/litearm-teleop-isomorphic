@@ -39,6 +39,8 @@ def test_travel_mm_matches_sdk_template():
     (dict(watchdog_ms=-5.0), "watchdog_ms"),
     (dict(poll_s=0.0), "poll_s"),
     (dict(poll_s=-1.0), "poll_s"),
+    # ⚠ 0 **合法**（= 关闭堵转保护），只有负数要拒 ⇒ 别把 `<= 0` 写进来。
+    (dict(torque_limit_nm=-0.1), "torque_limit_nm"),
 ])
 def test_degenerate_construction_params_are_rejected(kw, match):
     """⚠ `rate_hz <= 0` / `watchdog_ms <= 0` 会被 SDK 的 `GripperTeleop` 拒掉；
@@ -49,6 +51,14 @@ def test_degenerate_construction_params_are_rejected(kw, match):
     """
     with pytest.raises(ValueError, match=match):
         GripWorker("can0", **kw)
+
+
+def test_zero_torque_limit_is_accepted():
+    """0 是**合法**值 —— SDK 语义是"关闭堵转保护"，用户可能就是想全权手动。
+
+    判别力：把校验写成 `<= 0` 时本用例必红。
+    """
+    assert GripWorker("can0", torque_limit_nm=0.0).torque_limit_nm == 0.0
 
 
 def test_bad_role_is_rejected():
@@ -378,6 +388,49 @@ def test_teleop_start_receives_the_right_arguments(role, gcan, gpeer):
         assert kw["align"] is False
         assert kw["watchdog_s"] == pytest.approx(0.25)
         assert kw["rate_hz"] == pytest.approx(100.0)
+        assert kw["torque_limit_nm"] == pytest.approx(1.0), "构造默认值要透传下去"
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_torque_limit_is_passed_through_to_the_sdk():
+    """本仓的 `torque_limit_nm` 必须原样进 `teleop_start` —— 它就靠这个生效。
+
+    判别力：把 `_start_session` 里的 `torque_limit_nm=` 删掉时本用例必红
+    （那样 SDK 会用**它自己的**默认值，界面上设的 2.5 就白设了）。
+    """
+    g = FakeGrip()
+    w = GripWorker("can0", torque_limit_nm=2.5, poll_s=0.02,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True, ROLE_SLAVE)
+        time.sleep(0.2)
+        assert g.teleop_starts[0]["torque_limit_nm"] == pytest.approx(2.5)
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_slave_status_maps_the_torque_guard():
+    """从端的力矩保护状态要进快照 —— 否则"已卸力"与"正常持位"在界面上一样。
+
+    ⚠ `torque_nm` 是**从端自己**的力矩读数，不是帧里的 `force_n`（那是主端的）。
+    """
+    g = FakeGrip()
+    g.teleop_status_extra = {"torque_nm": 1.42, "over_torque": True,
+                             "torque_trips": 2}
+    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
+                   gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True, ROLE_SLAVE)
+        time.sleep(0.25)
+        s = w.snapshot()
+        assert s.torque_nm == pytest.approx(1.42)
+        assert s.over_torque is True
+        assert s.torque_trips == 2
     finally:
         w.stop(timeout=5.0)
 
