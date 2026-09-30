@@ -377,6 +377,45 @@ def test_starting_teleop_reads_the_role_at_that_moment(qapp):
         w.close()
 
 
+def test_starting_grip_teleop_reads_the_params_at_that_moment(qapp):
+    """⚠⚠ 夹爪的遥操参数（角色/对端/端口/夹爪 ID）在点「启动夹爪遥操」那一刻读，
+    不是建 worker 时。
+
+    判别力：把 `_toggle_grip` 改回"用构造时那组"时本用例必红 —— 这里**先改端口
+    再启动**，期望发出去的就是新端口。issue #12：旧设计改了不生效，日志还报旧值，
+    而 zenoh 点对点 ⇒ 端口不一致就是一条帧都收不到。
+    """
+    from liteteleop.gui import main_window as mw
+
+    w = MainWindow(Settings(role=ROLE_SLAVE))
+    got = []
+
+    class _W:
+        def is_alive(self):
+            return True
+
+        def set_teleop(self, on, params=None):
+            got.append((on, params))
+
+    w.grip = _W()                                 # type: ignore[assignment]
+    try:
+        w.page.ed_gcan.setText("can0")            # 有通道才会走到 set_teleop
+        w.page.sp_gport.setValue(17465)           # ⚠ 先改端口 …
+        w._toggle_grip(True)                      # … 再启动
+        assert got and got[0][0] is True
+        p = got[0][1]
+        # ⚠ 判据取 **main_window 自己那个** 类：`test_grip_worker.py` 有一条
+        #   `importlib.reload(grip_worker)` 的用例，reload 在**同一个模块对象**上
+        #   换了一批新类 ⇒ 别处 `from … import GripTeleopParams` 拿到的还是旧类，
+        #   拿本模块的引用判会假红（生产代码只鸭子类型，不受影响）。
+        assert isinstance(p, mw.GripTeleopParams), p
+        assert p.gport == 17465, f"启动时该读界面上那个端口，实际 {p.gport}"
+        assert p.role == ROLE_SLAVE
+    finally:
+        w.grip = None
+        w.close()
+
+
 def test_connect_and_disconnect_are_mutually_exclusive(qapp):
     """⚠ 顶栏「连接臂 / 断开」**互斥启用**，判据是 `worker` 在不在。
 

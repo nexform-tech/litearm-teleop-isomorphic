@@ -16,7 +16,8 @@ import pytest
 
 from liteteleop import grip_worker as gw
 from liteteleop.grip_worker import (ROLE_MASTER, ROLE_SLAVE, GripNotReady,
-                                    GripWorker, check_ready, travel_mm_of)
+                                    GripTeleopParams, GripWorker, check_ready,
+                                    travel_mm_of)
 from tests.fake_grip import NORMAL, REVERSE, FakeCfg, FakeGrip
 
 
@@ -39,8 +40,6 @@ def test_travel_mm_matches_sdk_template():
     (dict(watchdog_ms=-5.0), "watchdog_ms"),
     (dict(poll_s=0.0), "poll_s"),
     (dict(poll_s=-1.0), "poll_s"),
-    # ⚠ 0 **合法**（= 关闭堵转保护），只有负数要拒 ⇒ 别把 `<= 0` 写进来。
-    (dict(torque_limit_nm=-0.1), "torque_limit_nm"),
 ])
 def test_degenerate_construction_params_are_rejected(kw, match):
     """⚠ `rate_hz <= 0` / `watchdog_ms <= 0` 会被 SDK 的 `GripperTeleop` 拒掉；
@@ -48,30 +47,62 @@ def test_degenerate_construction_params_are_rejected(kw, match):
     不做的静默无用配置）。从线程里抛出来的表现只是"点了按钮没反应" ⇒ 构造时就拒。
 
     判别力：去掉 `__init__` 里那三条 `ValueError` 时本用例必红。
+
+    ⚠ 力矩上限**不在这里** —— 它是遥操参数，校验在 `GripTeleopParams`（见下）。
     """
     with pytest.raises(ValueError, match=match):
         GripWorker("can0", **kw)
 
+
+# ════════════════════ 遥操参数（点「启动夹爪遥操」那一刻才读）════════════════════
 
 def test_zero_torque_limit_is_accepted():
     """0 是**合法**值 —— SDK 语义是"关闭堵转保护"，用户可能就是想全权手动。
 
     判别力：把校验写成 `<= 0` 时本用例必红。
     """
-    assert GripWorker("can0", torque_limit_nm=0.0).torque_limit_nm == 0.0
+    assert GripTeleopParams(ROLE_SLAVE, torque_limit_nm=0.0).torque_limit_nm == 0.0
+
+
+def test_negative_torque_limit_is_rejected():
+    """只有负数要拒 —— 这条原本挂在 `GripWorker` 的构造上，现在跟着参数走。
+
+    判别力：去掉 `GripTeleopParams.__post_init__` 里那条 `ValueError` 时本用例必红。
+    """
+    with pytest.raises(ValueError, match="torque_limit_nm"):
+        GripTeleopParams(ROLE_SLAVE, torque_limit_nm=-0.1)
 
 
 def test_bad_role_is_rejected():
-    """⚠ 角色是**遥操参数** ⇒ 在 `set_teleop(True, role=…)` 上同步被拒。
+    """⚠ 角色是**遥操参数** ⇒ 在参数上同步被拒。
 
-    与臂同款：① 非法值要拒；② **不给**也要拒（不能默认成主端）。
+    与臂同款：① 非法值要拒；② **不给**也要拒（不能默认成主端）—— `role` 没有
+    默认值，所以"不给"由 dataclass 自己拒（`TypeError`），不用另写一条分支。
+    判别力：把 `GripTeleopParams.__post_init__` 里那条校验删掉时本用例必红。
+    """
+    with pytest.raises(ValueError, match="role"):
+        GripTeleopParams("bogus")
+    with pytest.raises(TypeError):
+        GripTeleopParams()                       # type: ignore[call-arg]
+
+
+def test_set_teleop_without_params_is_rejected():
+    """⚠ 启动必须给参数（**同步**抛，别让错误留到线程里变成"点了没反应"）。
+
+    与臂同款 —— 不给就默认主端正是那种会造成事故的静默默认值。
     判别力：把 `set_teleop` 里那段校验删掉时本用例必红。
     """
     w = GripWorker("can0")
-    with pytest.raises(ValueError, match="role"):
-        w.set_teleop(True, role="bogus")
-    with pytest.raises(ValueError, match="role"):
+    with pytest.raises(ValueError, match="params"):
         w.set_teleop(True)
+
+
+def test_topic_and_peer_host_come_from_the_params():
+    """topic 由 `grip_id` 派生；空对端按回环算（与 `TeleopParams` 同款）。"""
+    p = GripTeleopParams(ROLE_SLAVE, grip_id="gB", gpeer="")
+    assert p.topic == "litearm/v4/gB/gripper_teleop"
+    assert p.peer_host() == "127.0.0.1"
+    assert GripTeleopParams(ROLE_SLAVE, gpeer="10.0.0.5").peer_host() == "10.0.0.5"
 
 
 # ════════════════════ §8.1 前置：拒启动 ════════════════════
@@ -144,7 +175,7 @@ def test_teardown_stops_session_and_disconnects():
     w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     w.start()
     time.sleep(0.15)
-    w.set_teleop(True, ROLE_MASTER)
+    w.set_teleop(True, GripTeleopParams(ROLE_MASTER))
     time.sleep(0.2)
     w.stop(timeout=5.0)
     assert g.teleop_stops >= 1, "收尾必须 teleop_stop（交接持位）"
@@ -222,7 +253,7 @@ def test_teleop_start_failure_is_recorded():
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_MASTER)
+        w.set_teleop(True, GripTeleopParams(ROLE_MASTER))
         time.sleep(0.25)
         assert "already running" in w.snapshot().error, \
             f"teleop_start 的异常必须被记下来，实际 {w.snapshot().error!r}"
@@ -241,7 +272,7 @@ def test_master_status_maps_frames_to_sent_and_matching():
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_MASTER)
+        w.set_teleop(True, GripTeleopParams(ROLE_MASTER))
         time.sleep(0.25)
         s = w.snapshot()
         assert s.teleop_active is True
@@ -265,12 +296,12 @@ def test_slave_status_maps_frames_to_received_and_watchdog():
                              "stale": True, "fault": "fault 11: MOS 过温",
                              "rejected": 3, "send_failed": 2,
                              "last_frame_age_ms": 250.0}
-    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
+    w = GripWorker("can1", poll_s=0.02,
                    gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_SLAVE)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE))
         time.sleep(0.35)
         s = w.snapshot()
         assert s.frames_received > 0, "从端要把 frames 记成 received"
@@ -292,12 +323,12 @@ def test_slave_mismatch_warning_from_status():
     """
     g = FakeGrip()
     g.teleop_status_extra = {"openness": 0.5, "position_mm": 30.0}
-    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
+    w = GripWorker("can1", poll_s=0.02,
                    gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_SLAVE)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE))
         time.sleep(0.25)
         assert "不一致" in w.snapshot().mismatch
     finally:
@@ -313,12 +344,12 @@ def test_status_without_session_does_not_zero_the_readout():
     """
     g = FakeGrip()
     g.teleop_status_extra = {"openness": 0.7, "position_mm": 70.0}
-    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
+    w = GripWorker("can1", poll_s=0.02,
                    gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_SLAVE)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE))
         time.sleep(0.25)
         assert w.snapshot().openness == pytest.approx(0.7)
         w.set_teleop(False)                       # 停会话 ⇒ 状态回落到无会话形态
@@ -345,7 +376,7 @@ def test_self_ended_session_does_not_restart_storm():
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_MASTER)
+        w.set_teleop(True, GripTeleopParams(ROLE_MASTER))
         time.sleep(0.2)
         assert len(g.teleop_starts) == 1
         g.teleop_running = False                  # 会话"自己"结束
@@ -370,13 +401,13 @@ def test_teleop_start_receives_the_right_arguments(role, gcan, gpeer):
     `watchdog_s` 是**秒**，本仓的 `watchdog_ms` 要除以 1000（传错就是量纲 bug）。
     """
     g = FakeGrip()
-    w = GripWorker(gcan, grip_id="gB", gpeer=gpeer, gport=17449,
-                   rate_hz=100.0, watchdog_ms=250.0, align=False,
+    w = GripWorker(gcan, rate_hz=100.0, watchdog_ms=250.0,
                    poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, role)
+        w.set_teleop(True, GripTeleopParams(
+            role, grip_id="gB", gpeer=gpeer, gport=17449, align=False))
         time.sleep(0.2)
         assert g.teleop_starts, "应当已经 teleop_start"
         kw = g.teleop_starts[0]
@@ -388,7 +419,7 @@ def test_teleop_start_receives_the_right_arguments(role, gcan, gpeer):
         assert kw["align"] is False
         assert kw["watchdog_s"] == pytest.approx(0.25)
         assert kw["rate_hz"] == pytest.approx(100.0)
-        assert kw["torque_limit_nm"] == pytest.approx(1.0), "构造默认值要透传下去"
+        assert kw["torque_limit_nm"] == pytest.approx(1.0), "参数默认值要透传下去"
     finally:
         w.stop(timeout=5.0)
 
@@ -400,14 +431,41 @@ def test_torque_limit_is_passed_through_to_the_sdk():
     （那样 SDK 会用**它自己的**默认值，界面上设的 2.5 就白设了）。
     """
     g = FakeGrip()
-    w = GripWorker("can0", torque_limit_nm=2.5, poll_s=0.02,
-                   gripper_factory=lambda _c: g)
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_SLAVE)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE, torque_limit_nm=2.5))
         time.sleep(0.2)
         assert g.teleop_starts[0]["torque_limit_nm"] == pytest.approx(2.5)
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_a_changed_port_applies_on_the_next_start():
+    """⚠⚠ 回归 issue #12：worker 建好之后改端口，**下一次启动就要用新端口**。
+
+    旧设计把端口定死在构造里、而 worker 一直复用 ⇒ 改过的值静默失效，日志还报旧值。
+    后果不是"链路变差"而是"没有链路"：zenoh 严格点对点 ⇒ 端口不一致一帧都收不到
+    （从端只有「对齐超时」，主端只说「已发 N 帧」，没有一处指向端口）。
+
+    判别力：把 `_start_session` 改回读一个构造时存下的端口时本用例必红。
+    """
+    g = FakeGrip()
+    w = GripWorker("can1", poll_s=0.02, gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE, gport=17448))
+        time.sleep(0.2)
+        assert g.teleop_starts[0]["port"] == 17448
+
+        w.set_teleop(False)                       # 停会话 …
+        time.sleep(0.2)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE, gport=17465))
+        time.sleep(0.2)                           # … 改了端口再启动
+        assert g.teleop_starts[-1]["port"] == 17465, \
+            "改过的端口必须在下一次启动生效（issue #12）"
     finally:
         w.stop(timeout=5.0)
 
@@ -420,12 +478,12 @@ def test_slave_status_maps_the_torque_guard():
     g = FakeGrip()
     g.teleop_status_extra = {"torque_nm": 1.42, "over_torque": True,
                              "torque_trips": 2}
-    w = GripWorker("can1", gpeer="127.0.0.1", poll_s=0.02,
+    w = GripWorker("can1", poll_s=0.02,
                    gripper_factory=lambda _c: g)
     try:
         w.start()
         time.sleep(0.15)
-        w.set_teleop(True, ROLE_SLAVE)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE))
         time.sleep(0.25)
         s = w.snapshot()
         assert s.torque_nm == pytest.approx(1.42)

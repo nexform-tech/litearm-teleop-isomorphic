@@ -38,6 +38,10 @@ python -m liteteleop --role slave  --cdc /dev/ttyACM1 --peer 192.168.31.10 \
 帧与环**都不在本仓**：两者都来自 `litegrip` SDK，本仓只是经 `LiteGrip.teleop_start`
 调它。**不传 `--gcan` 就不启用夹爪遥操**，这也是默认状态。
 
+夹爪遥操的各个字段 —— 对端、端口、夹爪 ID、align、力矩上限 —— 是在**点「启动夹爪遥操」
+那一刻**读的，不是建 worker 时读的。改完端口再启动一次，新端口即生效；会话跑起来之后
+这些字段不再重读，要改就停下来重开。
+
 先把 CAN 总线拉起来。夹爪需要自己的总线（`can0` 或 `can1`），不是臂的 CDC 口：
 
 ```bash

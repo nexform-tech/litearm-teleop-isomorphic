@@ -47,6 +47,11 @@ here: both come from the `litegrip` SDK, which this repository calls through
 `LiteGrip.teleop_start`. Omit `--gcan` to leave gripper teleoperation off; that
 is the default.
 
+The gripper teleoperation fields — peer, port, grip ID, align, and torque limit
+— are read when you start gripper teleoperation, not when the worker is built.
+Edit the port and start again, and the new port applies; the fields are not
+re-read while a session runs, so stop and start to change them.
+
 Bring the CAN bus up first. The gripper needs its own bus (`can0` or `can1`), not
 the arm's CDC port:
 

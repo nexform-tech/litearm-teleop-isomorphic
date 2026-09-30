@@ -27,9 +27,9 @@ from typing import Callable, Optional
 log = logging.getLogger("liteteleop.grip")
 
 __all__ = ["ROLE_MASTER", "ROLE_SLAVE", "GRIP_RATE_HZ", "GRIP_WATCHDOG_MS",
-           "POLL_S", "GRIP_SDK_SRC", "TORQUE_LIMIT_NM", "GripNotReady",
-           "GripSnapshot", "GripWorker", "assert_sdk_pinned", "pin_grip_sdk",
-           "check_ready", "travel_mm_of"]
+           "POLL_S", "GRIP_SDK_SRC", "TORQUE_LIMIT_NM", "GripTeleopParams",
+           "GripNotReady", "GripSnapshot", "GripWorker", "assert_sdk_pinned",
+           "pin_grip_sdk", "check_ready", "travel_mm_of"]
 
 ROLE_MASTER = "master"
 ROLE_SLAVE = "slave"
@@ -69,6 +69,47 @@ _MISMATCH_WINDOW = (0.15, 0.85)
 #: ⚠ 覆盖值要**绝对路径**：`litegrip.__file__` 永远是绝对路径，给相对路径会
 #:   在 `assert_sdk_pinned` 上直接报错，而不是按 CWD 静默解析。
 GRIP_SDK_SRC = os.environ.get("LITEGRIP_SRC", "/home/llx/litegrip-python/src")
+
+
+@dataclass
+class GripTeleopParams:
+    """一组**遥操**参数 —— 点「启动夹爪遥操」那一刻才读。
+
+    ⚠⚠ 这里没有一个字段属于"连接"（连接只需要 `gcan`）。界面**不该**在连上后
+    把它们锁死 —— 那是旧设计「构造时定死」逼出来的补丁：worker 建好之后一直复用，
+    于是改过的端口/对端/夹爪 ID 全部**静默失效**（issue #12）。后果不是"链路变差"
+    而是"没有链路"：zenoh 是严格点对点的（`scouting/*` 全关），端口不一致就一帧
+    都收不到，日志里只有从端「对齐超时」+ 主端「已发 N 帧」，没有一处指向端口。
+    改成按 `teleop_active` 锁，与 `arm_worker.TeleopParams` 同款。
+    """
+
+    #: ⚠⚠ **必填、没有默认值** —— "不给就默认主端"正是那种会造成事故的静默默认值
+    #: （把不该软的那端送进零重力）。调用方必须显式说明这台机是主还是从。
+    role: str
+    grip_id: str = "gripA"
+    gpeer: str = "127.0.0.1"
+    gport: int = 17448
+    align: bool = True
+    torque_limit_nm: float = TORQUE_LIMIT_NM
+
+    def __post_init__(self) -> None:
+        if self.role not in (ROLE_MASTER, ROLE_SLAVE):
+            raise ValueError(f"role 必须是 {ROLE_MASTER}/{ROLE_SLAVE}，"
+                             f"收到 {self.role!r}")
+        # ⚠ 0 是**合法**值（SDK 语义：关闭堵转保护）⇒ 只拒负数，别把 `<= 0` 写进来。
+        if float(self.torque_limit_nm) < 0.0:
+            raise ValueError(
+                f"torque_limit_nm 必须 >= 0（0 = 关闭保护），"
+                f"收到 {self.torque_limit_nm!r}")
+
+    @property
+    def topic(self) -> str:
+        """遥操 zenoh topic —— 由 `grip_id` 派生。"""
+        return f"litearm/v4/{self.grip_id}/gripper_teleop"
+
+    def peer_host(self) -> str:
+        """对端地址；空串按本机回环算（与 `TeleopParams.peer_host` 同款）。"""
+        return (self.gpeer or "").strip() or "127.0.0.1"
 
 
 class GripNotReady(RuntimeError):
@@ -181,22 +222,22 @@ class GripSnapshot:
 class GripWorker:
     """独占夹爪的线程。生命周期：`start()` → … → `stop()`。"""
 
-    def __init__(self, gcan: str, grip_id: str = "gripA",
-                 gpeer: str = "127.0.0.1", gport: int = 17448,
+    def __init__(self, gcan: str,
                  rate_hz: float = GRIP_RATE_HZ,
                  kp: Optional[float] = None, kd: Optional[float] = None,
-                 align: bool = True, watchdog_ms: float = GRIP_WATCHDOG_MS,
-                 poll_s: float = POLL_S, torque_limit_nm: float = TORQUE_LIMIT_NM,
+                 watchdog_ms: float = GRIP_WATCHDOG_MS,
+                 poll_s: float = POLL_S,
                  gripper_factory: Optional[Callable[[str], object]] = None,
                  on_state: Optional[Callable[[GripSnapshot], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
-        """⚠ 构造只收**连接/设备**参数（CAN 通道等）。
+        """⚠ 构造只收**连接/环**参数（CAN 通道、环频、增益、watchdog）。
 
-        **角色不在构造里** —— 夹爪的角色**跟着臂走**，由
-        `set_teleop(True, role=...)` 在点「启动夹爪遥操」那一刻给。
-        （与 `ArmWorker` 同款：角色是**遥操**参数，不是连接参数。）
+        **遥操参数不在构造里** —— 对端、端口、夹爪 ID、align、力矩上限全部走
+        `set_teleop(True, GripTeleopParams(...))`，在点「启动夹爪遥操」那一刻读。
+        （与 `ArmWorker` 同款：那些字段没有一个是"连接"参数；角色还额外**跟着臂走**。
+        旧设计把它们定死在构造里 ⇒ 改过的值静默失效，见 issue #12。）
         """
-        self._role: str = ""            # 空 = 角色未定（还没启过夹爪遥操）
+        self._params: Optional[GripTeleopParams] = None   # 空 = 还没启过夹爪遥操
         # ⚠ 退化的构造参数在**这里**就拒掉，不要留到线程里才崩：
         #    `rate_hz <= 0` / `watchdog_ms <= 0` 会被 SDK 的 `GripperTeleop` 拒掉
         #    （`teleop.py` 的 `__init__`）—— 但从线程里抛出来的表现是"点了按钮没反应"，
@@ -208,22 +249,12 @@ class GripWorker:
             raise ValueError(f"watchdog_ms 必须 > 0，收到 {watchdog_ms!r}")
         if not float(poll_s) > 0.0:
             raise ValueError(f"poll_s 必须 > 0，收到 {poll_s!r}")
-        # ⚠ 0 是**合法**的（SDK 语义：关闭堵转保护）⇒ 只拒负数。
-        if float(torque_limit_nm) < 0.0:
-            raise ValueError(
-                f"torque_limit_nm 必须 >= 0（0 = 关闭保护），收到 {torque_limit_nm!r}")
         self.gcan = gcan
-        self.grip_id = grip_id
-        self.gpeer = gpeer
-        self.gport = int(gport)
         self.rate_hz = float(rate_hz)
         self.kp = kp
         self.kd = kd
-        self.align = bool(align)
         self.watchdog_ms = float(watchdog_ms)
         self.poll_s = float(poll_s)
-        self.torque_limit_nm = float(torque_limit_nm)
-        self._topic = f"litearm/v4/{grip_id}/gripper_teleop"
         self._factory = gripper_factory or _default_gripper_factory
         self._on_state = on_state
         self._on_log = on_log
@@ -231,7 +262,7 @@ class GripWorker:
         self._grip = None
         self._cfg = None
         self._lock = threading.Lock()
-        self._snap = GripSnapshot(topic=self._topic)   # ⚠ 角色未定，见 self._role
+        self._snap = GripSnapshot()   # ⚠ 角色/topic 未定，见 self._params
         self._stop = threading.Event()
         self._want = False
         self._thread: Optional[threading.Thread] = None
@@ -271,19 +302,23 @@ class GripWorker:
                 return
             self._thread = None
 
-    def set_teleop(self, on: bool, role: Optional[str] = None) -> None:
+    def set_teleop(self, on: bool,
+                   params: Optional[GripTeleopParams] = None) -> None:
         """请求启动/停止夹爪遥操。**与臂的开关是两个独立控件**（spec §2）。
 
-        ⚠⚠ **角色在这里定**（不是构造时），而且必须由调用方传 ——
-        夹爪的角色**跟着臂走**，两者都在点「启动遥操」那一刻读。
-        启动时不给就**同步抛**，别让错误留到线程里变成"点了没反应"。
+        ⚠⚠ **遥操参数（角色/对端/端口/夹爪 ID/align/力矩上限）在这里定**，
+        不是构造时 —— 见 `GripTeleopParams`。启动时必须给 `params`（**同步**抛，
+        别让错误留到线程里变成"点了没反应"）；停止时可以不给，沿用上一次那组。
+
+        ⚠ 先存 `params` 再置 `_want`：`_poll_loop` 在下一拍就可能看到 `_want`
+        为真并去 `_start_session()` 读 `_params` —— 顺序反了会用到上一组。
         """
         if on:
-            if role not in (ROLE_MASTER, ROLE_SLAVE):
+            if params is None:
                 raise ValueError(
-                    f"启动夹爪遥操必须给 role（{ROLE_MASTER}/{ROLE_SLAVE}），"
-                    f"收到 {role!r}")
-            self._role = role
+                    "启动夹爪遥操必须给 params —— 角色/对端/端口/夹爪 ID 都是"
+                    "**遥操**参数，连接时还不知道（见 GripTeleopParams）")
+            self._params = params
         self._want = bool(on)
 
     def snapshot(self) -> GripSnapshot:
@@ -366,23 +401,26 @@ class GripWorker:
             self._stop.wait(self.poll_s)
 
     def _start_session(self) -> dict:
+        p = self._params
+        if p is None:                            # 不该发生：set_teleop 已同步拦过
+            raise RuntimeError("启动夹爪遥操前必须先给 GripTeleopParams")
         st = self._grip.teleop_start(
-            self._role, link="zenoh",
-            host=None if self._role == ROLE_MASTER else self.gpeer,
-            port=self.gport, grip_id=self.grip_id,
-            kp=self.kp, kd=self.kd, align=self.align,
+            p.role, link="zenoh",
+            host=None if p.role == ROLE_MASTER else p.peer_host(),
+            port=p.gport, grip_id=p.grip_id,
+            kp=self.kp, kd=self.kd, align=p.align,
             watchdog_s=self.watchdog_ms / 1000.0, rate_hz=self.rate_hz,
-            torque_limit_nm=self.torque_limit_nm)
+            torque_limit_nm=p.torque_limit_nm)
         self._session = True
         self._prev_over_torque = False
-        if self._role == ROLE_MASTER:
-            self._log(f"主端夹爪：零重力拖动 · 发布 {self._topic} @ 端口 {self.gport}"
+        if p.role == ROLE_MASTER:
+            self._log(f"主端夹爪：零重力拖动 · 发布 {p.topic} @ 端口 {p.gport}"
                       f" · {self.rate_hz:.0f} Hz")
         else:
-            limit = ("关闭" if self.torque_limit_nm == 0.0
-                     else f"{self.torque_limit_nm:.2f} Nm")
-            self._log(f"从端夹爪：订阅 {self._topic} @ {self.gpeer}:{self.gport} "
-                      f"· align={self.align} · watchdog={self.watchdog_ms:.0f} ms "
+            limit = ("关闭" if p.torque_limit_nm == 0.0
+                     else f"{p.torque_limit_nm:.2f} Nm")
+            self._log(f"从端夹爪：订阅 {p.topic} @ {p.peer_host()}:{p.gport} "
+                      f"· align={p.align} · watchdog={self.watchdog_ms:.0f} ms "
                       f"· 力矩上限 {limit}")
         return st
 
@@ -390,16 +428,18 @@ class GripWorker:
 
     def _update(self, st: dict, running: bool) -> None:
         """把 SDK 的状态字典翻成界面要的 `GripSnapshot`。"""
-        master = self._role == ROLE_MASTER
+        p = self._params
+        master = p is not None and p.role == ROLE_MASTER
         # `teleop_status()` 在没有会话时只返回 `{"active": False, "mode": None}` ——
         # 那不是一份状态，别拿它把上一帧的读数清成 0。
         has_session = "topic" in st
         with self._lock:
             s = self._snap
             s.teleop_active = bool(self._want or running)
-            # ⚠ 角色是**遥操参数** ⇒ 没启过夹爪遥操时这里是空串（界面显示"未定"，
-            #   而不是替用户猜一个）。真源就是 `_role`。
-            s.role = self._role
+            # ⚠ 角色与 topic 都是**遥操参数** ⇒ 没启过夹爪遥操时是空串
+            #   （界面显示"未定"，而不是替用户猜一个）。真源就是 `_params`。
+            s.role = "" if p is None else p.role
+            s.topic = "" if p is None else p.topic
             if not has_session:
                 return
             frames = int(st.get("frames", 0) or 0)
@@ -426,8 +466,9 @@ class GripWorker:
                       "—— **持位**（继续发帧：不掉力、不松开、不重连）")
         self._prev_stale = s.stale
         if s.over_torque and not self._prev_over_torque:
+            limit = 0.0 if p is None else p.torque_limit_nm
             self._log(f"⚠ 从端夹爪力矩超限（{s.torque_nm:+.2f} Nm 对上限 "
-                      f"{self.torque_limit_nm:.2f} Nm）—— **就地卸力**，夹爪不再顶住；"
+                      f"{limit:.2f} Nm）—— **就地卸力**，夹爪不再顶住；"
                       "主端张开一点即自动恢复跟随")
         self._prev_over_torque = s.over_torque
         with self._lock:
