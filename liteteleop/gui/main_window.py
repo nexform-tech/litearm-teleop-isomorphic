@@ -27,7 +27,7 @@ import time
 from PyQt5 import QtCore, QtWidgets
 
 from ..arm_worker import ROLE_MASTER, ROLE_SLAVE, ArmWorker, Snapshot, TeleopParams
-from ..grip_worker import GripSnapshot, GripWorker
+from ..grip_worker import GripSnapshot, GripTeleopParams, GripWorker
 from ..settings import Settings, load_settings, save_settings
 from . import theme
 from .bridge import WorkerBridge
@@ -300,10 +300,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log(f"⛔ 夹爪 SDK 不可用：{e}")
             self._log("   （夹爪遥操已停用；臂遥操不受影响）")
             return None
+        # ⚠ 构造只收**设备**参数（CAN 通道）—— 对端/端口/夹爪 ID/align/力矩上限
+        #   都是**遥操**参数，在点「启动夹爪遥操」那一刻读（见 `GripTeleopParams`），
+        #   否则 worker 一旦建好就复用，改过的值全部静默失效（issue #12）。
         self.grip = GripWorker(
-            gcan=v["gcan"], grip_id=v["grip_id"],
-            gpeer=v["gpeer"], gport=v["gport"], align=v["align"],
-            torque_limit_nm=v["torque_limit_nm"],
+            gcan=v["gcan"],
             on_state=self.bridge.grip_state.emit, on_log=self.bridge.on_log)
         self.grip.start()
         return self.grip
@@ -318,10 +319,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if w is None:
             self.page.btn_grip.setChecked(False)
             return
-        # ⚠ 夹爪的角色**跟着臂走** ⇒ 也在这一刻读（不是连接时、也不是建 worker 时）
-        role = self.page.role()
-        self._log(f"启动夹爪遥操（角色={'主臂' if role == ROLE_MASTER else '从臂'}，跟随臂）")
-        w.set_teleop(True, role)
+        # ⚠⚠ **遥操参数在这一刻读**，不是连接时、也不是建 worker 时 —— 角色/对端/
+        #    端口/夹爪 ID/align/力矩上限全部。所以 worker 建好之后这些控件仍可改，
+        #    改了**下次启动生效**（界面按 `teleop_active` 锁，不是按 `connected`）。
+        #    （旧设计在构造时定死 ⇒ 端口改了不起作用、日志还报旧值，见 issue #12。）
+        v = self.page.gripper_values()
+        # ⚠ 夹爪的角色**跟着臂走** ⇒ 同样在这一刻读
+        try:
+            params = GripTeleopParams(
+                role=self.page.role(), grip_id=v["grip_id"], gpeer=v["gpeer"],
+                gport=v["gport"], align=v["align"],
+                torque_limit_nm=v["torque_limit_nm"])
+            w.set_teleop(True, params)
+        except ValueError as e:
+            # ⚠⚠ 不许让异常逃出 Qt 槽：PyQt5 对逃出槽的异常会直接 abort 进程
+            #    （见 `_ensure_grip_worker` 里那段说明）—— 那样会把正在跑的
+            #    臂遥操一起带走。参数非法就在这里挡下、把按钮弹回。
+            self._log(f"⛔ 夹爪遥操参数不合法：{e}")
+            self.page.btn_grip.setChecked(False)
+            return
+        self._log(f"启动夹爪遥操（角色={'主臂' if params.role == ROLE_MASTER else '从臂'}"
+                  f"，跟随臂 · 端口 {params.gport}）")
 
     def _on_grip_state(self, g: GripSnapshot) -> None:
         # ⚠ 本槽在 **Qt 主线程**跑（信号跨线程排队），碰控件是安全的
