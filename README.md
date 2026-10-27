@@ -81,7 +81,7 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 ## Repository standards
 
 This repository follows the shared NEXFORM ROBOTICS repository standards: the
-agent operating rules in [AGENTS.md](AGENTS.md), Conventional Commits, and
+agent operating rules in [`.nexform-standards.json`](.nexform-standards.json), Conventional Commits, and
 automated semantic-release versioning on every merge to `main`. All changes land
 through a pull request; direct pushes to `main` are blocked by branch protection.
 

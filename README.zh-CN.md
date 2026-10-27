@@ -69,7 +69,7 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 
 ## 仓库规范
 
-本仓遵循 NEXFORM ROBOTICS 的共享仓库规范：agent 操作规则见 [AGENTS.md](AGENTS.md)，
+本仓遵循 NEXFORM ROBOTICS 的共享仓库规范：agent 操作规则见 [`.nexform-standards.json`](.nexform-standards.json)，
 提交信息用 Conventional Commits，每次合入 `main` 由 semantic-release 自动打版本。
 所有改动都走 pull request，直接推 `main` 被分支保护拦住。
 
