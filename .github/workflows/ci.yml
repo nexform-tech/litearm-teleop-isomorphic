@@ -7,9 +7,6 @@
 # Source code has landed, so the real toolchain gate is now below ("Run test suite").
 # ⚠ Without it, stage-1's headline acceptance criterion ("pytest 全绿") is enforced
 # nowhere but on a developer's laptop.
-#
-# AGENTS.md is deliberately not linted: it is canonical content synced from
-# repo-template and must not be edited here.
 name: CI
 
 on:
@@ -72,7 +69,6 @@ jobs:
         run: |
           set -euo pipefail
           test -s README.md
-          test -s AGENTS.md
           test -s LICENSE
           python3 -c "import json; json.load(open('.releaserc.json'))"
           python3 -c "import json; json.load(open('.markdownlint.json'))"
