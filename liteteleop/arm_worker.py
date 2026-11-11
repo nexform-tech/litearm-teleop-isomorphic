@@ -511,6 +511,8 @@ class ArmWorker:
             self._log(f"命令执行失败: {e}")
 
     def _run(self) -> None:
+        from .arm_sdk import import_arm_sdk
+        import_arm_sdk()
         import litearm as pa
         from .ports import resolve_port
         try:

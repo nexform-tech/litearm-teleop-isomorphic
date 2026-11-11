@@ -1,30 +1,12 @@
 """入口：`python -m liteteleop`。
 
-⛔ **SDK 入口默认钉死在 `/home/llx/litearm-python/src`**（用户裁决）——
-本机 `sys.path` 上还挂着另一份 `litearm`（gitee 克隆，停在 `chore/sync-repo-standards`），
-会被**静默**抢先 import。判据不是"我设了 PYTHONPATH"，而是**导入后断言 + 打印**。
-
-⚠ 路径可用环境变量 `LITEARM_SRC` 覆盖 —— CI 上 checkout 的是**同一个公开仓**
-（`nexform-tech/litearm-python`），只是落在 runner 的工作目录里，硬编码路径不存在。
-⚠ 覆盖的只是**位置**；下面的"导入后核落点"判据一字未变 —— 所以它保护的东西
-（"别让另一份 litearm 静默抢先"）在两边同样成立。
+臂 SDK 与夹爪 SDK 都随包发布（`litearm/`、`litegrip/`），不要求用户克隆或单独安装。
+启动时核对 `litearm` 的落点：另一份同名包（例如旧的 editable 安装）抢先时直接退出，
+而不是连上臂之后才发现缺接口。
 """
 from __future__ import annotations
 
-import os
 import sys
-
-SDK_SRC = os.environ.get("LITEARM_SRC", "/home/llx/litearm-python/src")
-
-
-def _pin_sdk() -> None:
-    if SDK_SRC not in sys.path:
-        sys.path.insert(0, SDK_SRC)
-    import litearm as pa
-    if not str(pa.__file__).startswith(SDK_SRC):
-        raise SystemExit(
-            f"⛔ litearm 导入自 {pa.__file__}，不是 {SDK_SRC} —— 环境里有另一份抢先了")
-    print(f"SDK: {pa.__file__}")
 
 
 def main(argv=None) -> int:
@@ -35,7 +17,14 @@ def main(argv=None) -> int:
     """
     import argparse
     import logging
-    _pin_sdk()
+    try:
+        from .arm_sdk import import_arm_sdk
+        print(f"SDK: {import_arm_sdk()}")
+    except BaseException as e:                           # noqa: BLE001
+        # 命令行语义：SDK 不可用就**明确报错退出**，不要甩一坨 traceback。
+        print(f"⛔ 臂 SDK 不可用：{e}", file=sys.stderr)
+        print("   臂 SDK 随本包发布，重新安装 liteteleop", file=sys.stderr)
+        return 2
     # ⚠ 必须配 handler：界面里那份 `_log` 走 `log.info`，而**没配 handler 就什么都不落盘**
     #    —— 只有 warning 级以上才进文件。真机排查时日志文件是唯一的一手记录（界面关了就没了）。
     logging.basicConfig(level=logging.INFO,
