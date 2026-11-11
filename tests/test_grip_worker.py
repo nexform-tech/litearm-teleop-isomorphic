@@ -5,12 +5,14 @@ SDK**（`LiteGrip.teleop_start/teleop_stop/teleop_status`）⇒ 本文件**只**
 它把 SDK 的状态字典翻成界面要的 `GripSnapshot`。那些语义的用例在
 `litegrip-python/tests/test_teleop.py`（本仓不再重复，也不再维护第二份实现）。
 
-⚠⚠ CI **不装 litegrip**（`.github/workflows/ci.yml` 只装 `pytest` + `zenoh`）
-⇒ 这里一律走 `FakeGrip` 替身，绝不 `import litegrip`。
+⚠⚠ 夹爪硬件一律走 `FakeGrip` 替身。只有 SDK 落点/API 判据会 `import litegrip`；
+它 vendored 在本仓（`litegrip/`），CI 不需要额外安装。
 """
+import json
 import sys
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -184,12 +186,12 @@ def test_teardown_stops_session_and_disconnects():
     assert w.snapshot().teleop_active is False
 
 
-# ════════════════════ SDK：只认已安装的发行版 + 随包出厂标定 ════════════════════
+# ════════════════════ SDK：随包 vendored + 出厂标定 ════════════════════
 
-def _fake_sdk(tmp_path, version="1.2.1", teleop=True, factory=True):
-    """造一个最小的 `litegrip` 模块（落在 tmp 目录），喂 `import_grip_sdk` 的判据。"""
-    pkg = tmp_path / "litegrip"
-    pkg.mkdir()
+def _fake_sdk(root: Path, *, teleop=True, factory=True):
+    """造一个最小的 `litegrip` 模块（落在 root/litegrip），喂落点判据。"""
+    pkg = root / "litegrip"
+    pkg.mkdir(parents=True)
     init = pkg / "__init__.py"
     init.write_text("", encoding="utf-8")
     if factory:
@@ -197,7 +199,6 @@ def _fake_sdk(tmp_path, version="1.2.1", teleop=True, factory=True):
 
     mod = types.ModuleType("litegrip")
     mod.__file__ = str(init)
-    mod.__version__ = version
 
     class LiteGrip:
         pass
@@ -208,68 +209,37 @@ def _fake_sdk(tmp_path, version="1.2.1", teleop=True, factory=True):
     return mod
 
 
-def test_import_grip_sdk_accepts_the_installed_release(monkeypatch, tmp_path):
-    """已安装、够新、随包有出厂标定 ⇒ 返回模块路径（启动日志打印它）。"""
-    mod = _fake_sdk(tmp_path)
-    monkeypatch.setitem(sys.modules, "litegrip", mod)
-    assert gw.import_grip_sdk() == mod.__file__
+def test_import_grip_sdk_accepts_the_vendored_copy():
+    """随包的 `litegrip/` 就在仓库里 ⇒ 返回它的路径（启动日志打印它）。"""
+    module = Path(gw.import_grip_sdk()).resolve()
+    assert module.is_relative_to(gw.VENDORED_SDK_DIR)
+    assert module.name == "__init__.py"
 
 
-@pytest.mark.parametrize("version", ["1.2.0", "1.1.3", ""])
-def test_import_grip_sdk_rejects_an_old_or_unversioned_release(
-        monkeypatch, tmp_path, version):
-    """版本低于下限（或读不出）⇒ 拒。
+def test_import_grip_sdk_rejects_a_shadowing_package(monkeypatch, tmp_path):
+    """同名包从 `sys.path` 抢先时**报错**，而不是静默用错实现。
 
-    判别力：去掉版本下限比较时，1.2.0 那条会通过而本用例红。
+    判别力：去掉落点核对时本用例会通过而红。
     """
-    monkeypatch.setitem(sys.modules, "litegrip", _fake_sdk(tmp_path, version=version))
-    with pytest.raises(gw.GripSdkUnavailable, match="太旧|版本未知"):
+    monkeypatch.setitem(sys.modules, "litegrip", _fake_sdk(tmp_path))
+    with pytest.raises(gw.GripSdkUnavailable, match="不是随包"):
         gw.import_grip_sdk()
 
 
-def test_import_grip_sdk_rejects_a_source_tree(monkeypatch, tmp_path):
-    """⚠ `0.0.0+source` = **没有发行版元数据**，即源码树被塞进了 `sys.path`。
-
-    本仓不认检出目录（换台机器就没了）；要开发就 `pip install -e`，
-    那样至少有发行版元数据（版本会是占位符 `0.0.0`）。
-    判别力：去掉 `+source` 分支时本用例会走进"可编辑安装"的放行路径而红。
-    """
-    monkeypatch.setitem(sys.modules, "litegrip",
-                        _fake_sdk(tmp_path, version="0.0.0+source"))
-    with pytest.raises(gw.GripSdkUnavailable, match="源码树"):
-        gw.import_grip_sdk()
-
-
-def test_import_grip_sdk_accepts_an_editable_install_with_a_warning(
-        monkeypatch, tmp_path, caplog):
-    """可编辑安装版本是占位符 `0.0.0`（semantic-release 不写回）⇒ 放行 + 告警。
-
-    版本下限核对不了，但 API 与出厂标定仍然要查 —— 那才是这个 worker 真正
-    用到的东西。
-    """
-    monkeypatch.setitem(sys.modules, "litegrip",
-                        _fake_sdk(tmp_path, version="0.0.0"))
-    assert gw.import_grip_sdk() == str(tmp_path / "litegrip" / "__init__.py")
-    assert "可编辑安装" in caplog.text
-
-
-def test_import_grip_sdk_rejects_the_other_same_named_package(monkeypatch, tmp_path):
-    """同名不同源的 `litegrip`（gitee 那份）没有 `LiteGrip.teleop_start`。
-
-    判别力：去掉 API 核对时本用例会通过而红。
-    """
+def test_import_grip_sdk_rejects_an_incomplete_vendored_copy(
+        monkeypatch, tmp_path):
+    """落点对，但缺 `LiteGrip.teleop_start` ⇒ 不是本仓用的那份 SDK。"""
+    monkeypatch.setattr(gw, "VENDORED_SDK_DIR", tmp_path.resolve())
     monkeypatch.setitem(sys.modules, "litegrip",
                         _fake_sdk(tmp_path, teleop=False))
     with pytest.raises(gw.GripSdkUnavailable, match="teleop_start"):
         gw.import_grip_sdk()
 
 
-def test_import_grip_sdk_rejects_a_package_without_the_factory_calibration(
+def test_import_grip_sdk_rejects_a_vendored_copy_without_calibration(
         monkeypatch, tmp_path):
-    """版本够、API 在，但包里没有 `factory_calibration.json` ⇒ 旧版/别的包。
-
-    判别力：去掉 `factory.is_file()` 核对时本用例会通过而红。
-    """
+    """落点对、API 在，但缺 `factory_calibration.json` ⇒ 安装包不完整。"""
+    monkeypatch.setattr(gw, "VENDORED_SDK_DIR", tmp_path.resolve())
     monkeypatch.setitem(sys.modules, "litegrip",
                         _fake_sdk(tmp_path, factory=False))
     with pytest.raises(gw.GripSdkUnavailable, match="factory_calibration"):
@@ -277,19 +247,17 @@ def test_import_grip_sdk_rejects_a_package_without_the_factory_calibration(
 
 
 def test_import_grip_sdk_reports_a_missing_package(monkeypatch):
-    """没装就给出可执行的修法，而不是把 `ModuleNotFoundError` 甩给用户。"""
+    """随包副本缺失时给出可执行的修法，而不是把 `ModuleNotFoundError` 甩给用户。"""
     monkeypatch.setitem(sys.modules, "litegrip", None)
-    with pytest.raises(gw.GripSdkUnavailable, match="pip install"):
+    with pytest.raises(gw.GripSdkUnavailable, match="重新安装本包"):
         gw.import_grip_sdk()
 
 
-def test_factory_calibration_path_is_the_file_bundled_with_the_module(
-        monkeypatch, tmp_path):
-    """出厂标定 = **已安装模块旁边**的 `factory_calibration.json`。"""
-    mod = _fake_sdk(tmp_path)
-    monkeypatch.setitem(sys.modules, "litegrip", mod)
-    assert gw.factory_calibration_path() == \
-        str(tmp_path / "litegrip" / "factory_calibration.json")
+def test_factory_calibration_path_is_the_vendored_factory_file():
+    """出厂标定 = 随包 SDK 目录里的 `factory_calibration.json`，且已标定。"""
+    path = Path(gw.factory_calibration_path()).resolve()
+    assert path == (gw.VENDORED_SDK_DIR / "factory_calibration.json").resolve()
+    assert json.loads(path.read_text(encoding="utf-8"))["calibrated"] is True
 
 
 def test_worker_loads_the_sdk_factory_calibration(monkeypatch):
@@ -301,12 +269,12 @@ def test_worker_loads_the_sdk_factory_calibration(monkeypatch):
     g = FakeGrip()
     monkeypatch.setattr(gw, "_default_gripper_factory", lambda _c: g)
     monkeypatch.setattr(gw, "factory_calibration_path",
-                        lambda: "/opt/litegrip/litegrip/factory_calibration.json")
+                        lambda: "/tmp/vendored/factory_calibration.json")
     w = GripWorker("can1", poll_s=0.02)
     try:
         w.start()
         time.sleep(0.2)
-        assert g.loaded_path == "/opt/litegrip/litegrip/factory_calibration.json"
+        assert g.loaded_path == "/tmp/vendored/factory_calibration.json"
         assert g.loaded is True
     finally:
         w.stop(timeout=5.0)

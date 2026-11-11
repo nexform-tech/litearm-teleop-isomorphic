@@ -282,8 +282,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("⚠ 未填夹爪 CAN 通道 —— 夹爪遥操未启用")
             return None
         self._save_grip()
-        # ⚠ 只依赖**已安装**的 litegrip-python；不往 sys.path 塞检出目录。
-        #    核对必须排在 `GripWorker.start()` **之前**，这样缺 SDK / 版本太旧
+        # ⚠ 只认**随包 vendored** 的 litegrip；不往 sys.path 塞检出目录。
+        #    核对必须排在 `GripWorker.start()` **之前**，这样缺 SDK / 被同名包抢先
         #    会在主线程里报出来，而不是在 worker 线程里变成"点了没反应"。
         try:
             from ..grip_worker import import_grip_sdk

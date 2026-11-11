@@ -28,7 +28,7 @@ from .settings import DEFAULT_PEER
 log = logging.getLogger("liteteleop.grip")
 
 __all__ = ["ROLE_MASTER", "ROLE_SLAVE", "GRIP_RATE_HZ", "GRIP_WATCHDOG_MS",
-           "POLL_S", "MIN_SDK_VERSION", "DEFAULT_PEER", "TORQUE_LIMIT_NM",
+           "POLL_S", "DEFAULT_PEER", "TORQUE_LIMIT_NM", "VENDORED_SDK_DIR",
            "GripTeleopParams", "GripNotReady", "GripSdkUnavailable",
            "GripSnapshot", "GripWorker", "import_grip_sdk",
            "factory_calibration_path", "check_ready", "travel_mm_of"]
@@ -58,11 +58,10 @@ _MISMATCH_TOL = 0.15
 #: `openness→1` 时比值会报出主端**原始** `position_mm`（大于其真实 travel）⇒ 会误报。
 _MISMATCH_WINDOW = (0.15, 0.85)
 
-#: The litegrip-python release this worker is written against.
-#: ⚠ `teleop_start` / `teleop_status` / `load_calibration(path=...)` arrive over
-#: several releases; an older one imports fine and then fails at the first call.
-#: Raise this floor only when this worker starts using a newer API.
-MIN_SDK_VERSION = "1.2.1"
+#: The SDK ships inside this repository as a top-level `litegrip` package.
+#: It is a sibling of `liteteleop` both in a checkout and in an installed wheel;
+#: `litegrip/VENDORED.md` records the upstream commit.
+VENDORED_SDK_DIR = (Path(__file__).resolve().parent.parent / "litegrip").resolve()
 
 
 @dataclass
@@ -115,74 +114,44 @@ class GripNotReady(RuntimeError):
 
 
 class GripSdkUnavailable(RuntimeError):
-    """`litegrip-python` 没装、太旧，或者装的是另一个同名包。"""
-
-
-def _release_tuple(version: str) -> tuple:
-    """取 PEP 440 风格的 release 前缀：`"1.2.1+abc"` → `(1, 2, 1)`。"""
-    import re
-
-    m = re.match(r"\s*(\d+(?:\.\d+)*)", str(version or ""))
-    return tuple(int(p) for p in m.group(1).split(".")) if m else ()
+    """随包的 `litegrip` 导入失败，或者被另一份同名包抢先了。"""
 
 
 def import_grip_sdk() -> str:
-    """导入**已安装**的 `litegrip-python`，核对版本与 API，返回模块路径（供日志）。
+    """导入**随本包发布**的 `litegrip`，核对落点与 API，返回模块路径（供日志）。
 
-    ⚠⚠ **不要往 `sys.path` 里塞检出目录。** 旧设计把 SDK 钉死在
-    `/home/llx/litegrip-python/src`：那个路径只存在于一台机器上，换台机器
-    `--gcan` 就直接起不来；而且路径钉死同时把**标定文件**和**API 版本**一起
-    钉给了某次检出。改成依赖已安装的发行版（`pip install -U
-    'litegrip-python[zenoh]'`）后，同一份代码在哪台机器上都跑，版本由环境声明。
+    ⚠⚠ SDK 以 vendoring 的方式随包发布（`litegrip/`，来源见
+    `litegrip/VENDORED.md`）。**不要**再单独 `pip install litegrip-python`，
+    也不要往 `sys.path` 里塞检出目录：两者都会让同名包抢先，换台机器就没了，
+    而且会决定这次运行加载的是哪份标定与哪套 API。
 
-    导入后仍然核对，理由没变：同名不同源的 `litegrip`（例如 gitee 那份）也能
-    被 import 成功。两道判据 —— 版本下限，以及 `LiteGrip.teleop_start` 是否存在
-    （后者只在 `litegrip-python` 里有）。
+    导入后仍要核对落点：一个装在 `site-packages` 里、或由 `PYTHONPATH` 带进来的
+    同名 `litegrip` 也能 import 成功。落点不在 `VENDORED_SDK_DIR` 下就直接报错，
+    而不是静默用错实现。
     """
     try:
         import litegrip
     except ImportError as e:
         raise GripSdkUnavailable(
-            "没装 litegrip-python —— pip install -U 'litegrip-python[zenoh]'") from e
-    version = str(getattr(litegrip, "__version__", "") or "")
-    if version.endswith("+source"):
-        # `_detect_version()` 只在**没有发行版元数据**时给这个标记 ——
-        # 也就是说这是源码树被塞进了 `sys.path`，不是已安装的包。
+            f"随包的 litegrip 导入失败（{e}）—— 重新安装本包；"
+            "litegrip 不需要单独安装") from e
+    module = Path(litegrip.__file__).resolve()
+    if not module.is_relative_to(VENDORED_SDK_DIR):
         raise GripSdkUnavailable(
-            f"litegrip 来自源码树（{litegrip.__file__}），不是已安装的发行版 —— "
-            "pip install -e <checkout> 或 pip install -U 'litegrip-python[zenoh]'")
-    release = _release_tuple(version)
-    if not release:
-        raise GripSdkUnavailable(
-            f"litegrip-python 版本未知（{version!r}）—— 装一个发行版："
-            "pip install -U 'litegrip-python[zenoh]'")
-    if release < _release_tuple(MIN_SDK_VERSION):
-        if release[0] == 0:
-            # ⚠ 可编辑安装的 `pyproject.toml` 版本是占位符 `0.0.0`
-            #    （SDK 用 semantic-release，版本只存在于 git tag）⇒ 无法核对
-            #    版本下限。API 与出厂标定下面还会查，所以放行，但提交可复现的
-            #    部署应当装发行版。
-            log.warning("litegrip-python %s 没有发行版版本号（可编辑安装？）—— "
-                        "只核对 API 与出厂标定；部署请 "
-                        "pip install -U 'litegrip-python[zenoh]'", version)
-        else:
-            raise GripSdkUnavailable(
-                f"litegrip-python {version} 太旧：本仓需要 "
-                f">= {MIN_SDK_VERSION} —— pip install -U 'litegrip-python[zenoh]'")
+            f"litegrip 导入自 {module}，不是随包的 {VENDORED_SDK_DIR} —— "
+            "另一份同名包抢先了；不要 pip install litegrip-python")
     if not hasattr(getattr(litegrip, "LiteGrip", None), "teleop_start"):
         raise GripSdkUnavailable(
-            f"{litegrip.__file__} 不是本仓要的 litegrip-python："
-            "LiteGrip 没有 teleop_start")
-    factory = Path(litegrip.__file__).resolve().parent / "factory_calibration.json"
+            f"{module} 不是本仓随包的 litegrip-python：LiteGrip 没有 teleop_start")
+    factory = module.parent / "factory_calibration.json"
     if not factory.is_file():
         raise GripSdkUnavailable(
-            f"{litegrip.__file__} 没有随包出厂标定 {factory.name} —— "
-            "装的是旧版或别的同名包；pip install -U 'litegrip-python[zenoh]'")
-    return str(litegrip.__file__)
+            f"{module} 缺少随包出厂标定 {factory.name} —— 安装包不完整，重新安装")
+    return str(module)
 
 
 def factory_calibration_path() -> str:
-    """已安装 SDK **随包出厂标定**的路径（`factory_calibration.json`）。
+    """随包 SDK 的**出厂标定**路径（`litegrip/factory_calibration.json`）。
 
     ⚠⚠ 为什么显式给 `path=`，而不是只调 `load_calibration()`：
     无参形式会先读 `$LITEGRIP_CALIB` —— 那可能是这台机器上的另一份文件；
@@ -190,9 +159,7 @@ def factory_calibration_path() -> str:
     本仓的规矩是**一概用 SDK 里的出厂标定**：显式路径既不读环境变量，
     也不做 channel 过滤（SDK 只在 channel 不一致时告警，仍然加载）。
     """
-    import litegrip
-
-    return str(Path(litegrip.__file__).resolve().parent / "factory_calibration.json")
+    return str(Path(import_grip_sdk()).parent / "factory_calibration.json")
 
 
 # ────────────────────────────── 前置 / 换算 ──────────────────────────────

@@ -892,9 +892,9 @@ def test_grip_sdk_unavailable_does_not_abort_the_app(qapp, monkeypatch):
 
     w = MainWindow(Settings(gcan="can0"))
     try:
-        # ① 没装 / 版本太旧 ⇒ `import_grip_sdk` 抛 `GripSdkUnavailable`（RuntimeError）
+        # ① 随包 SDK 不可用 ⇒ `import_grip_sdk` 抛 `GripSdkUnavailable`（RuntimeError）
         monkeypatch.setattr(gwk, "import_grip_sdk", lambda *a, **k: (_ for _ in ()).throw(
-            gwk.GripSdkUnavailable("没装 litegrip-python")))
+            gwk.GripSdkUnavailable("随包的 litegrip 不可用")))
         assert w._ensure_grip_worker() is None, "SDK 缺失应当只是停用夹爪遥操"
         assert w.grip is None
 

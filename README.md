@@ -57,15 +57,14 @@ The gripper teleoperation fields — peer, port, grip ID, align, and torque limi
 Edit the port and start again, and the new port applies; the fields are not
 re-read while a session runs, so stop and start to change them.
 
-Install the gripper SDK as an installed release, not as a directory:
+The gripper SDK is vendored in `litegrip/` and ships with this package; there is
+no separate install step. Provenance and the re-vendor procedure are in
+`litegrip/VENDORED.md`. Do not `pip install litegrip-python` alongside it: a
+second distribution of the same top-level package can shadow the vendored copy.
 
-```bash
-python3 -m pip install -U 'litegrip-python[zenoh]'
-```
-
-The worker always loads the factory calibration shipped inside that release
-(`factory_calibration.json`). It does not read `$LITEGRIP_CALIB` and does not
-use a calibration measured on another machine.
+The worker always loads the factory calibration bundled with that SDK
+(`litegrip/factory_calibration.json`). It does not read `$LITEGRIP_CALIB` and
+does not use a calibration measured on another machine.
 
 Bring the CAN bus up first. The gripper needs its own bus (`can0` or `can1`), not
 the arm's CDC port:
@@ -139,8 +138,9 @@ condensed from are not published.
 
 - Do not let a zenoh session go without `close()`. The process hangs permanently at exit.
 - Do not resolve `litearm` by whichever import wins. Point it at the intended checkout and assert the result; a stale editable install silently satisfies `import litearm`.
-- Do not pin `litegrip-python` to a checkout path (`/home/llx/litegrip-python/src`). It exists on one machine only and pins which calibration loads.
-- Do not add a checkout to `sys.path` instead. Use `grip_worker.import_grip_sdk()`; it imports the installed release, checks the version floor and `LiteGrip.teleop_start`.
+- Do not `pip install litegrip-python` beside this application. The SDK is vendored in `litegrip/`; a same-named distribution or a `sys.path` entry can shadow it and decide which calibration loads.
+- Do not add a checkout to `sys.path` either. Use `grip_worker.import_grip_sdk()`; it imports the vendored copy and rejects a `litegrip` imported from outside `litegrip/`.
+- Do not edit files under `litegrip/`. Re-vendor instead (`litegrip/VENDORED.md`); the tree-hash test fails on a local edit.
 - Do not call argument-less `load_calibration()` here. It reads `$LITEGRIP_CALIB` and filters by `channel`; pass `grip_worker.factory_calibration_path()`.
 - Do not point `--peer` or `--gpeer` at a LAN address when both arms are on one computer. The default is loopback; a subnet-specific address silently produces a link that receives no frames.
 - Do not expect `LiteGrip.close()` to disconnect. It closes the jaws; `disconnect()` drops the link.

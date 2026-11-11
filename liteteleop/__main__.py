@@ -69,15 +69,15 @@ def main(argv=None) -> int:
     # ⚠⚠ 钉死必须排在**上面那 4 行赋值之后** —— 否则 `s.gcan` 还是空串，
     #    这段就永远不跑（本计划的初稿就写错成了「load_settings() 之后」）。
     if s.gcan:
-        # ⚠ 只依赖**已安装**的 litegrip-python，不往 sys.path 塞任何检出目录 ——
-        #   路径钉死换台机器就起不来（见 `import_grip_sdk` 的说明）。
+        # ⚠ 只认**随包 vendored** 的 litegrip（见 `litegrip/VENDORED.md`），
+        #   不往 sys.path 塞任何检出目录，也不要求单独安装。
         try:
             from .grip_worker import import_grip_sdk
             print(f"夹爪 SDK: {import_grip_sdk()}")
         except BaseException as e:                       # noqa: BLE001
             # 命令行语义：缺 SDK 就**明确报错退出**，不要甩一坨 traceback。
             print(f"⛔ 夹爪 SDK 不可用：{e}", file=sys.stderr)
-            print("   --gcan 需要 pip install -U 'litegrip-python[zenoh]'；"
+            print("   夹爪 SDK 随本包发布，重新安装 liteteleop；"
                   "去掉 --gcan 可只跑臂遥操", file=sys.stderr)
             return 2
     import sys as _sys
