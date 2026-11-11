@@ -57,12 +57,13 @@ The gripper teleoperation fields — peer, port, grip ID, align, and torque limi
 Edit the port and start again, and the new port applies; the fields are not
 re-read while a session runs, so stop and start to change them.
 
-The arm SDK is vendored in `litearm/` and ships with this package; there is no
-separate install step. Provenance and the re-vendor procedure are in
-`litearm/VENDORED.md`. Do not `pip install litearm-python` alongside it: a
-second distribution of the same top-level package can shadow the vendored copy.
-The worker imports the vendored copy through `arm_sdk.import_arm_sdk()`, which
-rejects a `litearm` imported from outside `litearm/`.
+The arm SDK is vendored in `liteteleop/_vendor/litearm/` and ships with this
+package; there is no separate install step. Provenance and the re-vendor
+procedure are in `liteteleop/_vendor/litearm/VENDORED.md`. The private path lets
+a `litearm-python` you installed for other work coexist: the worker imports the
+vendored copy through `arm_sdk.import_arm_sdk()`, which puts that directory first
+on `sys.path` and ignores any other `litearm` already loaded. To update the arm
+SDK, update the vendored copy; this application never uses the installed one.
 
 The gripper SDK is vendored in `litegrip/` and ships with this package; there is
 no separate install step. Provenance and the re-vendor procedure are in
@@ -95,7 +96,7 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 | [litearm-teleop-vr](https://github.com/nexform-tech/litearm-teleop-vr) | VR teleoperation |
 | [litearm-ros2](https://github.com/nexform-tech/litearm-ros2) | ROS 2 driver |
 | [litearm-ros1](https://github.com/nexform-tech/litearm-ros1) | ROS 1 driver |
-| [litearm-python](https://github.com/nexform-tech/litearm-python) | Python SDK; vendored in `litearm/` |
+| [litearm-python](https://github.com/nexform-tech/litearm-python) | Python SDK; this app uses a private vendored copy |
 | [litegrip-python](https://github.com/nexform-tech/litegrip-python) | Gripper SDK; owns the gripper teleop link and loop |
 | [litearm-docs](https://github.com/nexform-tech/litearm-docs) | Product documentation |
 
@@ -144,9 +145,10 @@ condensed from are not published.
 ### Dependencies and cleanup
 
 - Do not let a zenoh session go without `close()`. The process hangs permanently at exit.
-- Do not `pip install litearm-python` beside this application. The SDK is vendored in `litearm/`.
-- Use `arm_sdk.import_arm_sdk()`, which rejects a `litearm` imported from outside `litearm/`. A stale editable install otherwise silently satisfies `import litearm`.
-- Do not edit files under `litearm/`. Re-vendor instead (`litearm/VENDORED.md`); the tree-hash test fails on a local edit.
+- Do not import `litearm` before calling `arm_sdk.import_arm_sdk()`.
+- That helper puts the private `liteteleop/_vendor/litearm/` first on `sys.path` and replaces any other `litearm` already loaded, so a user's own `litearm-python` is never used.
+- Do not edit files under `liteteleop/_vendor/litearm/`. Re-vendor instead (`liteteleop/_vendor/litearm/VENDORED.md`); the tree-hash test fails on a local edit.
+- To update the arm SDK, update the vendored copy. Installing or upgrading `litearm-python` in the environment does not change what this application runs.
 - Do not `pip install litegrip-python` beside this application. The SDK is vendored in `litegrip/`; a same-named distribution or a `sys.path` entry can shadow it and decide which calibration loads.
 - Do not add a checkout to `sys.path` either. Use `grip_worker.import_grip_sdk()`; it imports the vendored copy and rejects a `litegrip` imported from outside `litegrip/`.
 - Do not edit files under `litegrip/`. Re-vendor instead (`litegrip/VENDORED.md`); the tree-hash test fails on a local edit.

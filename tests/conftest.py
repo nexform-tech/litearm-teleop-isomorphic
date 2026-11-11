@@ -1,11 +1,9 @@
-"""测试也核对 `litearm` 的落点 —— **与 `liteteleop.arm_sdk.import_arm_sdk()` 同一判据**。
+"""测试也走 `liteteleop.arm_sdk.import_arm_sdk()` —— 与真实启动同一条导入路径。
 
-⚠ 为什么必须有这个文件：`pytest` **不经过** `liteteleop.__main__`，所以入口处那道检查
-   对测试完全不生效。本机 `sys.path` 上可能挂着另一份 `litearm`（例如旧的 editable
-   安装）—— 两份子模块同名同构，导错了照样能跑，只有用到新接口时才炸。
-
-仓库根目录必须先于 site-packages 出现在 `sys.path`，这样 `import litearm` 才会落到
-随包的 `litearm/`；然后由 `import_arm_sdk()` 断言落点。
+⚠ 为什么必须有这个文件：`pytest` **不经过** `liteteleop.__main__`，入口处那次调用
+   对测试不生效。这里主动调一次：它把 `_vendor` 顶到 `sys.path` 最前，并清掉内存里
+   可能已经导入的另一份 `litearm`，所以测试加载的也是随包副本 ——
+   site-packages 里用户自己的 `litearm-python` 不会被用到。
 """
 from __future__ import annotations
 

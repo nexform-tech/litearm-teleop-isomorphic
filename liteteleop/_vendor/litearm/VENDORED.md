@@ -4,6 +4,8 @@ This note records where the `litearm` package in this directory came from and ho
 
 The arm worker drives both arms through this SDK. Shipping it in-tree is what makes `python -m liteteleop --cdc /dev/ttyACM0` work on a machine that has only this repository; users do not clone or install `litearm-python`.
 
+The copy lives under `liteteleop/_vendor/litearm/`, not at the top level, so a `litearm-python` that the user installed for another project can coexist in the same environment. `liteteleop/arm_sdk.py` puts this directory first on `sys.path` and drops any other `litearm` already imported in the process, so this application always loads the vendored copy.
+
 ## What is vendored, and from where
 
 | | |
@@ -12,7 +14,7 @@ The arm worker drives both arms through this SDK. Shipping it in-tree is what ma
 | Commit | `5f757686a11aebbbca808bfddf53aaff29a7976b` (tag `v1.3.0`, 2026-10-28) |
 | License | Apache-2.0 — `LICENSE` is that commit's file, copied verbatim |
 
-`litearm/` holds the complete `src/litearm` tree at that commit: the modules, `py.typed`, and the `__main__.py` entry used by upstream's console script. Upstream's `tests/`, `examples/`, `docs/`, `.github/`, `README*`, `pyproject.toml`, and `__pycache__/` are deliberately not copied. This repository does not register the `litearm-python` console script.
+`liteteleop/_vendor/litearm/` holds the complete `src/litearm` tree at that commit: the modules, `py.typed`, and the `__main__.py` entry used by upstream's console script. Upstream's `tests/`, `examples/`, `docs/`, `.github/`, `README*`, `pyproject.toml`, and `__pycache__/` are deliberately not copied. This repository does not register the `litearm-python` console script.
 
 The package needs `pyserial>=3.4` at runtime. `transport.py` imports it lazily, so `import litearm` alone works without it; opening a CDC port does not. The dependency is declared in this repository's `pyproject.toml`.
 
@@ -34,12 +36,12 @@ An edit here is a fork of upstream that nothing records, and the next re-vendor 
 48c736321566cfa30731026a65060c7986912568a228b4e9f13a9958522acbbb
 ```
 
-The recipe: take every file under `litearm/` except this note and `__pycache__`, ordered by its POSIX path relative to `litearm/`; feed each path, a newline, then the file's bytes into one SHA-256 stream; read the hex digest.
+The recipe: take every file under `liteteleop/_vendor/litearm/` except this note and `__pycache__`, ordered by its POSIX path relative to that directory; feed each path, a newline, then the file's bytes into one SHA-256 stream; read the hex digest.
 
 ```bash
 python3 - <<'PY'
 import hashlib, pathlib
-root = pathlib.Path("litearm")
+root = pathlib.Path("liteteleop/_vendor/litearm")
 h = hashlib.sha256()
 for p in sorted(root.rglob("*")):
     if not p.is_file() or "__pycache__" in p.parts or p.name == "VENDORED.md":
@@ -61,8 +63,8 @@ gh api "repos/nexform-tech/litearm-python/tarball/$COMMIT" > "$tmp/src.tar.gz"
 mkdir "$tmp/extracted"
 tar -xzf "$tmp/src.tar.gz" -C "$tmp/extracted" --strip-components=1
 rsync -a --delete --exclude '__pycache__' --exclude 'VENDORED.md' \
-    "$tmp/extracted/src/litearm/" litearm/
-cp "$tmp/extracted/LICENSE" litearm/LICENSE
+    "$tmp/extracted/src/litearm/" liteteleop/_vendor/litearm/
+cp "$tmp/extracted/LICENSE" liteteleop/_vendor/litearm/LICENSE
 ```
 
 Do not copy a checkout's working tree. A checkout sits on whatever branch it was last switched to, and that branch decides which modules and version string are copied. Ask the commit instead.

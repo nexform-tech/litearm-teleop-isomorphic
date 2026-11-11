@@ -35,8 +35,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-#: 只认随包的 `litearm/`（见 `litearm/VENDORED.md`）。本机另一份 editable
-#: 安装会被拒绝，而不是静默用错版本。
+#: 只认随包的 `liteteleop/_vendor/litearm/`（见 `liteteleop/_vendor/litearm/VENDORED.md`）。本机另一份 editable
+#: 安装不会被用到，即使它是用户的 editable 安装。
 from liteteleop.arm_sdk import import_arm_sdk                  # noqa: E402
 
 SDK_FILE = import_arm_sdk()

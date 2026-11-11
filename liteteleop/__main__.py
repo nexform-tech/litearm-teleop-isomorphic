@@ -1,8 +1,8 @@
 """入口：`python -m liteteleop`。
 
-臂 SDK 与夹爪 SDK 都随包发布（`litearm/`、`litegrip/`），不要求用户克隆或单独安装。
-启动时核对 `litearm` 的落点：另一份同名包（例如旧的 editable 安装）抢先时直接退出，
-而不是连上臂之后才发现缺接口。
+臂 SDK 与夹爪 SDK 都随包发布（`liteteleop/_vendor/litearm/`、`litegrip/`），不要求
+用户克隆或单独安装。启动时把臂 SDK 的私有目录顶到 `sys.path` 最前：即使机器上另装了
+`litearm-python`（可能是用户自己的项目在用），本应用也总是加载随包副本。
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def main(argv=None) -> int:
         print(f"SDK: {import_arm_sdk()}")
     except BaseException as e:                           # noqa: BLE001
         # 命令行语义：SDK 不可用就**明确报错退出**，不要甩一坨 traceback。
-        print(f"⛔ 臂 SDK 不可用：{e}", file=sys.stderr)
+        print(f"⛔ 随包臂 SDK 不可用：{e}", file=sys.stderr)
         print("   臂 SDK 随本包发布，重新安装 liteteleop", file=sys.stderr)
         return 2
     # ⚠ 必须配 handler：界面里那份 `_log` 走 `log.info`，而**没配 handler 就什么都不落盘**

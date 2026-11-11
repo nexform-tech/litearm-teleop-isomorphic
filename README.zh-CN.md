@@ -45,10 +45,12 @@ python -m liteteleop --role slave  --cdc /dev/ttyACM1 --gcan can1
 那一刻**读的，不是建 worker 时读的。改完端口再启动一次，新端口即生效；会话跑起来之后
 这些字段不再重读，要改就停下来重开。
 
-臂 SDK 已经 **vendored 在 `litearm/`，随本包发布**，不需要单独安装；来源与
-re-vendor 步骤见 `litearm/VENDORED.md`。不要另外 `pip install litearm-python`：
-同一个顶层包名的第二份发行版可能把随包副本盖掉。worker 经
-`arm_sdk.import_arm_sdk()` 导入随包副本，并拒绝来自 `litearm/` 之外的 `litearm`。
+臂 SDK 已经 **vendored 在 `liteteleop/_vendor/litearm/`，随本包发布**，不需要单独
+安装；来源与 re-vendor 步骤见 `liteteleop/_vendor/litearm/VENDORED.md`。私有路径
+让用户为其他项目装的 `litearm-python` 可以共存：worker 经
+`arm_sdk.import_arm_sdk()` 导入随包副本，它会把该目录顶到 `sys.path` 最前，
+并忽略已经加载的别的 `litearm`。要升级臂 SDK 就更新这份随包副本；本应用不会用
+机器上装的那份。
 
 夹爪 SDK 已经 **vendored 在 `litegrip/`，随本包发布**，不需要单独安装；来源与
 re-vendor 步骤见 `litegrip/VENDORED.md`。不要另外 `pip install litegrip-python`：
@@ -78,7 +80,7 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 | [litearm-teleop-vr](https://github.com/nexform-tech/litearm-teleop-vr) | VR 遥操作 |
 | [litearm-ros2](https://github.com/nexform-tech/litearm-ros2) | ROS 2 驱动 |
 | [litearm-ros1](https://github.com/nexform-tech/litearm-ros1) | ROS 1 驱动 |
-| [litearm-python](https://github.com/nexform-tech/litearm-python) | Python SDK；已 vendored 在 `litearm/` |
+| [litearm-python](https://github.com/nexform-tech/litearm-python) | Python SDK；本应用使用私有 vendored 副本 |
 | [litegrip-python](https://github.com/nexform-tech/litegrip-python) | 夹爪 SDK；夹爪遥操的链路与环归它 |
 | [litearm-docs](https://github.com/nexform-tech/litearm-docs) | 产品文档 |
 
@@ -123,9 +125,10 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 ### 依赖与收尾
 
 - **不要**让 zenoh session 不做 `close()`，进程退出会永久挂死。
-- **不要**在本应用旁边再 `pip install litearm-python`。SDK 已经 vendored 在 `litearm/`。
-- 应当走 `arm_sdk.import_arm_sdk()`，它会拒绝来自 `litearm/` 之外的 `litearm`。否则一个陈旧的 editable 安装会静默满足 `import litearm`。
-- **不要**直接改 `litearm/` 下的文件。要改就 re-vendor（`litearm/VENDORED.md`）；树哈希测试会在就地修改时变红。
+- **不要**在本应用里先 `import litearm` 再走 `arm_sdk.import_arm_sdk()`。
+- 该助手会把私有目录 `liteteleop/_vendor/litearm/` 顶到 `sys.path` 最前，并替换进程里已加载的别的 `litearm`；用户自己的 `litearm-python` 不会被用到。
+- **不要**直接改 `liteteleop/_vendor/litearm/` 下的文件。要改就 re-vendor（`liteteleop/_vendor/litearm/VENDORED.md`）；树哈希测试会在就地修改时变红。
+- 要升级臂 SDK 就更新随包副本。在环境里安装或升级 `litearm-python` 不会改变本应用运行的版本。
 - **不要**在本应用旁边再 `pip install litegrip-python`。SDK 已经 vendored 在 `litegrip/`；同名发行版或 `sys.path` 里的一项都可能把随包副本盖掉，决定这次加载的是哪份标定。
 - **不要**用往 `sys.path` 塞目录来代替随包副本。应当走 `grip_worker.import_grip_sdk()`：它导入随包副本，并拒绝来自 `litegrip/` 之外的 `litegrip`。
 - **不要**直接改 `litegrip/` 下的文件。要改就 re-vendor（`litegrip/VENDORED.md`）；树哈希测试会在就地修改时变红。
