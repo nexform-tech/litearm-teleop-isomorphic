@@ -15,7 +15,13 @@ from typing import Any, Dict
 
 log = logging.getLogger("liteteleop.settings")
 
-__all__ = ["Settings", "settings_path", "load_settings", "save_settings"]
+__all__ = ["DEFAULT_PEER", "Settings", "settings_path", "load_settings",
+           "save_settings"]
+
+#: 对端地址的默认值。主从两臂、夹爪都接在**同一台电脑**上 ⇒ 回环。
+#: ⚠ 只有两个进程跑在不同机器上时才需要填局域网地址；把一个固定网段的
+#:   `192.168.x.y` 写进默认值，换一个网段就整条链路收不到帧（zenoh 严格点对点）。
+DEFAULT_PEER = "127.0.0.1"
 
 
 def settings_path() -> Path:
@@ -26,14 +32,14 @@ def settings_path() -> Path:
 @dataclass
 class Settings:
     role: str = "master"                 # master | slave
-    peer: str = "127.0.0.1"              # 从臂填：主臂的 IP
+    peer: str = DEFAULT_PEER             # 从臂填：主臂的 IP（同一台电脑 ⇒ 回环）
     jport: int = 17447                   # zenoh 监听/连接端口
     arm_id: str = "armA"                 # 决定 topic：litearm/v4/{arm_id}/teleop
     cdc_port: str = ""                   # 空 = 按 VID:PID 自动找
     confirmed: bool = False              # ☑ 安全确认（**不持久化**到 True 才是默认安全）
     # ── 夹爪遥操（与臂侧**完全独立**，spec §2 铁律第 3 条：不读臂的字段）──
     gcan: str = ""                       # 夹爪 CAN 通道；空 = 不启用夹爪遥操（默认关）
-    gpeer: str = "127.0.0.1"             # 从端填：主端 IP（**独立字段**）
+    gpeer: str = DEFAULT_PEER            # 从端填：主端 IP（**独立字段**，回环）
     gport: int = 17448                   # 夹爪 zenoh 端口（独立 session ⇒ 必须独立端口）
     grip_id: str = "gripA"               # 决定夹爪 topic
     # 从端夹爪的力矩上限（Nm）：超过就卸力，护住打印件。0 = 关闭该保护。

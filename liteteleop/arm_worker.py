@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 from . import link, servo, wire
+from .settings import DEFAULT_PEER
 from .wall import JointLimitWall
 from .safety import clamp_to_limits, read_safe_limits
 from .wire import N_JOINTS
@@ -99,7 +100,7 @@ class TeleopParams:
         return self.key
 
     def peer_host(self) -> str:
-        return (self.peer or "").strip() or "127.0.0.1"
+        return (self.peer or "").strip() or DEFAULT_PEER
 
 
 class StateHookMissing(RuntimeError):
@@ -756,7 +757,7 @@ class ArmWorker:
     def _peer_host(self) -> str:
         # 保留给测试/调试：真源已挪到 `TeleopParams.peer_host()`
         p = self._params
-        return p.peer_host() if p is not None else "127.0.0.1"
+        return p.peer_host() if p is not None else DEFAULT_PEER
 
     def _on_wire(self, payload: bytes) -> None:
         """**在 zenoh 线程上**被调用 ⇒ 只写槽。"""
