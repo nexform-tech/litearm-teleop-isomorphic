@@ -5,7 +5,9 @@ description = "LiteArm 同构遥操上位机（主臂零重力拖动 → zenoh �
 requires-python = ">=3.10"
 # ⚠ PyPI 上的发行名是 `eclipse-zenoh`（import 名仍是 `zenoh`）。写 `zenoh` 装不上：
 #   `ERROR: No matching distribution found for zenoh` —— CI 就这么挂在装依赖上过。
-dependencies = ["eclipse-zenoh>=1.6", "PyQt5>=5.15"]
+# pyserial is the arm SDK's only runtime dependency; its `transport.py` imports
+# it lazily, so importing the package works without it but opening a CDC port does not.
+dependencies = ["eclipse-zenoh>=1.6", "PyQt5>=5.15", "pyserial>=3.4"]
 
 [project.scripts]
 liteteleop = "liteteleop.__main__:main"
@@ -13,17 +15,23 @@ liteteleop = "liteteleop.__main__:main"
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
-# The gripper SDK is vendored in `litegrip/`, not resolved as a dependency.
-# Source and provenance: `litegrip/VENDORED.md`. Do not add litegrip-python here:
-# a second distribution of the same top-level package can shadow the vendored copy.
+# Both SDKs are vendored, not resolved as dependencies. The arm SDK lives under
+# `liteteleop/_vendor/litearm/` so it does not occupy the top-level `litearm`
+# install slot: a user's own litearm-python can coexist, and `arm_sdk.py` imports
+# the private copy explicitly. The gripper SDK is top-level `litegrip/`; do not
+# add litegrip-python here, because a second distribution can shadow it.
+# Source and provenance: `liteteleop/_vendor/litearm/VENDORED.md` and
+# `litegrip/VENDORED.md`.
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["liteteleop*", "litegrip*"]
 
 [tool.setuptools.package-data]
-# The SDK resolves its calibration files through `dirname(__file__)`, so a wheel
-# without these has the code that reads them and not the files.
+# The gripper SDK resolves its calibration files through `dirname(__file__)`, so a
+# wheel without these has the code that reads them and not the files.
 litegrip = ["py.typed", "*.json", "LICENSE", "VENDORED.md"]
+# The arm SDK has no data files; these ship for type checkers and provenance.
+"liteteleop._vendor.litearm" = ["py.typed", "LICENSE", "VENDORED.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

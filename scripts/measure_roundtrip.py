@@ -35,12 +35,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-#: ⚠⚠ SDK 的**唯一入口**（用户裁决）。本机 `sys.path` 上还挂着另一份 `litearm`
-#: （`/home/llx/gitee/litearm-python/src`）—— 它会被**静默** import 到。
-#: 判据不是"我设过 PYTHONPATH"，而是**导入后打印出来核**。
-SDK_SRC = "/home/llx/litearm-python/src"
-sys.path.insert(0, SDK_SRC)
+#: 只认随包的 `liteteleop/_vendor/litearm/`（见 `liteteleop/_vendor/litearm/VENDORED.md`）。本机另一份 editable
+#: 安装不会被用到，即使它是用户的 editable 安装。
+from liteteleop.arm_sdk import import_arm_sdk                  # noqa: E402
 
+SDK_FILE = import_arm_sdk()
 import litearm as pa                                            # noqa: E402
 
 
@@ -66,10 +65,7 @@ def main() -> int:
     ap.add_argument("-n", type=int, default=200, help="每项采样次数")
     a = ap.parse_args()
 
-    print(f"SDK: {pa.__file__}")
-    if not pa.__file__.startswith(SDK_SRC):
-        print(f"⛔ 导入到的不是 {SDK_SRC} —— 环境里有另一份 litearm 抢先了。")
-        return 5
+    print(f"SDK: {SDK_FILE}")
 
     arm = pa.Arm(port=a.port, move_timeout=3.0)
     try:
