@@ -101,6 +101,9 @@ class FakeGrip:
 
         self.connected = False
         self.loaded = False
+        #: 最后一次 `load_calibration(path=...)` 的实参（`None` = 无参调用）。
+        #: 用例靠它断言「一律加载 SDK 出厂标定」。
+        self.loaded_path: Optional[str] = None
         self.enable_calls = 0
         self.zero_gravity_exits = 0
         self.polls = 0
@@ -140,8 +143,9 @@ class FakeGrip:
         self.connected = True
         return True
 
-    def load_calibration(self, *a, **k):
+    def load_calibration(self, path=None, *a, **k):
         self.loaded = True
+        self.loaded_path = path
         self.config.calibrated = self._calibrated
         return True
 

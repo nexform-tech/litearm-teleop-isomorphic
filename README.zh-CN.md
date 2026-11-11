@@ -8,7 +8,7 @@
 ## 这是什么
 
 LiteArm 机械臂系列的同构遥操作。人手在零重力模式下拖动主臂，从臂经 zenoh 点对点链路跟随。
-夹爪也可以在同一对机器上遥操，走自己的 CAN 总线和自己的链路。
+夹爪也可以在**同一台电脑**上遥操，走自己的 CAN 总线和自己的链路。
 
 ## 状态
 
@@ -20,18 +20,21 @@ LiteArm 机械臂系列的同构遥操作。人手在零重力模式下拖动主
 
 ## 用法
 
-跑两个进程，一台机器一个。臂链路与夹爪链路相互独立：各自的总线、各自的 zenoh 会话、
-各自的端口（`--jport`，臂默认 17447；`--gport`，夹爪默认 17448）、各自的话题、
-界面上各自的开关。
+跑两个进程，一个臂一个。两条臂通常都接在**同一台电脑**上，所以两个进程都在这台机器上跑，
+对端地址默认就是本机回环（`127.0.0.1`）。臂链路与夹爪链路相互独立：各自的总线、
+各自的 zenoh 会话、各自的端口（`--jport`，臂默认 17447；`--gport`，夹爪默认 17448）、
+各自的话题、界面上各自的开关。
 
 ```bash
-# 主臂侧：臂以零重力模式被人手拖动；夹爪同理
+# 主臂进程：臂以零重力模式被人手拖动；夹爪同理
 python -m liteteleop --role master --cdc /dev/ttyACM0 --gcan can0
 
-# 从臂侧：订阅并跟随
-python -m liteteleop --role slave  --cdc /dev/ttyACM1 --peer 192.168.31.10 \
-                     --gcan can1 --gpeer 192.168.31.10
+# 从臂进程：订阅并跟随
+python -m liteteleop --role slave  --cdc /dev/ttyACM1 --gcan can1
 ```
+
+只有两个进程分跑在**不同机器**上时才需要传 `--peer` / `--gpeer`。默认回环，是因为把
+某个固定网段的地址写死之后，一换网段链路就收不到帧。
 
 夹爪链路用话题 `litearm/v4/{grip_id}/gripper_teleop` 和 32 字节大端帧
 `(openness, position_mm, force_n, timestamp)`，真正驱动从端的是 `openness ∈ [0,1]`。
@@ -41,6 +44,13 @@ python -m liteteleop --role slave  --cdc /dev/ttyACM1 --peer 192.168.31.10 \
 夹爪遥操的各个字段 —— 对端、端口、夹爪 ID、align、力矩上限 —— 是在**点「启动夹爪遥操」
 那一刻**读的，不是建 worker 时读的。改完端口再启动一次，新端口即生效；会话跑起来之后
 这些字段不再重读，要改就停下来重开。
+
+夹爪 SDK 已经 **vendored 在 `litegrip/`，随本包发布**，不需要单独安装；来源与
+re-vendor 步骤见 `litegrip/VENDORED.md`。不要另外 `pip install litegrip-python`：
+同一个顶层包名的第二份发行版可能把随包副本盖掉。
+
+worker 一概加载随包 SDK 的**出厂标定**（`litegrip/factory_calibration.json`），不读
+`$LITEGRIP_CALIB`，也不用别的机器上量出来的标定。
 
 先把 CAN 总线拉起来。夹爪需要自己的总线（`can0` 或 `can1`），不是臂的 CDC 口：
 
@@ -109,8 +119,11 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 
 - **不要**让 zenoh session 不做 `close()`，进程退出会永久挂死。
 - **不要**让 `litearm` 由"谁先被 import 谁赢"。要显式指到目标检出位置并断言结果，因为一个陈旧的 editable 安装会静默满足 `import litearm`。
-- **不要**在有同名两份检出的机器上裸 `import litegrip`。两者都能 import 成功，而赢的是错的那份。
-- 应当走 `grip_worker.pin_grip_sdk()`，它会断言并打日志。只做一个 `sys.path.insert` 挡不住将来改用 `meta_path.insert` 的注册方式。
+- **不要**在本应用旁边再 `pip install litegrip-python`。SDK 已经 vendored 在 `litegrip/`；同名发行版或 `sys.path` 里的一项都可能把随包副本盖掉，决定这次加载的是哪份标定。
+- **不要**用往 `sys.path` 塞目录来代替随包副本。应当走 `grip_worker.import_grip_sdk()`：它导入随包副本，并拒绝来自 `litegrip/` 之外的 `litegrip`。
+- **不要**直接改 `litegrip/` 下的文件。要改就 re-vendor（`litegrip/VENDORED.md`）；树哈希测试会在就地修改时变红。
+- **不要**在本应用里用无参 `load_calibration()` 加载夹爪标定。无参形式会读 `$LITEGRIP_CALIB` 并按 `channel` 过滤；要显式传随包 SDK 的 `factory_calibration.json`（`grip_worker.factory_calibration_path()`）。
+- **不要**在两臂接同一台电脑时把 `--peer` / `--gpeer` 填成局域网地址。默认是回环；写死某个网段的地址只会得到一条收不到帧的链路。
 - **不要**以为 `LiteGrip.close()` 是断开。它是合爪；断链是 `disconnect()`。
 - **不要**在想让夹爪继续夹住时，让 `disable_on_disconnect` 留在默认值。它默认 `True`，所以 `disconnect()` 会先失能，把正夹着的东西松掉。要显式传 `False`。
 - **不要**把"拒掉未标定夹爪"这件事交给 SDK。`teleop_start` 确实会查，但那是在调用方**已经使能**之后。要先查 —— `grip_worker.check_ready()` —— 未标定的夹爪绝不上电。

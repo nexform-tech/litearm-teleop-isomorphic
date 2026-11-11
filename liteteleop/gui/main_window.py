@@ -282,20 +282,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("⚠ 未填夹爪 CAN 通道 —— 夹爪遥操未启用")
             return None
         self._save_grip()
-        # ⚠⚠ 钉死必须排在 `GripWorker.start()` **之前** —— 那条线程里的工厂会
-        #    `import litegrip`，本机那份 editable 的 gitee 克隆会静默抢先（实测）。
+        # ⚠ 只认**随包 vendored** 的 litegrip；不往 sys.path 塞检出目录。
+        #    核对必须排在 `GripWorker.start()` **之前**，这样缺 SDK / 被同名包抢先
+        #    会在主线程里报出来，而不是在 worker 线程里变成"点了没反应"。
         try:
-            from ..grip_worker import pin_grip_sdk
-            self._log(f"夹爪 SDK: {pin_grip_sdk()}")
+            from ..grip_worker import import_grip_sdk
+            self._log(f"夹爪 SDK: {import_grip_sdk()}")
         except BaseException as e:                   # noqa: BLE001
-            # ⚠⚠ 必须兜住 **BaseException**，不能只兜 `SystemExit`：
-            #    · `assert_sdk_pinned` 抛的是 `SystemExit`（**不是** `Exception` 的子类）；
-            #    · 一台**没装 litegrip** 的机器上 `import litegrip` 会抛
-            #      `ModuleNotFoundError`；
-            #    · 而 PyQt5 对**逃出槽的异常会直接 abort 进程**（本机实测：
-            #      `ModuleNotFoundError` 逃出槽 ⇒ exit 134、core dumped）。
-            #    ⇒ 只兜 SystemExit 的结果是：点一下「启动夹爪遥操」把**整个应用**
-            #      带走，连正在跑的臂遥操一起（没有收尾 movej）——
+            # ⚠⚠ 必须兜住 **BaseException**，不能只兜 `Exception`：
+            #    · PyQt5 对**逃出槽的异常会直接 abort 进程**（本机实测：
+            #      `ModuleNotFoundError` 逃出槽 ⇒ exit 134、core dumped）；
+            #    · `import_grip_sdk` 自己抛的是 `GripSdkUnavailable`（`RuntimeError`），
+            #      但 `import` 阶段仍可能出现别的 `ImportError`/`BaseException`。
+            #    ⇒ 兜不住的结果是：点一下「启动夹爪遥操」把**整个应用**带走，
+            #      连正在跑的臂遥操一起（没有收尾 movej）——
             #      直接违反 spec §2「与臂完全解耦」的故障隔离承诺。
             self._log(f"⛔ 夹爪 SDK 不可用：{e}")
             self._log("   （夹爪遥操已停用；臂遥操不受影响）")

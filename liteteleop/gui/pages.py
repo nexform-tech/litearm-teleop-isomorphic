@@ -42,7 +42,7 @@ from .. import servo
 from ..arm_worker import (ROLE_MASTER, ROLE_SLAVE, PUB_HZ, SLAVE_HZ, WATCHDOG_MS,
                           Snapshot)
 from ..ports import list_arms
-from ..settings import Settings
+from ..settings import DEFAULT_PEER, Settings
 from ..wire import N_JOINTS
 from .cards import (Badge, Card, MetricTile, ScrollColumn, SegmentedControl,
                     StopButton, field_row, hint, separator)
@@ -697,7 +697,7 @@ class TeleopPage(QtWidgets.QWidget):
 
     def _emit_changed(self) -> None:
         self.gs.role = self.role()
-        self.gs.peer = self.ed_peer.text().strip() or "127.0.0.1"
+        self.gs.peer = self.ed_peer.text().strip() or DEFAULT_PEER
         self.gs.jport = int(self.sp_port.value())
         self.gs.arm_id = self.ed_arm_id.text().strip() or "armA"
         self.gs.cdc_port = self.cb_port.currentData() or ""
@@ -711,7 +711,7 @@ class TeleopPage(QtWidgets.QWidget):
         """
         return {
             "gcan": self.ed_gcan.text().strip(),
-            "gpeer": self.ed_gpeer.text().strip() or "127.0.0.1",
+            "gpeer": self.ed_gpeer.text().strip() or DEFAULT_PEER,
             "gport": int(self.sp_gport.value()),
             "grip_id": self.ed_grip_id.text().strip() or "gripA",
             "align": bool(self.chk_align.isChecked()),

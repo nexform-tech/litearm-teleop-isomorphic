@@ -13,6 +13,18 @@ liteteleop = "liteteleop.__main__:main"
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+# The gripper SDK is vendored in `litegrip/`, not resolved as a dependency.
+# Source and provenance: `litegrip/VENDORED.md`. Do not add litegrip-python here:
+# a second distribution of the same top-level package can shadow the vendored copy.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["liteteleop*", "litegrip*"]
+
+[tool.setuptools.package-data]
+# The SDK resolves its calibration files through `dirname(__file__)`, so a wheel
+# without these has the code that reads them and not the files.
+litegrip = ["py.typed", "*.json", "LICENSE", "VENDORED.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["slow: 慢测（起子进程 / 数十秒），用 -m \"not slow\" 跳过"]

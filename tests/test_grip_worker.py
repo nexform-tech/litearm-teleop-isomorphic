@@ -5,12 +5,14 @@ SDK**（`LiteGrip.teleop_start/teleop_stop/teleop_status`）⇒ 本文件**只**
 它把 SDK 的状态字典翻成界面要的 `GripSnapshot`。那些语义的用例在
 `litegrip-python/tests/test_teleop.py`（本仓不再重复，也不再维护第二份实现）。
 
-⚠⚠ CI **不装 litegrip**（`.github/workflows/ci.yml` 只装 `pytest` + `zenoh`）
-⇒ 这里一律走 `FakeGrip` 替身，绝不 `import litegrip`。
+⚠⚠ 夹爪硬件一律走 `FakeGrip` 替身。只有 SDK 落点/API 判据会 `import litegrip`；
+它 vendored 在本仓（`litegrip/`），CI 不需要额外安装。
 """
+import json
 import sys
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -184,37 +186,111 @@ def test_teardown_stops_session_and_disconnects():
     assert w.snapshot().teleop_active is False
 
 
-# ════════════════════ §9.4 SDK 钉死断言 ════════════════════
+# ════════════════════ SDK：随包 vendored + 出厂标定 ════════════════════
 
-def test_sdk_pin_accepts_the_target_and_rejects_the_other_copy():
-    """⚠ 断言必须有 —— 只 `sys.path.insert` 压不住未来改成 insert 式注册的
-    editable MetaPathFinder，那时 import 会**静默**落到 gitee 那份。
+def _fake_sdk(root: Path, *, teleop=True, factory=True):
+    """造一个最小的 `litegrip` 模块（落在 root/litegrip），喂落点判据。"""
+    pkg = root / "litegrip"
+    pkg.mkdir(parents=True)
+    init = pkg / "__init__.py"
+    init.write_text("", encoding="utf-8")
+    if factory:
+        (pkg / "factory_calibration.json").write_text("{}", encoding="utf-8")
 
-    本用例不需要真的装 litegrip（CI 上也没有）⇒ 直接喂路径判据。
+    mod = types.ModuleType("litegrip")
+    mod.__file__ = str(init)
+
+    class LiteGrip:
+        pass
+
+    if teleop:
+        LiteGrip.teleop_start = lambda self, *a, **k: None
+    mod.LiteGrip = LiteGrip
+    return mod
+
+
+def test_import_grip_sdk_accepts_the_vendored_copy():
+    """随包的 `litegrip/` 就在仓库里 ⇒ 返回它的路径（启动日志打印它）。"""
+    module = Path(gw.import_grip_sdk()).resolve()
+    assert module.is_relative_to(gw.VENDORED_SDK_DIR)
+    assert module.name == "__init__.py"
+
+
+def test_import_grip_sdk_rejects_a_shadowing_package(monkeypatch, tmp_path):
+    """同名包从 `sys.path` 抢先时**报错**，而不是静默用错实现。
+
+    判别力：去掉落点核对时本用例会通过而红。
     """
-    ok = "/home/llx/litegrip-python/src/litegrip/__init__.py"
-    bad = "/home/llx/moduangongju/lite-grip/litegrip/__init__.py"
-    gw.assert_sdk_pinned(ok)                     # 不抛
-    with pytest.raises(SystemExit, match="另一份抢先了"):
-        gw.assert_sdk_pinned(bad)
+    monkeypatch.setitem(sys.modules, "litegrip", _fake_sdk(tmp_path))
+    with pytest.raises(gw.GripSdkUnavailable, match="不是随包"):
+        gw.import_grip_sdk()
 
 
-def test_sdk_src_is_overridable_by_env(monkeypatch):
-    """⚠ `LITEGRIP_SRC` 覆盖 SDK **位置** —— 与 `__main__.py` 的 `LITEARM_SRC` 同款。
+def test_import_grip_sdk_rejects_an_incomplete_vendored_copy(
+        monkeypatch, tmp_path):
+    """落点对，但缺 `LiteGrip.teleop_start` ⇒ 不是本仓用的那份 SDK。"""
+    monkeypatch.setattr(gw, "VENDORED_SDK_DIR", tmp_path.resolve())
+    monkeypatch.setitem(sys.modules, "litegrip",
+                        _fake_sdk(tmp_path, teleop=False))
+    with pytest.raises(gw.GripSdkUnavailable, match="teleop_start"):
+        gw.import_grip_sdk()
 
-    硬编码的是 `/home/llx/litegrip-python/src`，别的机器上那份不存在，而
-    `assert_sdk_pinned` 又要求落点必须与它相符 ⇒ 不改代码就根本起不来。
-    覆盖的只是位置，判据一字未变。
 
-    判别力：把 `GRIP_SDK_SRC` 改回裸字符串常量时本用例必红。
+def test_import_grip_sdk_rejects_a_vendored_copy_without_calibration(
+        monkeypatch, tmp_path):
+    """落点对、API 在，但缺 `factory_calibration.json` ⇒ 安装包不完整。"""
+    monkeypatch.setattr(gw, "VENDORED_SDK_DIR", tmp_path.resolve())
+    monkeypatch.setitem(sys.modules, "litegrip",
+                        _fake_sdk(tmp_path, factory=False))
+    with pytest.raises(gw.GripSdkUnavailable, match="factory_calibration"):
+        gw.import_grip_sdk()
+
+
+def test_import_grip_sdk_reports_a_missing_package(monkeypatch):
+    """随包副本缺失时给出可执行的修法，而不是把 `ModuleNotFoundError` 甩给用户。"""
+    monkeypatch.setitem(sys.modules, "litegrip", None)
+    with pytest.raises(gw.GripSdkUnavailable, match="重新安装本包"):
+        gw.import_grip_sdk()
+
+
+def test_factory_calibration_path_is_the_vendored_factory_file():
+    """出厂标定 = 随包 SDK 目录里的 `factory_calibration.json`，且已标定。"""
+    path = Path(gw.factory_calibration_path()).resolve()
+    assert path == (gw.VENDORED_SDK_DIR / "factory_calibration.json").resolve()
+    assert json.loads(path.read_text(encoding="utf-8"))["calibrated"] is True
+
+
+def test_worker_loads_the_sdk_factory_calibration(monkeypatch):
+    """⚠⚠ 生产路径（没注入工厂）必须显式加载 SDK 随包的出厂标定。
+
+    判别力：把 `_run` 里的 `load_calibration(path=...)` 改回无参调用时，
+    `FakeGrip.loaded_path` 会是 `None`，本用例红。
     """
-    import importlib
-    monkeypatch.setenv("LITEGRIP_SRC", "/opt/litegrip/src")
+    g = FakeGrip()
+    monkeypatch.setattr(gw, "_default_gripper_factory", lambda _c: g)
+    monkeypatch.setattr(gw, "factory_calibration_path",
+                        lambda: "/tmp/vendored/factory_calibration.json")
+    w = GripWorker("can1", poll_s=0.02)
     try:
-        assert importlib.reload(gw).GRIP_SDK_SRC == "/opt/litegrip/src"
+        w.start()
+        time.sleep(0.2)
+        assert g.loaded_path == "/tmp/vendored/factory_calibration.json"
+        assert g.loaded is True
     finally:
-        monkeypatch.delenv("LITEGRIP_SRC", raising=False)
-        importlib.reload(gw)
+        w.stop(timeout=5.0)
+
+
+def test_injected_calibration_path_is_passed_through():
+    """注入替身时可用 `calibration_path=` 断言加载的是哪一份。"""
+    g = FakeGrip()
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g,
+                   calibration_path="/tmp/test_calibration.json")
+    try:
+        w.start()
+        time.sleep(0.2)
+        assert g.loaded_path == "/tmp/test_calibration.json"
+    finally:
+        w.stop(timeout=5.0)
 
 
 # ════════════════════ §8 rule 10：失败必须可见（不能静默死掉）════════════════════

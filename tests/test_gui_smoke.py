@@ -880,27 +880,26 @@ def test_grip_sdk_unavailable_does_not_abort_the_app(qapp, monkeypatch):
     """⚠⚠ SDK 不可用时**绝不能让异常逃出 Qt 槽** —— PyQt5 会直接 abort 进程。
 
     本机实测：`ModuleNotFoundError` 逃出槽 ⇒ **exit 134、core dumped**。
-    只在 `_ensure_grip_worker` 里兜 `SystemExit` 是不够的，因为
-    ① `assert_sdk_pinned` 抛的 `SystemExit` **不是** `Exception` 的子类；
-    ② 一台**没装 litegrip** 的机器上 `import litegrip` 抛 `ModuleNotFoundError`。
+    只在 `_ensure_grip_worker` 里兜 `Exception` 也不够，因为 import 阶段可能抛出
+    非 `Exception` 的 `BaseException`（例如 `SystemExit`）。
     后果是点一下夹爪按钮把**整个应用**带走，连正在跑的臂遥操一起
     （没有收尾 movej）—— 直接违反 spec §2 的故障隔离承诺。
 
-    判别力：把 `except BaseException` 改回 `except SystemExit` 时，
-    第一个 `assert` 会因为异常逃出来而报错。
+    判别力：把 `except BaseException` 改回 `except Exception` 时，
+    第二个 `assert` 会因为 `SystemExit` 逃出来而报错。
     """
     import liteteleop.grip_worker as gwk
 
     w = MainWindow(Settings(gcan="can0"))
     try:
-        # ① 没装 SDK
-        monkeypatch.setattr(gwk, "pin_grip_sdk", lambda *a, **k: (_ for _ in ()).throw(
-            ModuleNotFoundError("import of litegrip halted")))
+        # ① 随包 SDK 不可用 ⇒ `import_grip_sdk` 抛 `GripSdkUnavailable`（RuntimeError）
+        monkeypatch.setattr(gwk, "import_grip_sdk", lambda *a, **k: (_ for _ in ()).throw(
+            gwk.GripSdkUnavailable("随包的 litegrip 不可用")))
         assert w._ensure_grip_worker() is None, "SDK 缺失应当只是停用夹爪遥操"
         assert w.grip is None
 
-        # ② 走错仓（断言抛 SystemExit）
-        monkeypatch.setattr(gwk, "pin_grip_sdk", lambda *a, **k: (_ for _ in ()).throw(
+        # ② import 阶段抛出非 Exception 的 SystemExit，也必须兜住
+        monkeypatch.setattr(gwk, "import_grip_sdk", lambda *a, **k: (_ for _ in ()).throw(
             SystemExit("⛔ litegrip 导入自别处")))
         assert w._ensure_grip_worker() is None
         assert w.grip is None
