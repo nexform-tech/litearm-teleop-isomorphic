@@ -69,17 +69,15 @@ def main(argv=None) -> int:
     # ⚠⚠ 钉死必须排在**上面那 4 行赋值之后** —— 否则 `s.gcan` 还是空串，
     #    这段就永远不跑（本计划的初稿就写错成了「load_settings() 之后」）。
     if s.gcan:
-        # ⚠⚠ 必须在任何人 import litegrip **之前**钉死，否则本机那份 editable 的
-        #    gitee 克隆会被静默抢先（实测：裸 import 落在 moduangongju/lite-grip）。
+        # ⚠ 只依赖**已安装**的 litegrip-python，不往 sys.path 塞任何检出目录 ——
+        #   路径钉死换台机器就起不来（见 `import_grip_sdk` 的说明）。
         try:
-            from .grip_worker import pin_grip_sdk
-            print(f"夹爪 SDK: {pin_grip_sdk()}")
+            from .grip_worker import import_grip_sdk
+            print(f"夹爪 SDK: {import_grip_sdk()}")
         except BaseException as e:                       # noqa: BLE001
             # 命令行语义：缺 SDK 就**明确报错退出**，不要甩一坨 traceback。
-            # （`assert_sdk_pinned` 抛 `SystemExit` —— 它不是 `Exception` 的子类；
-            #   没装 litegrip 时 `import` 抛 `ModuleNotFoundError`。）
             print(f"⛔ 夹爪 SDK 不可用：{e}", file=sys.stderr)
-            print("   --gcan 需要 litegrip（/home/llx/litegrip-python）；"
+            print("   --gcan 需要 pip install -U 'litegrip-python[zenoh]'；"
                   "去掉 --gcan 可只跑臂遥操", file=sys.stderr)
             return 2
     import sys as _sys

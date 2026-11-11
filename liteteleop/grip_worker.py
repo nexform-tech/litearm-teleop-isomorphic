@@ -18,18 +18,20 @@
 from __future__ import annotations
 
 import logging
-import os
-import sys
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
+
+from .settings import DEFAULT_PEER
 
 log = logging.getLogger("liteteleop.grip")
 
 __all__ = ["ROLE_MASTER", "ROLE_SLAVE", "GRIP_RATE_HZ", "GRIP_WATCHDOG_MS",
-           "POLL_S", "GRIP_SDK_SRC", "TORQUE_LIMIT_NM", "GripTeleopParams",
-           "GripNotReady", "GripSnapshot", "GripWorker", "assert_sdk_pinned",
-           "pin_grip_sdk", "check_ready", "travel_mm_of"]
+           "POLL_S", "MIN_SDK_VERSION", "DEFAULT_PEER", "TORQUE_LIMIT_NM",
+           "GripTeleopParams", "GripNotReady", "GripSdkUnavailable",
+           "GripSnapshot", "GripWorker", "import_grip_sdk",
+           "factory_calibration_path", "check_ready", "travel_mm_of"]
 
 ROLE_MASTER = "master"
 ROLE_SLAVE = "slave"
@@ -56,19 +58,11 @@ _MISMATCH_TOL = 0.15
 #: `openness→1` 时比值会报出主端**原始** `position_mm`（大于其真实 travel）⇒ 会误报。
 _MISMATCH_WINDOW = (0.15, 0.85)
 
-#: ⚠⚠ 夹爪 SDK 必须钉死。**本机有两份包名都叫 `litegrip` 的仓**：
-#:   `/home/llx/litegrip-python`（github nexform-tech，本设计的目标，src 布局）
-#:   `/home/llx/moduangongju/lite-grip`（gitee，被 editable 装成 `litegrip` 2.2.0）
-#: 裸 `import litegrip` **落到后者**（实测）。两者的 API 面并不相同
-#: （`teleop_start`/`close_sign`/`calibrated` 只在目标那份有）⇒ 走错仓从
-#: `AttributeError` 到**静默语义漂移**都可能。
-#: 用户裁决 2026-09-28：SDK 采用 `litegrip-python`。
-#: ⚠ 位置可用 `LITEGRIP_SRC` 覆盖 —— 与 `__main__.py` 的 `LITEARM_SRC` 同款。
-#:   判据（导入后核落点）一字未变，覆盖的只是**位置**：机器不同、检出目录不同时
-#:   不必改代码。（硬编码的那台是 `/home/llx`，别的机器上没有。）
-#: ⚠ 覆盖值要**绝对路径**：`litegrip.__file__` 永远是绝对路径，给相对路径会
-#:   在 `assert_sdk_pinned` 上直接报错，而不是按 CWD 静默解析。
-GRIP_SDK_SRC = os.environ.get("LITEGRIP_SRC", "/home/llx/litegrip-python/src")
+#: The litegrip-python release this worker is written against.
+#: ⚠ `teleop_start` / `teleop_status` / `load_calibration(path=...)` arrive over
+#: several releases; an older one imports fine and then fails at the first call.
+#: Raise this floor only when this worker starts using a newer API.
+MIN_SDK_VERSION = "1.2.1"
 
 
 @dataclass
@@ -87,7 +81,7 @@ class GripTeleopParams:
     #: （把不该软的那端送进零重力）。调用方必须显式说明这台机是主还是从。
     role: str
     grip_id: str = "gripA"
-    gpeer: str = "127.0.0.1"
+    gpeer: str = DEFAULT_PEER
     gport: int = 17448
     align: bool = True
     torque_limit_nm: float = TORQUE_LIMIT_NM
@@ -108,39 +102,97 @@ class GripTeleopParams:
         return f"litearm/v4/{self.grip_id}/gripper_teleop"
 
     def peer_host(self) -> str:
-        """对端地址；空串按本机回环算（与 `TeleopParams.peer_host` 同款）。"""
-        return (self.gpeer or "").strip() or "127.0.0.1"
+        """对端地址；空串按本机回环算（与 `TeleopParams.peer_host` 同款）。
+
+        ⚠ 主从两臂接在**同一台电脑**上 ⇒ 默认回环。只有两端跑在不同机器上时
+        才需要填局域网地址（见 `settings.DEFAULT_PEER`）。
+        """
+        return (self.gpeer or "").strip() or DEFAULT_PEER
 
 
 class GripNotReady(RuntimeError):
     """夹爪没做好遥操准备（未标定 / 零行程 / `rad_to_mm` 为 0）。"""
 
 
-# ────────────────────────────── SDK 钉死（spec §9.4）──────────────────────────────
+class GripSdkUnavailable(RuntimeError):
+    """`litegrip-python` 没装、太旧，或者装的是另一个同名包。"""
 
-def assert_sdk_pinned(mod_file: str, src: str = GRIP_SDK_SRC) -> None:
-    """判据：导入后 `litegrip.__file__` 必须落在 `src` 下，否则**抛 `SystemExit`**。
 
-    ⚠ **断言不能省，只 `sys.path.insert` 不算数。**
-    本机那份 editable 安装是用 `sys.meta_path.append(_EditableFinder)` 注册的
-    （`__editable___litegrip_2_2_0_finder.py` 的 `install()`），排在 `PathFinder`
-    **之后** ⇒ `sys.path.insert(0, ...)` 目前**压得住**（实测）。
-    但这是**实现细节**：一旦改成 `sys.meta_path.insert` 式注册，
-    `sys.path` 插入就会**静默失效** —— 只有这条断言能抓住它。
-    与 `liteteleop/__main__.py:11-21` 的 `_pin_sdk()` 同款纪律。
+def _release_tuple(version: str) -> tuple:
+    """取 PEP 440 风格的 release 前缀：`"1.2.1+abc"` → `(1, 2, 1)`。"""
+    import re
+
+    m = re.match(r"\s*(\d+(?:\.\d+)*)", str(version or ""))
+    return tuple(int(p) for p in m.group(1).split(".")) if m else ()
+
+
+def import_grip_sdk() -> str:
+    """导入**已安装**的 `litegrip-python`，核对版本与 API，返回模块路径（供日志）。
+
+    ⚠⚠ **不要往 `sys.path` 里塞检出目录。** 旧设计把 SDK 钉死在
+    `/home/llx/litegrip-python/src`：那个路径只存在于一台机器上，换台机器
+    `--gcan` 就直接起不来；而且路径钉死同时把**标定文件**和**API 版本**一起
+    钉给了某次检出。改成依赖已安装的发行版（`pip install -U
+    'litegrip-python[zenoh]'`）后，同一份代码在哪台机器上都跑，版本由环境声明。
+
+    导入后仍然核对，理由没变：同名不同源的 `litegrip`（例如 gitee 那份）也能
+    被 import 成功。两道判据 —— 版本下限，以及 `LiteGrip.teleop_start` 是否存在
+    （后者只在 `litegrip-python` 里有）。
     """
-    if not str(mod_file).startswith(str(src)):
-        raise SystemExit(
-            f"⛔ litegrip 导入自 {mod_file}，不是 {src} —— 环境里有另一份抢先了")
-
-
-def pin_grip_sdk(src: str = GRIP_SDK_SRC) -> str:
-    """把夹爪 SDK 钉到 `src`，断言后返回实际导入路径（供启动日志打印）。"""
-    if src not in sys.path:
-        sys.path.insert(0, src)
-    import litegrip                          # noqa: PLC0415 - 故意延迟到 pin 之后
-    assert_sdk_pinned(litegrip.__file__, src)
+    try:
+        import litegrip
+    except ImportError as e:
+        raise GripSdkUnavailable(
+            "没装 litegrip-python —— pip install -U 'litegrip-python[zenoh]'") from e
+    version = str(getattr(litegrip, "__version__", "") or "")
+    if version.endswith("+source"):
+        # `_detect_version()` 只在**没有发行版元数据**时给这个标记 ——
+        # 也就是说这是源码树被塞进了 `sys.path`，不是已安装的包。
+        raise GripSdkUnavailable(
+            f"litegrip 来自源码树（{litegrip.__file__}），不是已安装的发行版 —— "
+            "pip install -e <checkout> 或 pip install -U 'litegrip-python[zenoh]'")
+    release = _release_tuple(version)
+    if not release:
+        raise GripSdkUnavailable(
+            f"litegrip-python 版本未知（{version!r}）—— 装一个发行版："
+            "pip install -U 'litegrip-python[zenoh]'")
+    if release < _release_tuple(MIN_SDK_VERSION):
+        if release[0] == 0:
+            # ⚠ 可编辑安装的 `pyproject.toml` 版本是占位符 `0.0.0`
+            #    （SDK 用 semantic-release，版本只存在于 git tag）⇒ 无法核对
+            #    版本下限。API 与出厂标定下面还会查，所以放行，但提交可复现的
+            #    部署应当装发行版。
+            log.warning("litegrip-python %s 没有发行版版本号（可编辑安装？）—— "
+                        "只核对 API 与出厂标定；部署请 "
+                        "pip install -U 'litegrip-python[zenoh]'", version)
+        else:
+            raise GripSdkUnavailable(
+                f"litegrip-python {version} 太旧：本仓需要 "
+                f">= {MIN_SDK_VERSION} —— pip install -U 'litegrip-python[zenoh]'")
+    if not hasattr(getattr(litegrip, "LiteGrip", None), "teleop_start"):
+        raise GripSdkUnavailable(
+            f"{litegrip.__file__} 不是本仓要的 litegrip-python："
+            "LiteGrip 没有 teleop_start")
+    factory = Path(litegrip.__file__).resolve().parent / "factory_calibration.json"
+    if not factory.is_file():
+        raise GripSdkUnavailable(
+            f"{litegrip.__file__} 没有随包出厂标定 {factory.name} —— "
+            "装的是旧版或别的同名包；pip install -U 'litegrip-python[zenoh]'")
     return str(litegrip.__file__)
+
+
+def factory_calibration_path() -> str:
+    """已安装 SDK **随包出厂标定**的路径（`factory_calibration.json`）。
+
+    ⚠⚠ 为什么显式给 `path=`，而不是只调 `load_calibration()`：
+    无参形式会先读 `$LITEGRIP_CALIB` —— 那可能是这台机器上的另一份文件；
+    而且它会按 `channel` 过滤（出厂文件写的是 `can0`，`can1` 的夹爪会被跳过）。
+    本仓的规矩是**一概用 SDK 里的出厂标定**：显式路径既不读环境变量，
+    也不做 channel 过滤（SDK 只在 channel 不一致时告警，仍然加载）。
+    """
+    import litegrip
+
+    return str(Path(litegrip.__file__).resolve().parent / "factory_calibration.json")
 
 
 # ────────────────────────────── 前置 / 换算 ──────────────────────────────
@@ -228,6 +280,7 @@ class GripWorker:
                  watchdog_ms: float = GRIP_WATCHDOG_MS,
                  poll_s: float = POLL_S,
                  gripper_factory: Optional[Callable[[str], object]] = None,
+                 calibration_path: Optional[str] = None,
                  on_state: Optional[Callable[[GripSnapshot], None]] = None,
                  on_log: Optional[Callable[[str], None]] = None):
         """⚠ 构造只收**连接/环**参数（CAN 通道、环频、增益、watchdog）。
@@ -236,6 +289,10 @@ class GripWorker:
         `set_teleop(True, GripTeleopParams(...))`，在点「启动夹爪遥操」那一刻读。
         （与 `ArmWorker` 同款：那些字段没有一个是"连接"参数；角色还额外**跟着臂走**。
         旧设计把它们定死在构造里 ⇒ 改过的值静默失效，见 issue #12。）
+
+        `calibration_path` 只给测试/替身用：`None` = 生产路径，永远取已安装 SDK
+        随包的**出厂标定**（见 `factory_calibration_path`）。显式给值时原样传给
+        `load_calibration(path=...)`，让用例断言"加载的到底是哪一份"。
         """
         self._params: Optional[GripTeleopParams] = None   # 空 = 还没启过夹爪遥操
         # ⚠ 退化的构造参数在**这里**就拒掉，不要留到线程里才崩：
@@ -256,6 +313,7 @@ class GripWorker:
         self.watchdog_ms = float(watchdog_ms)
         self.poll_s = float(poll_s)
         self._factory = gripper_factory or _default_gripper_factory
+        self._calibration_path = calibration_path
         self._on_state = on_state
         self._on_log = on_log
 
@@ -346,7 +404,10 @@ class GripWorker:
         try:
             self._grip = self._factory(self.gcan)
             self._grip.connect()
-            self._grip.load_calibration()
+            calib = self._resolve_calibration_path()
+            # ⚠⚠ 传 `path=` 而不是无参调用：无参会先读 `$LITEGRIP_CALIB`，还可能
+            #    按 channel 跳过出厂文件（见 `factory_calibration_path`）。
+            self._grip.load_calibration(path=calib)
             self._cfg = self._grip.config
             # ⚠⚠ **必须在 enable() 之前** —— 见 `check_ready` 的说明。
             check_ready(self._cfg)
@@ -362,7 +423,8 @@ class GripWorker:
             with self._lock:
                 self._snap.connected = True
                 self._snap.travel_mm = travel_mm_of(self._cfg)
-            self._log(f"夹爪已就绪：{self.gcan}  travel={travel_mm_of(self._cfg):.2f} mm  "
+            self._log(f"夹爪已就绪：{self.gcan}  标定={calib or 'SDK 默认'}  "
+                      f"travel={travel_mm_of(self._cfg):.2f} mm  "
                       f"close_sign={float(self._cfg.close_sign):+.0f} rad_to_mm="
                       f"{float(self._cfg.rad_to_mm):.2f}")
             self._poll_loop()
@@ -372,6 +434,20 @@ class GripWorker:
             self._log(f"⛔ 夹爪 {e}")
         finally:
             self._teardown()
+
+    def _resolve_calibration_path(self) -> Optional[str]:
+        """这次启动要加载的标定文件。
+
+        ⚠ 生产路径（没注入 `gripper_factory`）**一律**用已安装 SDK 随包的出厂标定。
+        注入替身的用例里 CI 上没有 `litegrip`，此时去解析路径会直接 `ImportError`；
+        所以替身拿到 `None`（等价于 SDK 的无参调用），要断言路径的用例显式传
+        `calibration_path=`。
+        """
+        if self._calibration_path is not None:
+            return self._calibration_path
+        if self._factory is _default_gripper_factory:
+            return factory_calibration_path()
+        return None
 
     def _poll_loop(self) -> None:
         """按 `poll_s` 读 SDK 的状态；请求变了就启停 SDK 的遥操会话。"""

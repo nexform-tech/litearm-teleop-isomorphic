@@ -12,6 +12,10 @@ liteteleop = "liteteleop.__main__:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# 夹爪遥操（`--gcan`）。⚠ 走**已安装的发行版**，不要指向某个检出目录 ——
+# 路径钉死换台机器就起不来，而且会把标定文件一起钉给那次检出（issue #18）。
+# 版本下限与 `liteteleop.grip_worker.MIN_SDK_VERSION` 保持一致。
+gripper = ["litegrip-python[zenoh]>=1.2.1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
