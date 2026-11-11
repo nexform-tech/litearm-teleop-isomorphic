@@ -26,19 +26,24 @@ that status into the UI.
 
 ## Usage
 
-Run two processes, one per machine. The arm link and the gripper link are
-independent: separate CAN buses, separate zenoh sessions, separate ports
-(`--jport`, default 17447 for the arm; `--gport`, default 17448 for the gripper),
-separate topics, separate toggles in the UI.
+Run two processes, one per arm. Both arms normally connect to the same computer,
+so both processes run there and the peer address defaults to loopback
+(`127.0.0.1`). The arm link and the gripper link are independent: separate CAN
+buses, separate zenoh sessions, separate ports (`--jport`, default 17447 for the
+arm; `--gport`, default 17448 for the gripper), separate topics, separate
+toggles in the UI.
 
 ```bash
-# Leader machine: the arm is hand-dragged in zero gravity; the gripper likewise.
+# Leader process: the arm is hand-dragged in zero gravity; the gripper likewise.
 python -m liteteleop --role master --cdc /dev/ttyACM0 --gcan can0
 
-# Follower machine: subscribes and follows.
-python -m liteteleop --role slave  --cdc /dev/ttyACM1 --peer 192.168.31.10 \
-                     --gcan can1 --gpeer 192.168.31.10
+# Follower process: subscribes and follows.
+python -m liteteleop --role slave  --cdc /dev/ttyACM1 --gcan can1
 ```
+
+Pass `--peer` and `--gpeer` only when the two processes run on separate
+machines; the default is loopback because a fixed LAN address breaks as soon as
+the subnet changes.
 
 The gripper link uses the topic `litearm/v4/{grip_id}/gripper_teleop` and the
 32-byte big-endian frame `(openness, position_mm, force_n, timestamp)`, where
@@ -51,6 +56,16 @@ The gripper teleoperation fields — peer, port, grip ID, align, and torque limi
 — are read when you start gripper teleoperation, not when the worker is built.
 Edit the port and start again, and the new port applies; the fields are not
 re-read while a session runs, so stop and start to change them.
+
+Install the gripper SDK as an installed release, not as a directory:
+
+```bash
+python3 -m pip install -U 'litegrip-python[zenoh]'
+```
+
+The worker always loads the factory calibration shipped inside that release
+(`factory_calibration.json`). It does not read `$LITEGRIP_CALIB` and does not
+use a calibration measured on another machine.
 
 Bring the CAN bus up first. The gripper needs its own bus (`can0` or `can1`), not
 the arm's CDC port:
@@ -124,8 +139,10 @@ condensed from are not published.
 
 - Do not let a zenoh session go without `close()`. The process hangs permanently at exit.
 - Do not resolve `litearm` by whichever import wins. Point it at the intended checkout and assert the result; a stale editable install silently satisfies `import litearm`.
-- Do not `import litegrip` bare on a machine that has two same-named checkouts. Both resolve, and the wrong one wins.
-- Go through `grip_worker.pin_grip_sdk()`, which asserts and logs. A `sys.path.insert` alone does not hold against a future switch to `meta_path.insert`.
+- Do not pin `litegrip-python` to a checkout path (`/home/llx/litegrip-python/src`). It exists on one machine only and pins which calibration loads.
+- Do not add a checkout to `sys.path` instead. Use `grip_worker.import_grip_sdk()`; it imports the installed release, checks the version floor and `LiteGrip.teleop_start`.
+- Do not call argument-less `load_calibration()` here. It reads `$LITEGRIP_CALIB` and filters by `channel`; pass `grip_worker.factory_calibration_path()`.
+- Do not point `--peer` or `--gpeer` at a LAN address when both arms are on one computer. The default is loopback; a subnet-specific address silently produces a link that receives no frames.
 - Do not expect `LiteGrip.close()` to disconnect. It closes the jaws; `disconnect()` drops the link.
 - Do not leave `disable_on_disconnect` at its default when you want the gripper to keep holding. It defaults to `True`, so `disconnect()` disables the motors first.
 - That drops whatever is being gripped. Pass `False` explicitly.
