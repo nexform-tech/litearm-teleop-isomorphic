@@ -28,9 +28,9 @@ from .settings import DEFAULT_PEER
 log = logging.getLogger("liteteleop.grip")
 
 __all__ = ["ROLE_MASTER", "ROLE_SLAVE", "GRIP_RATE_HZ", "GRIP_WATCHDOG_MS",
-           "POLL_S", "DEFAULT_PEER", "TORQUE_LIMIT_NM", "VENDORED_SDK_DIR",
-           "GripTeleopParams", "GripNotReady", "GripSdkUnavailable",
-           "GripSnapshot", "GripWorker", "import_grip_sdk",
+           "POLL_S", "DEFAULT_PEER", "TORQUE_LIMIT_NM", "FEEDBACK_GAIN_NM_PER_N",
+           "VENDORED_SDK_DIR", "GripTeleopParams", "GripNotReady",
+           "GripSdkUnavailable", "GripSnapshot", "GripWorker", "import_grip_sdk",
            "factory_calibration_path", "check_ready", "travel_mm_of"]
 
 ROLE_MASTER = "master"
@@ -45,11 +45,16 @@ GRIP_WATCHDOG_MS = 200.0
 #: 界面快照的刷新周期（秒）。SDK 自己按 `rate_hz` 跑环，这里只是**读**它的状态。
 POLL_S = 0.1
 
-#: 从端夹爪的**力矩上限**（Nm）默认值。超过就卸力（SDK 侧 `torque_limit_nm`）。
+#: 从端夹爪的**力矩上限**（Nm）默认值。超过即**限力保持**：以这个力矩继续压住
+#: 工件（SDK 侧 `torque_limit_nm` + `torque_guard_action="hold"`）。
 #: ⚠ 这个值取决于**打印件有多脆**，是 per-machine 的，不是型号常量：
 #: 先用 1.0 起步，第一次跑起来看界面上的 `torque_nm` 再定。
 #: ⚠ 与跟随增益强相关 —— `kp` 是 Nm/rad，所以 1.0 Nm 只对应一点点位置误差。
 TORQUE_LIMIT_NM = 1.0
+
+#: 主端力反馈增益（Nm 阻力 / N 夹持力）。只在从端夹持力超过 SDK 阈值（2 N）后
+#: 按比例生效，并由 SDK 封顶（默认 1.0 Nm）。0 = 关闭渲染（仍会发布/接收）。
+FEEDBACK_GAIN_NM_PER_N = 0.10
 
 #: 主从 `travel_mm` 偏差超过这个比例就告警（spec §7.3）。
 _MISMATCH_TOL = 0.15
@@ -84,6 +89,10 @@ class GripTeleopParams:
     gport: int = 17448
     align: bool = True
     torque_limit_nm: float = TORQUE_LIMIT_NM
+    #: 主端力反馈：从端每拍发布夹持力，主端按「阈值 + 增益 + 封顶」渲染成阻力矩。
+    #: 只在 zenoh 链路上可用（UDP 主端没有接收路径）；老对端不声明该 key ⇒ 自动退化为纯位置。
+    force_feedback: bool = True
+    feedback_gain_nm_per_n: float = FEEDBACK_GAIN_NM_PER_N
 
     def __post_init__(self) -> None:
         if self.role not in (ROLE_MASTER, ROLE_SLAVE):
@@ -94,6 +103,11 @@ class GripTeleopParams:
             raise ValueError(
                 f"torque_limit_nm 必须 >= 0（0 = 关闭保护），"
                 f"收到 {self.torque_limit_nm!r}")
+        # 同理：0 = 关闭渲染（仍然收/发），不是非法值。
+        if float(self.feedback_gain_nm_per_n) < 0.0:
+            raise ValueError(
+                f"feedback_gain_nm_per_n 必须 >= 0（0 = 关闭渲染），"
+                f"收到 {self.feedback_gain_nm_per_n!r}")
 
     @property
     def topic(self) -> str:
@@ -230,8 +244,12 @@ class GripSnapshot:
     fault: str = ""                     # 夹爪自己报的 error_code != 1（§8 rule 10）
     # ── 从端力矩保护（SDK 的 `torque_limit_nm`，见 issue #20）──
     torque_nm: float = 0.0              # 从端**自己**的力矩读数（= 电流信号）
-    over_torque: bool = False           # 已超限卸力（锁存中）
-    torque_trips: int = 0               # 本次会话卸力次数
+    over_torque: bool = False           # 已超限，限力保持中（锁存）
+    torque_trips: int = 0               # 本次会话触发次数
+    # ── 力反馈（SDK 的 `force_feedback`）──
+    feedback_force_n: float = 0.0       # 主端：收到的夹持力；从端：上一次发布的夹持力
+    feedback_tau_nm: float = 0.0        # 主端：当前打在操作者手上的阻力矩
+    feedback_active: bool = False       # 本次会话通道确实通过帧（主端收到 / 从端发出）
     mismatch: str = ""                  # 主从标定不一致告警（§7.3），空 = 无
     error: str = ""
 
@@ -453,18 +471,25 @@ class GripWorker:
             port=p.gport, grip_id=p.grip_id,
             kp=self.kp, kd=self.kd, align=p.align,
             watchdog_s=self.watchdog_ms / 1000.0, rate_hz=self.rate_hz,
-            torque_limit_nm=p.torque_limit_nm)
+            torque_limit_nm=p.torque_limit_nm,
+            # 过力矩不再卸力，而是限力保持 —— 这正是「夹住不掉」的修复。
+            torque_guard_action="hold",
+            force_feedback=p.force_feedback,
+            feedback_gain_nm_per_n=p.feedback_gain_nm_per_n)
         self._session = True
         self._prev_over_torque = False
         if p.role == ROLE_MASTER:
+            fb = (f" · 力反馈增益 {p.feedback_gain_nm_per_n:.2f} Nm/N"
+                  if p.force_feedback else " · 力反馈关闭")
             self._log(f"主端夹爪：零重力拖动 · 发布 {p.topic} @ 端口 {p.gport}"
-                      f" · {self.rate_hz:.0f} Hz")
+                      f" · {self.rate_hz:.0f} Hz{fb}")
         else:
             limit = ("关闭" if p.torque_limit_nm == 0.0
-                     else f"{p.torque_limit_nm:.2f} Nm")
+                     else f"{p.torque_limit_nm:.2f} Nm（限力保持）")
+            fb = "发布夹持力" if p.force_feedback else "不发布夹持力"
             self._log(f"从端夹爪：订阅 {p.topic} @ {p.peer_host()}:{p.gport} "
                       f"· align={p.align} · watchdog={self.watchdog_ms:.0f} ms "
-                      f"· 力矩上限 {limit}")
+                      f"· 力矩上限 {limit} · {fb}")
         return st
 
     # ────────────────────── 快照 ──────────────────────
@@ -497,6 +522,12 @@ class GripWorker:
             s.torque_nm = float(st.get("torque_nm", 0.0) or 0.0)
             s.over_torque = bool(st.get("over_torque", False))
             s.torque_trips = int(st.get("torque_trips", 0) or 0)
+            s.feedback_force_n = float(st.get("feedback_force_n", 0.0) or 0.0)
+            s.feedback_tau_nm = float(st.get("feedback_tau_nm", 0.0) or 0.0)
+            # 主端看「收到」、从端看「发出」——同一个通道的两端。
+            s.feedback_active = bool(
+                int(st.get("feedback_rx", 0) or 0) if master
+                else int(st.get("feedback_tx", 0) or 0))
             s.stale = bool(st.get("stale", False))
             s.frame_age = None if age_ms is None else float(age_ms) / 1000.0
             s.matching = bool(st.get("matching")) if master else False
@@ -511,8 +542,8 @@ class GripWorker:
         if s.over_torque and not self._prev_over_torque:
             limit = 0.0 if p is None else p.torque_limit_nm
             self._log(f"⚠ 从端夹爪力矩超限（{s.torque_nm:+.2f} Nm 对上限 "
-                      f"{limit:.2f} Nm）—— **就地卸力**，夹爪不再顶住；"
-                      "主端张开一点即自动恢复跟随")
+                      f"{limit:.2f} Nm）—— **限力保持**：以 {limit:.2f} Nm 继续"
+                      "压住工件（夹住不掉）；主端张开一点即自动恢复跟随")
         self._prev_over_torque = s.over_torque
         with self._lock:
             s.watchdog_trips = self._watchdog_trips

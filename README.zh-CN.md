@@ -41,9 +41,18 @@ python -m liteteleop --role slave  --cdc /dev/ttyACM1 --gcan can1
 帧与环**都不在本仓**：两者都来自 `litegrip` SDK，本仓只是经 `LiteGrip.teleop_start`
 调它。**不传 `--gcan` 就不启用夹爪遥操**，这也是默认状态。
 
-夹爪遥操的各个字段 —— 对端、端口、夹爪 ID、align、力矩上限 —— 是在**点「启动夹爪遥操」
-那一刻**读的，不是建 worker 时读的。改完端口再启动一次，新端口即生效；会话跑起来之后
-这些字段不再重读，要改就停下来重开。
+夹爪遥操的各个字段 —— 对端、端口、夹爪 ID、align、力矩上限、力反馈 —— 是在**点「启动
+夹爪遥操」那一刻**读的，不是建 worker 时读的。改完端口再启动一次，新端口即生效；会话
+跑起来之后这些字段不再重读，要改就停下来重开。
+
+从端力矩超过上限时不再卸力，而是**以有界力矩继续压住工件**（限力保持）：worker 传
+`torque_guard_action="hold"`，被夹住的物体不会再被顶开。上限要按**打印件**的强度设，不是
+按夹爪型号；`0` 关闭该保护。
+
+从端把夹持力发布到 `litearm/v4/{grip_id}/gripper_feedback`（一个 8 字节大端 double，单位
+N，正 = 夹紧）。主端把它渲染成阻力矩：只有超过 2 N 的力才传导，增益默认 0.10 Nm/N，阻力
+封顶 1.0 Nm；两者都能在控制台里改，增益 `0` 关闭反馈。这条 key 是新增的，老版本对端收不到
+就自动退化为纯位置遥操。UDP 主端只发不收，所以那里反馈自动关闭。
 
 臂 SDK 已经 **vendored 在 `liteteleop/_vendor/litearm/`，随本包发布**，不需要单独
 安装；来源与 re-vendor 步骤见 `liteteleop/_vendor/litearm/VENDORED.md`。私有路径

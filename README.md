@@ -52,10 +52,24 @@ here: both come from the `litegrip` SDK, which this repository calls through
 `LiteGrip.teleop_start`. Omit `--gcan` to leave gripper teleoperation off; that
 is the default.
 
-The gripper teleoperation fields — peer, port, grip ID, align, and torque limit
-— are read when you start gripper teleoperation, not when the worker is built.
-Edit the port and start again, and the new port applies; the fields are not
-re-read while a session runs, so stop and start to change them.
+The gripper teleoperation fields — peer, port, grip ID, align, torque limit, and
+force feedback — are read when you start gripper teleoperation, not when the
+worker is built. Edit the port and start again, and the new port applies; the
+fields are not re-read while a session runs, so stop and start to change them.
+
+When the follower torque exceeds the limit it stops following and **holds the
+part at a bounded torque** (限力保持) instead of going slack: the worker passes
+`torque_guard_action="hold"`, so a clamped object is no longer pushed open. Set
+the limit for the printed part, not the gripper model; `0` disables the guard.
+
+The follower publishes its squeeze on
+`litearm/v4/{grip_id}/gripper_feedback` (one big-endian double, newtons, positive
+= squeezing). The leader renders it as a resistance torque: only forces above
+2 N pass through, the gain defaults to 0.10 Nm/N, and the resistance is capped at
+1.0 Nm. Both are in the console; a gain of `0` turns the feedback off. The key is
+additive, so a console paired with an older build simply runs position-only
+teleoperation. A UDP leader is publish-only and cannot receive it, so feedback
+is off there automatically.
 
 The arm SDK is vendored in `liteteleop/_vendor/litearm/` and ships with this
 package; there is no separate install step. Provenance and the re-vendor

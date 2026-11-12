@@ -767,6 +767,76 @@ def test_grip_panel_defaults_to_disabled_and_independent(qapp):
     w.close()
 
 
+def test_grip_force_feedback_controls_default_on_and_reach_the_params(qapp):
+    """⚠ 主端力反馈默认**开**、增益默认 0.10 Nm/N；控件值必须进 `GripTeleopParams`。
+
+    判别力：
+      · `gripper_values()` 忘了暴露 ⇒ 启动时反馈参数取默认，界面上的勾选形同虚设；
+      · 默认改成关 ⇒ 用户拍板的"夹取时主端顶手"默认不生效。
+    """
+    from liteteleop.gui import main_window as mw
+
+    w = MainWindow(Settings(role=ROLE_SLAVE))
+    assert w.page.chk_feedback.isChecked() is True, "力反馈默认必须开"
+    assert w.page.sp_fbgain.value() == pytest.approx(0.10)
+    v = w.page.gripper_values()
+    assert v["force_feedback"] is True
+    assert v["feedback_gain_nm_per_n"] == pytest.approx(0.10)
+
+    got = []
+
+    class _W:
+        def is_alive(self):
+            return True
+
+        def set_teleop(self, on, params=None):
+            got.append((on, params))
+
+    w.grip = _W()                                 # type: ignore[assignment]
+    try:
+        w.page.ed_gcan.setText("can0")
+        w.page.sp_fbgain.setValue(0.2)            # ⚠ 启动那一刻读界面值
+        w._toggle_grip(True)
+        p = got[0][1]
+        assert isinstance(p, mw.GripTeleopParams), p
+        assert p.force_feedback is True
+        assert p.feedback_gain_nm_per_n == pytest.approx(0.2)
+    finally:
+        w.grip = None
+        w.close()
+
+
+def test_grip_force_feedback_readout_and_hold_wording(qapp):
+    """主端渲染「阻力/反馈」，从端超限渲染「限力保持」——**不是**「已卸力」。
+
+    判别力：沿用旧的零刚度文案（"已卸力"）会误导操作者以为钳口不顶料，
+    实际现在是以力矩限值压住工件（夹住不掉）。
+    """
+    from liteteleop.grip_worker import GripSnapshot
+
+    w = MainWindow(Settings())
+
+    m = GripSnapshot(role="master", connected=True, matching=True,
+                     feedback_active=True, feedback_force_n=10.0,
+                     feedback_tau_nm=-0.8)
+    w._on_grip_state(m)
+    txt = w.page.lab_grip.text()
+    assert "阻力 -0.80 Nm" in txt and "反馈 10.0 N" in txt, txt
+
+    m.feedback_active = False
+    w._on_grip_state(m)
+    assert "力反馈无数据" in w.page.lab_grip.text()
+
+    s = GripSnapshot(role="slave", connected=True, over_torque=True,
+                     feedback_active=True, feedback_force_n=10.0)
+    w._on_grip_state(s)
+    txt = w.page.lab_grip.text()
+    assert "限力保持" in txt, txt
+    assert "已卸力" not in txt, "旧文案会误导：现在是以限力矩继续压住工件"
+    assert "输出力 10.0 N" in txt, txt
+    w.close()
+
+
 def test_grip_button_is_clickable_from_construction(qapp):
     """⚠⚠ 死锁回归：夹爪按钮**不能**初始禁用。
 

@@ -265,6 +265,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.s.gport = v["gport"]
         self.s.grip_id = v["grip_id"]
         self.s.grip_torque_limit_nm = v["torque_limit_nm"]
+        self.s.grip_force_feedback = v["force_feedback"]
+        self.s.grip_feedback_gain_nm_per_n = v["feedback_gain_nm_per_n"]
         self._save()
 
     def _ensure_grip_worker(self) -> "GripWorker | None":
@@ -329,7 +331,9 @@ class MainWindow(QtWidgets.QMainWindow):
             params = GripTeleopParams(
                 role=self.page.role(), grip_id=v["grip_id"], gpeer=v["gpeer"],
                 gport=v["gport"], align=v["align"],
-                torque_limit_nm=v["torque_limit_nm"])
+                torque_limit_nm=v["torque_limit_nm"],
+                force_feedback=v["force_feedback"],
+                feedback_gain_nm_per_n=v["feedback_gain_nm_per_n"])
             w.set_teleop(True, params)
         except ValueError as e:
             # ⚠⚠ 不许让异常逃出 Qt 槽：PyQt5 对逃出槽的异常会直接 abort 进程

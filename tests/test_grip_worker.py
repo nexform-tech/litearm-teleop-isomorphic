@@ -75,6 +75,24 @@ def test_negative_torque_limit_is_rejected():
         GripTeleopParams(ROLE_SLAVE, torque_limit_nm=-0.1)
 
 
+def test_force_feedback_defaults_are_on_and_bounded():
+    """力反馈默认开、增益 0.10 Nm/N（SDK 阈值 2 N / 封顶 1.0 Nm）。
+
+    0 是合法值（关闭渲染，仍收发）⇒ 只拒负数。
+    """
+    p = GripTeleopParams(ROLE_MASTER)
+    assert p.force_feedback is True
+    assert p.feedback_gain_nm_per_n == pytest.approx(0.10)
+    assert GripTeleopParams(ROLE_MASTER, feedback_gain_nm_per_n=0.0) \
+        .feedback_gain_nm_per_n == 0.0
+
+
+def test_negative_feedback_gain_is_rejected():
+    """判别力：去掉 `GripTeleopParams.__post_init__` 里那条校验时本用例必红。"""
+    with pytest.raises(ValueError, match="feedback_gain_nm_per_n"):
+        GripTeleopParams(ROLE_MASTER, feedback_gain_nm_per_n=-0.1)
+
+
 def test_bad_role_is_rejected():
     """⚠ 角色是**遥操参数** ⇒ 在参数上同步被拒。
 
@@ -496,6 +514,10 @@ def test_teleop_start_receives_the_right_arguments(role, gcan, gpeer):
         assert kw["watchdog_s"] == pytest.approx(0.25)
         assert kw["rate_hz"] == pytest.approx(100.0)
         assert kw["torque_limit_nm"] == pytest.approx(1.0), "参数默认值要透传下去"
+        # 过力矩改为**限力保持**（夹住不掉），不再是卸力弹开。
+        assert kw["torque_guard_action"] == "hold"
+        assert kw["force_feedback"] is True
+        assert kw["feedback_gain_nm_per_n"] == pytest.approx(0.10)
     finally:
         w.stop(timeout=5.0)
 
@@ -547,7 +569,7 @@ def test_a_changed_port_applies_on_the_next_start():
 
 
 def test_slave_status_maps_the_torque_guard():
-    """从端的力矩保护状态要进快照 —— 否则"已卸力"与"正常持位"在界面上一样。
+    """从端的力矩保护状态要进快照 —— 否则"限力保持"与"正常持位"在界面上一样。
 
     ⚠ `torque_nm` 是**从端自己**的力矩读数，不是帧里的 `force_n`（那是主端的）。
     """
@@ -565,6 +587,46 @@ def test_slave_status_maps_the_torque_guard():
         assert s.torque_nm == pytest.approx(1.42)
         assert s.over_torque is True
         assert s.torque_trips == 2
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_master_status_maps_the_rendered_force_feedback():
+    """主端：收到夹持力、当前阻力矩都要进快照，界面才显示得出来。
+
+    `feedback_active` 在主端看 `feedback_rx`（有没有真的收到帧）—— 没通时界面
+    显示「力反馈无数据」，而不是一个假的 0。
+    """
+    g = FakeGrip()
+    g.teleop_status_extra = {"feedback_force_n": 7.5, "feedback_tau_nm": -0.6,
+                             "feedback_rx": 4}
+    w = GripWorker("can0", poll_s=0.02, gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True, GripTeleopParams(ROLE_MASTER))
+        time.sleep(0.25)
+        s = w.snapshot()
+        assert s.feedback_force_n == pytest.approx(7.5)
+        assert s.feedback_tau_nm == pytest.approx(-0.6)
+        assert s.feedback_active is True
+    finally:
+        w.stop(timeout=5.0)
+
+
+def test_slave_status_maps_the_published_force_feedback():
+    """从端看 `feedback_tx`（有没有真的发出去）。"""
+    g = FakeGrip()
+    g.teleop_status_extra = {"feedback_force_n": 5.0, "feedback_tx": 9}
+    w = GripWorker("can1", poll_s=0.02, gripper_factory=lambda _c: g)
+    try:
+        w.start()
+        time.sleep(0.15)
+        w.set_teleop(True, GripTeleopParams(ROLE_SLAVE))
+        time.sleep(0.25)
+        s = w.snapshot()
+        assert s.feedback_force_n == pytest.approx(5.0)
+        assert s.feedback_active is True
     finally:
         w.stop(timeout=5.0)
 
