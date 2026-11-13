@@ -58,11 +58,13 @@ def test_degenerate_construction_params_are_rejected(kw, match):
 
 # ════════════════════ 遥操参数（点「启动夹爪遥操」那一刻才读）════════════════════
 
-def test_zero_torque_limit_is_accepted():
-    """0 是**合法**值 —— SDK 语义是"关闭堵转保护"，用户可能就是想全权手动。
+def test_zero_torque_limit_is_the_default_and_accepted():
+    """默认 **0 = 关闭判定**（纯位置跟随）；0 是**合法**值，不是"没设"。
 
-    判别力：把校验写成 `<= 0` 时本用例必红。
+    判别力：把校验写成 `<= 0` 时本用例必红；把默认改回非零也会让这里的断言
+    与 `test_teleop_start_receives_the_right_arguments` 一起红。
     """
+    assert GripTeleopParams(ROLE_SLAVE).torque_limit_nm == 0.0
     assert GripTeleopParams(ROLE_SLAVE, torque_limit_nm=0.0).torque_limit_nm == 0.0
 
 
@@ -495,7 +497,8 @@ def test_teleop_start_receives_the_right_arguments(role, gcan, gpeer):
         assert kw["align"] is False
         assert kw["watchdog_s"] == pytest.approx(0.25)
         assert kw["rate_hz"] == pytest.approx(100.0)
-        assert kw["torque_limit_nm"] == pytest.approx(1.0), "参数默认值要透传下去"
+        assert kw["torque_limit_nm"] == pytest.approx(0.0), \
+            "默认 0 = 关闭判定；参数值要透传下去"
         # 过力矩改为**限力保持**（夹住不掉），不再是卸力弹开。
         assert kw["torque_guard_action"] == "hold"
     finally:

@@ -8,6 +8,7 @@ def test_gripper_defaults_are_off_and_independent():
     assert s.gport == 17448
     assert s.grip_id == "gripA"
     assert s.gpeer == DEFAULT_PEER
+    assert s.grip_torque_limit_nm == 0.0, "默认关闭力矩判定（纯位置跟随）"
 
 
 def test_peer_defaults_are_loopback():

@@ -563,10 +563,11 @@ class TeleopPage(QtWidgets.QWidget):
         self.sp_gtorque.setValue(self.gs.grip_torque_limit_nm)
         self.sp_gtorque.setFixedWidth(80)
         card.add_row("从端力矩上限", self.sp_gtorque, "Nm")
-        card.add(hint("从端夹爪力矩超过上限即<b>限力保持</b>：以该力矩继续压住工件"
-                      "（夹住不掉），不再卸力弹开（0 = 关闭该保护）。"
-                      "打印件越脆取得越小 —— 跟随增益是 Nm/rad，1.0 Nm 只对应很小的"
-                      "位置误差。先跑一次看下面的力矩读数再定。", "hintSubtle"))
+        card.add(hint("默认 <b>0 = 关闭判定</b>：从端纯位置跟随，抓取时不切换控制模式。"
+                      "设成非零后，力矩超过上限即<b>限力保持</b>：以该力矩继续压住工件"
+                      "（夹住不掉），不再卸力弹开。打印件越脆取得越小 —— 跟随增益是"
+                      " Nm/rad，1.0 Nm 只对应很小的位置误差。开保护前先跑一次看下面的"
+                      "力矩峰值再定。", "hintSubtle"))
 
         gtip = "`GripWorker` 的构造默认值 —— 本版没接到界面上，故只读"
         self.ro_rate = ro_field("—", 72, gtip)

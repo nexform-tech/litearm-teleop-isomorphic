@@ -45,12 +45,14 @@ GRIP_WATCHDOG_MS = 200.0
 #: 界面快照的刷新周期（秒）。SDK 自己按 `rate_hz` 跑环，这里只是**读**它的状态。
 POLL_S = 0.1
 
-#: 从端夹爪的**力矩上限**（Nm）默认值。超过即**限力保持**：以这个力矩继续压住
-#: 工件（SDK 侧 `torque_limit_nm` + `torque_guard_action="hold"`）。
+#: 从端夹爪的**力矩上限**（Nm）。超过即**限力保持**：以这个力矩继续压住工件
+#: （SDK 侧 `torque_limit_nm` + `torque_guard_action="hold"`）。
+#: ⚠ 默认 **0 = 关闭判定**：从端是纯位置跟随，夹持力由位置误差决定，
+#: 不会在抓取瞬间切到纯力矩而顿一下。需要保护脆的打印件时再打开。
 #: ⚠ 这个值取决于**打印件有多脆**，是 per-machine 的，不是型号常量：
-#: 先用 1.0 起步，第一次跑起来看界面上的 `torque_nm` 再定。
+#: 打开时先用 1.0 起步，看界面上的 `torque_nm` 峰值再定。
 #: ⚠ 与跟随增益强相关 —— `kp` 是 Nm/rad，所以 1.0 Nm 只对应一点点位置误差。
-TORQUE_LIMIT_NM = 1.0
+TORQUE_LIMIT_NM = 0.0
 
 #: 主从 `travel_mm` 偏差超过这个比例就告警（spec §7.3）。
 _MISMATCH_TOL = 0.15

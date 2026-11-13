@@ -57,10 +57,13 @@ The gripper teleoperation fields — peer, port, grip ID, align, and torque limi
 Edit the port and start again, and the new port applies; the fields are not
 re-read while a session runs, so stop and start to change them.
 
-When the follower torque exceeds the limit it stops following and **holds the
-part at a bounded torque** (限力保持) instead of going slack: the worker passes
-`torque_guard_action="hold"`, so a clamped object is no longer pushed open. Set
-the limit for the printed part, not the gripper model; `0` disables the guard.
+The follower torque limit is **0 by default**, which turns the guard off: the
+follower is a pure position follower, so contact does not switch control modes
+and the grip does not jolt. Set a non-zero limit to protect a fragile printed
+part: above it the follower stops following and **holds the part at a bounded
+torque** (限力保持) instead of going slack, because the worker passes
+`torque_guard_action="hold"`. Choose the limit for the part, not the gripper
+model.
 
 The arm SDK is vendored in `liteteleop/_vendor/litearm/` and ships with this
 package; there is no separate install step. Provenance and the re-vendor
