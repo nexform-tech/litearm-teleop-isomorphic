@@ -9,7 +9,7 @@ The teleoperation worker drives the gripper through this SDK. Shipping it in-tre
 | | |
 | --- | --- |
 | Upstream | <https://github.com/nexform-tech/litegrip-python> |
-| Commit | `4ce8482e10f5ca12a12e90db2a7222f814b07cea` (tag `v1.2.1`, 2026-10-30) |
+| Commit | `66b7c1663501bd1d44e2a5d094293af7241fbc05` (tag `v1.3.0`, 2026-11-12) |
 | License | Apache-2.0 — `LICENSE` is that commit's file, copied verbatim |
 
 `litegrip/` holds the modules, the `can/` and `protocols/` subpackages, `py.typed`, and the three JSON data files the code resolves through `dirname(__file__)`: `factory_calibration.json`, `calibration_normal.json`, and `calibration_reverse.json`. The worker loads the factory file explicitly; the other two are upstream's legacy templates and must travel with the code.
@@ -25,7 +25,7 @@ An edit here is a fork of upstream that nothing records, and the next re-vendor 
 ## Tree hash
 
 ```text
-0a085f3259227688ff5da535ba1079b3d02efe73f7c5aa56d3caf63d113cd029
+7c1ffaca424d52915c48f401c6bc14d920c534127656a56927d936012609dd42
 ```
 
 The recipe: take every file under `litegrip/` except this note and `__pycache__`, ordered by its POSIX path relative to `litegrip/`; feed each path, a newline, then the file's bytes into one SHA-256 stream; read the hex digest.

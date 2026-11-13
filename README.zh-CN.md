@@ -45,6 +45,11 @@ python -m liteteleop --role slave  --cdc /dev/ttyACM1 --gcan can1
 那一刻**读的，不是建 worker 时读的。改完端口再启动一次，新端口即生效；会话跑起来之后
 这些字段不再重读，要改就停下来重开。
 
+从端力矩上限**默认 0，即关闭判定**：从端是纯位置跟随，碰到工件不会切换控制模式，夹取时
+不会顿一下。设成非零才开启保护：力矩超过上限时不再卸力，而是**以有界力矩继续压住工件**
+（限力保持）—— worker 传 `torque_guard_action="hold"`，被夹住的物体不会再被顶开。上限要
+按**打印件**的强度设，不是按夹爪型号。
+
 臂 SDK 已经 **vendored 在 `liteteleop/_vendor/litearm/`，随本包发布**，不需要单独
 安装；来源与 re-vendor 步骤见 `liteteleop/_vendor/litearm/VENDORED.md`。私有路径
 让用户为其他项目装的 `litearm-python` 可以共存：worker 经
