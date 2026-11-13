@@ -47,20 +47,3 @@ def test_gripper_defaults_survive_a_settings_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "settings_path", lambda: p)
     st.save_settings(st.Settings())
     assert st.load_settings().gcan == ""
-
-
-def test_gripper_force_feedback_roundtrip(tmp_path, monkeypatch):
-    """力反馈开关与增益必须落盘再读回 —— `asdict` 自动带上，无需另写序列化。
-
-    判别力：把 `grip_force_feedback` / `grip_feedback_gain_nm_per_n` 从 `Settings`
-    删掉时，`__getattr__` 都不存在 ⇒ 本用例在读取处必红。
-    """
-    from liteteleop import settings as st
-
-    p = tmp_path / "settings.json"
-    monkeypatch.setattr(st, "settings_path", lambda: p)
-    st.save_settings(st.Settings(grip_force_feedback=False,
-                                 grip_feedback_gain_nm_per_n=0.25))
-    got = st.load_settings()
-    assert got.grip_force_feedback is False
-    assert got.grip_feedback_gain_nm_per_n == 0.25

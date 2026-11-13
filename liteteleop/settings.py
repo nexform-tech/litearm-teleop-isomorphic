@@ -45,9 +45,6 @@ class Settings:
     # 从端夹爪的力矩上限（Nm）：超过即限力保持，护住打印件。0 = 关闭该保护。
     # ⚠ 这是 **per-machine 的值** —— 取决于打印件有多脆，不是夹爪型号。
     grip_torque_limit_nm: float = 1.0
-    # 主端力反馈：从端夹持力 → 主端阻力矩。增益单位 Nm/N，0 = 关闭渲染。
-    grip_force_feedback: bool = True
-    grip_feedback_gain_nm_per_n: float = 0.10
     extra: Dict[str, Any] = field(default_factory=dict)
 
 

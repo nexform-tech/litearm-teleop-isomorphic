@@ -568,20 +568,6 @@ class TeleopPage(QtWidgets.QWidget):
                       "打印件越脆取得越小 —— 跟随增益是 Nm/rad，1.0 Nm 只对应很小的"
                       "位置误差。先跑一次看下面的力矩读数再定。", "hintSubtle"))
 
-        # 主端力反馈：从端夹持力（>2 N 后）按增益渲染成主端阻力矩，SDK 封顶 1.0 Nm。
-        self.chk_feedback = QtWidgets.QCheckBox("主端力反馈")
-        self.chk_feedback.setChecked(bool(self.gs.grip_force_feedback))
-        self.sp_fbgain = QtWidgets.QDoubleSpinBox()
-        self.sp_fbgain.setRange(0.0, 1.0)
-        self.sp_fbgain.setDecimals(2)
-        self.sp_fbgain.setSingleStep(0.01)
-        self.sp_fbgain.setValue(self.gs.grip_feedback_gain_nm_per_n)
-        self.sp_fbgain.setFixedWidth(80)
-        card.add_row(self.chk_feedback, "增益", self.sp_fbgain, "Nm/N")
-        card.add(hint("从端夹得住时主端「顶手」：夹持力超过 2 N 后按增益变成阻力矩"
-                      "（SDK 封顶 1.0 Nm）。仅在 zenoh 链路可用 —— UDP 主端或老版本"
-                      "对端会自动退化为纯位置遥操。增益 0 = 关闭渲染。", "hintSubtle"))
-
         gtip = "`GripWorker` 的构造默认值 —— 本版没接到界面上，故只读"
         self.ro_rate = ro_field("—", 72, gtip)
         self.ro_kp = ro_field("—", 72, gtip)
@@ -614,8 +600,6 @@ class TeleopPage(QtWidgets.QWidget):
             w.editingFinished.connect(self.grip_settings_changed.emit)
         self.sp_gport.valueChanged.connect(self.grip_settings_changed.emit)
         self.sp_gtorque.valueChanged.connect(self.grip_settings_changed.emit)
-        self.chk_feedback.toggled.connect(self.grip_settings_changed.emit)
-        self.sp_fbgain.valueChanged.connect(self.grip_settings_changed.emit)
         self.chk_align.toggled.connect(self.grip_settings_changed.emit)
         return card
 
@@ -733,8 +717,6 @@ class TeleopPage(QtWidgets.QWidget):
             "grip_id": self.ed_grip_id.text().strip() or "gripA",
             "align": bool(self.chk_align.isChecked()),
             "torque_limit_nm": float(self.sp_gtorque.value()),
-            "force_feedback": bool(self.chk_feedback.isChecked()),
-            "feedback_gain_nm_per_n": float(self.sp_fbgain.value()),
         }
 
     def set_grip_defaults(self, rate_hz, kp, kd) -> None:
@@ -855,12 +837,10 @@ class TeleopPage(QtWidgets.QWidget):
             self.lab_grip.setText("夹爪已连接 —— 角色未定（点「启动夹爪遥操」时才定）")
             self.grip_badge.set_state("未启动", "outline")
         elif g.role == ROLE_MASTER:
-            fb = (f" · 阻力 {g.feedback_tau_nm:+.2f} Nm · 反馈 {g.feedback_force_n:.1f} N"
-                  if g.feedback_active else " · 力反馈无数据（未开/对端不发）")
             self.lab_grip.setText(
                 f"主端夹爪：零重力 · {g.topic} · 发 {g.frames_sent} 帧 · "
                 f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm · "
-                f"力 {g.force_n:.1f} N{fb} · "
+                f"力 {g.force_n:.1f} N · "
                 + ("已匹配订阅者" if g.matching else "⚠ 未匹配（发了没人在收）"))
             self.grip_badge.set_state(
                 "已匹配" if g.matching else "未匹配", "ok" if g.matching else "warn")
@@ -868,13 +848,11 @@ class TeleopPage(QtWidgets.QWidget):
             age = "—" if g.frame_age is None else f"{g.frame_age * 1000:.0f} ms"
             state = ("限力保持（力矩超限）" if g.over_torque
                      else "持位（watchdog 超时）" if g.stale else "跟随中")
-            fb = (f" · 输出力 {g.feedback_force_n:.1f} N"
-                  if g.feedback_active else "")
             self.lab_grip.setText(
                 f"从端夹爪：{state} · "
                 f"环频 {g.loop_hz:.0f} Hz · 收 {g.frames_received} 帧 · 帧龄 {age} · "
                 f"开合 {g.openness:.2f} · {g.position_mm:.1f} mm · "
-                f"力 {g.force_n:.1f} N · 力矩 {g.torque_nm:+.2f} Nm{fb}")
+                f"力 {g.force_n:.1f} N · 力矩 {g.torque_nm:+.2f} Nm")
             self.grip_badge.set_state(
                 "限力保持" if g.over_torque else "持位" if g.stale else "跟随中",
                 "warn" if g.over_torque else "warn" if g.stale else "ok")
