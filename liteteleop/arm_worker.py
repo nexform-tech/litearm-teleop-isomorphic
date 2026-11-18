@@ -73,6 +73,14 @@ MASTER_LOST_STOP_TICKS = 5
 #: 那种情况下 `enabled` 位永远停在最后一次的真值，靠它判不出来。
 MASTER_STALE_STOP_SECONDS = 0.5
 
+#: `CMD_ENABLE 0x10` 被固件拒绝时的**锁存码**：0x06 = EMERGENCY 或 `joint_fault` 非 0，
+#: 语义是「须先 RESET」，**重发无用**。恢复顺序（真机验证过）：
+#: `clear_faults()` → `reset()` → `enable()`。
+#: ⚠ 同一个 `0x06` 在运动命令上是「掉线刚性持位锁存 (`drop_hold`)」，两者判据不同
+#: —— 这里只看 ENABLE 这一档（vendored SDK 的 `CommandRejectedError.cmd/.code`）。
+ENABLE_CMD = 0x10
+ENABLE_LATCHED_CODE = 0x06
+
 
 @dataclass(frozen=True)
 class TeleopParams:
@@ -342,14 +350,71 @@ class ArmWorker:
                 self._log(f"✓ {name}已执行")
         self.post(_do)
 
+    def _enable_at_connect(self, arm) -> None:
+        """连接后的一次性使能。**失败也不拆连接**。
+
+        ⚠⚠ 2026-11-18 真机踩到的死结：臂因断整机电源锁存后，界面「重连」会在
+        连接成功的那一刻自动使能 → 固件回 `ERR[10,6]` → 旧代码把它当致命错误
+        交给 `_teardown` ⇒ 界面回到「未连接」；而「清错/复位」只在**已连接**
+        时才可点 ⇒ 用户被彻底卡死，只剩命令行能救（当天正是这么救的）。
+        所以这里把使能失败的处置降级为**日志 + 停在未使能**，连接保持不动，
+        手动恢复三键（清错/复位/使能）始终可用。
+
+        ⚠ 故意**不写** `snap.error`：它会让 `_relock` 把安全确认勾选永久摘掉，
+          而那正是用户接下来要勾的东西。状态位（flags/joint_fault）已经把
+          "为什么没使能"说清楚了。
+        """
+        try:
+            self._enable_with_recovery(arm)
+            st = arm.get_state(refresh=True).value
+            if st is None or not st.enabled or st.faulted or st.joint_fault:
+                raise RuntimeError(f"起始状态不干净: {st and st.fault_detail}")
+            self._log("已使能")
+        except Exception as e:                           # noqa: BLE001
+            self._log(f"⚠ 使能失败: {e} —— **连接保持不变**，"
+                      f"请点「清错」→「复位」→「使能」")
+
+    def _enable_with_recovery(self, arm) -> None:
+        """使能；遇到固件的**锁存**拒绝就自动 清错 → 复位 → 使能。
+
+        ⚠⚠ 为什么必须有它（2026-11-18 真机踩到）：主臂**断整机电源**之后
+        `joint_fault` 非 0、或从臂整臂掉反馈进 EMERGENCY —— 此时固件对 ENABLE
+        恒回 `ERR[10,6]「锁存, 须先 RESET」`，而界面的「使能」被安全确认勾选门控，
+        故障态下勾选又被 `_relock` 自动摘掉 ⇒ **用户既勾不上、也点不动复位**，
+        只剩"重连"，而重连又会自动使能一次、再被拒 ⇒ 死循环。
+        恢复顺序是固件定死的，照做即可。
+
+        ⚠⚠ 只在**锁存码**上自动恢复；其它错误（未连接/超时/总线不通）原样抛出
+        —— 那些不是"点两下就好"的问题，自动重试只会掩盖真相。
+        ⚠ `reset()` 会让臂**瞬间失能**（固件语义），所以这条路径只在"本来就
+        没使能"的锁存态下走；已使能的臂 `enable()` 不会回这个码。
+        """
+        try:
+            arm.enable()
+            return
+        except Exception as e:                           # noqa: BLE001
+            if (getattr(e, "cmd", None) != ENABLE_CMD
+                    or getattr(e, "code", None) != ENABLE_LATCHED_CODE):
+                raise
+            self._log("⚠ 使能被拒（锁存：EMERGENCY 或 joint_fault 非 0）"
+                      " —— 自动执行「清错 → 复位 → 使能」")
+        arm.clear_faults()
+        arm.reset()
+        arm.enable()
+        self._log("✓ 锁存已解除（清错 → 复位 → 使能）")
+
     def enable_arm(self) -> None:
         """使能全关节。
 
         ⚠ **是一条运动类动作**：臂若正被自重压着（例如刚失能过），使能瞬间会
         "弹"到保持位 —— 所以界面把它与「回零」一起按运动类门控（要勾安全确认）。
         重试策略在 SDK 里（只对固件明说可重试的码重试）。
+
+        ⚠ 卡在**锁存态**（掉电/急停之后）时，固件对 ENABLE 恒回 `ERR[10,6]`，
+        重发无用 —— 这里自动走一次 **清错 → 复位 → 使能**，让"一键使能"真的
+        能救回来。见 `_enable_with_recovery`。
         """
-        self._arm_action("使能", lambda a: a.enable())
+        self._arm_action("使能", lambda a: self._enable_with_recovery(a))
 
     def clear_faults(self) -> None:
         """清故障码（逐轴；**健康轴零触碰**）。
@@ -540,11 +605,7 @@ class ArmWorker:
             self._log(f"已连接 {self._arm.firmware!r} n={self._arm.n}")
             if self._arm.n != N_JOINTS:
                 raise RuntimeError(f"只支持 {N_JOINTS} 关节整臂，当前 n={self._arm.n}")
-            self._arm.enable()
-            st = self._arm.get_state(refresh=True).value
-            if st is None or not st.enabled or st.faulted or st.joint_fault:
-                raise RuntimeError(f"起始状态不干净: {st and st.fault_detail}")
-            self._log("已使能")
+            self._enable_at_connect(self._arm)
             self.refresh_payload()                       # 读回当前载荷（含出厂默认）
 
             while not self._stop.is_set():

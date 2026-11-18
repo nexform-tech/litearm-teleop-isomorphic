@@ -621,6 +621,98 @@ def test_a_successful_maintenance_clears_the_previous_error():
     assert w._snap.error == "", f"成功之后该清空，实际 {w._snap.error!r}"
 
 
+# ────────────── 锁存态恢复：使能 → ERR[10,6] → 清错→复位→使能 ──────────────
+
+class _Rejected(Exception):
+    """假 `CommandRejectedError` —— 判锁存只看 `.cmd` / `.code` 两个字段。"""
+
+    def __init__(self, cmd=arm_worker.ENABLE_CMD, code=arm_worker.ENABLE_LATCHED_CODE):
+        super().__init__(f"enable 被固件拒绝: ERR [{cmd:02x},{code}]")
+        self.cmd = cmd
+        self.code = code
+
+
+class _LatchedArm:
+    """真机复现的形态：锁存期间 `enable` 恒拒；`reset` 之后才放行。"""
+
+    def __init__(self, latched=True, recovery_works=True):
+        self.latched = latched
+        self.recovery_works = recovery_works
+        self.calls = []
+
+    def get_state(self, refresh=False):
+        st = type("S", (), {"enabled": not self.latched,
+                            "faulted": self.latched,
+                            "joint_fault": 1 if self.latched else 0,
+                            "fault_detail": "锁存"})()
+        return type("M", (), {"value": st})()
+
+    def enable(self):
+        self.calls.append("enable")
+        if self.latched:
+            raise _Rejected()
+
+    def clear_faults(self):
+        self.calls.append("clear_faults")
+
+    def reset(self):
+        self.calls.append("reset")
+        if self.recovery_works:
+            self.latched = False
+
+
+def test_enable_recovers_from_a_firmware_latch():
+    """⚠⚠ 断整机电源之后 `enable` 恒回 `ERR[10,6]` —— 必须自动走完恢复顺序。
+
+    判别力：把 `_enable_with_recovery` 里的三步删掉，本用例会红。
+    """
+    logs = []
+    w = ArmWorker(on_log=logs.append)
+    w._arm = _LatchedArm()
+    w.enable_arm()
+    _drain_once(w)
+    assert w._arm.calls == ["enable", "clear_faults", "reset", "enable"], w._arm.calls
+    assert any("锁存已解除" in x for x in logs), logs
+    assert w._snap.error == "", "自动恢复成功就不该留错误，实际 " + repr(w._snap.error)
+
+
+def test_enable_does_not_mask_other_failures():
+    """非锁存错误（总线/超时）**原样报错**，不许拿 清错/复位 瞎重试。"""
+    w = ArmWorker()
+    arm = _MaintArm(boom="enable")
+    w._arm = arm
+    w.enable_arm()
+    _drain_once(w)
+    assert w._arm.calls == ["enable"], w._arm.calls
+    assert "使能失败" in w._snap.error and "炸了" in w._snap.error, w._snap.error
+
+
+def test_connect_keeps_the_link_when_enable_fails():
+    """⚠⚠ 连接时的自动使能失败**不得拆连接** —— 否则界面未连接 ⇒ 复位键灰掉 ⇒
+    用户被卡死（2026-11-18 真机就是靠命令行才救回来的）。
+
+    判别力：把这个异常放出去让 `_run` 走 `_teardown`，本用例会红。
+    """
+    logs = []
+    w = ArmWorker(on_log=logs.append)
+    arm = _LatchedArm(recovery_works=False)      # 连自动恢复都救不回来
+    w._arm = arm
+    w._enable_at_connect(arm)                    # 不许抛
+    assert any("连接保持不变" in x for x in logs), logs
+    assert w._snap.error == "", "别写 error —— 它会把安全确认勾选永久摘掉"
+
+
+def test_connect_enable_success_under_the_normal_path():
+    """没锁存的臂：只发一次 ENABLE，日志「已使能」。"""
+    logs = []
+    w = ArmWorker(on_log=logs.append)
+    arm = _LatchedArm(latched=False)
+    w._arm = arm
+    w._enable_at_connect(arm)
+    assert arm.calls == ["enable"], arm.calls
+    assert any("已使能" in x for x in logs), logs
+
+
 def test_maintenance_on_a_missing_arm_says_so():
     """没连接时要说一声，不是静默 no-op。
 

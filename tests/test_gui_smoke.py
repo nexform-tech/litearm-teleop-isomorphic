@@ -448,6 +448,41 @@ def test_connect_and_disconnect_are_mutually_exclusive(qapp):
     w.close()
 
 
+def test_dead_worker_is_reaped_so_connect_comes_back(qapp):
+    """⚠⚠ 连接失败（口不存在/被占用）之后，**线程已经死了但 `worker` 还在**。
+
+    旧行为：快照只靠状态帧推送更新，而失败路径**一帧都没有** ⇒ 界面停在旧快照
+    ⇒「连接臂」一直灰着，用户必须先去点一次「断开」才能重连（2026-11-18 真机
+    就是这么被卡住的：上位机先启动、臂后插，第一次打开必然失败）。
+
+    判别力：把 `_poll_worker` 里那段"线程没了就解除"删掉，本用例会红。
+    """
+    w = MainWindow(Settings())
+    w._on_state(_snap())
+
+    class _Dead:
+        """线程已收尾的 worker —— 只有界面用到的那几个口。"""
+        def shutdown(self, timeout=8.0):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def snapshot(self):
+            return Snapshot()
+
+    w.worker = _Dead()          # type: ignore[assignment]
+    w._relock()
+    assert not w.page.btn_connect.isEnabled(), "worker 还在时不许再开一个"
+
+    w._poll_worker()            # 心跳一拍：发现线程已经没了
+
+    assert w.worker is None, "死掉的 worker 必须丢掉"
+    assert w.page.btn_connect.isEnabled(), "解除之后「连接臂」必须立刻可点"
+    assert not w.page.btn_disconnect.isEnabled(), "没什么可断的了"
+    w.close()
+
+
 def test_disconnect_hands_over_and_never_disables(qapp):
     """⚠⚠ 断开 = 停遥操 → 受控接管 movej → 关 zenoh → 关臂，**绝不失能**。
 
