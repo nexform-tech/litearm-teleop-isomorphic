@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 from . import link, servo, wire
+from .record import from_env as _recorders_from_env
 from .settings import DEFAULT_PEER
 from .wall import JointLimitWall
 from .safety import clamp_to_limits, read_safe_limits
@@ -243,6 +244,8 @@ class ArmWorker:
         self._link_n = 0
         self._link_t0 = 0.0
         self._link_hz = 0.0
+        # 诊断记录器（`LITEARM_RECORD_DIR` 未设置时是 None，调用点全部短路）
+        self._rec = _recorders_from_env()
 
     # ────────────────────────── 生命周期 ──────────────────────────
     def start(self) -> None:
@@ -268,6 +271,16 @@ class ArmWorker:
             t.join(timeout=timeout)
             if t.is_alive():
                 self._log("⚠ ArmWorker 未在超时内退出")
+        self._close_recorders()
+
+    def _close_recorders(self) -> None:
+        rec, self._rec = self._rec, None
+        if rec:
+            for r in rec.values():
+                try:
+                    r.close()
+                except Exception:                        # noqa: BLE001 - 收尾不抛
+                    pass
 
     # ────────────────────────── GUI 用的投递口 ──────────────────────────
     def post(self, fn: Callable[[], None]) -> None:
@@ -559,7 +572,7 @@ class ArmWorker:
         self._link_hz = 0.0
 
     def _push(self, st) -> None:
-        """在 **SDK 读线程**上被调用 ⇒ 只写槽，不做别的。"""
+        """在 **SDK 读线程**上被调用 ⇒ 只写槽；诊断记录是可选、纯文件写入。"""
         self._state_tick()
         with self._lock:
             s = self._snap
@@ -576,6 +589,19 @@ class ArmWorker:
             s.flags = st.flags
             s.flag_names = list(st.flag_names)
             s.seq = st.seq
+        if self._rec:
+            try:
+                # tau / tmos 与 q / dq 同帧，列数固定 7 —— 短了补 nan，别让后面的
+                # 身份列整体错位（CSV 错位是静默的，读回时才会发现对不上）。
+                _tau = [float(v) for v in st.tau][:7]
+                _tmos = [float(j.t_mos) for j in st.joints][:7]
+                _tau += [float("nan")] * (7 - len(_tau))
+                _tmos += [float("nan")] * (7 - len(_tmos))
+                self._rec["state"].row(
+                    [*st.q, *st.dq, *_tau, *_tmos, int(st.enabled), int(st.flags),
+                     int(st.joint_fault), int(getattr(st, "seq", -1))])
+            except Exception:                            # noqa: BLE001 - 记录不参与控制
+                pass
         if self._on_state is not None:
             try:
                 self._on_state(self.snapshot())
@@ -812,6 +838,11 @@ class ArmWorker:
                 pub.put(wire.encode_teleop(st.q, st.dq, now))
                 self._frames_sent += 1
                 self._link_tick()                        # 统计**发布**速率
+                if self._rec:
+                    try:
+                        self._rec["pub"].row([*st.q, *st.dq])
+                    except Exception:                    # noqa: BLE001 - 记录不参与控制
+                        pass
             self._drain(0.0)                             # 顺手处理 GUI 投来的命令
             r = nxt - time.monotonic()
             if r > 0:
@@ -892,6 +923,12 @@ class ArmWorker:
             dq = list(frame["dq"])
             if not all(math.isfinite(v) for v in dq):
                 dq = [0.0] * N_JOINTS
+            if self._rec:
+                try:
+                    self._rec["rx"].row(
+                        [float(frame["timestamp"]), *frame["q"], *frame["dq"]])
+                except Exception:                        # noqa: BLE001 - 记录不参与控制
+                    pass
             return clamped, dq
 
         def should_stop() -> bool:
@@ -906,8 +943,15 @@ class ArmWorker:
             self._drain(0.0)
             return False
 
+        on_tick = None
+        if self._rec:
+            rec_loop = self._rec["loop"]
+
+            def on_tick(t, q_cmd, dq_cmd, q_meas, dq_meas):   # noqa: E306 - 闭包
+                rec_loop.row([*q_cmd, *dq_cmd, *q_meas, *dq_meas], t=t)
+
         servo.follow(arm, provider, should_stop=should_stop, hz=SLAVE_HZ, wall=wall,
-                     speed_limit=sl)
+                     speed_limit=sl, on_tick=on_tick)
 
     def _peer_host(self) -> str:
         # 保留给测试/调试：真源已挪到 `TeleopParams.peer_host()`

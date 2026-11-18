@@ -682,6 +682,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
            engage_sec: float = DEFAULT_ENGAGE_SEC, hz: float = DEFAULT_HZ,
            should_stop: Callable[[], bool] = lambda: False,
            duration_s: Optional[float] = None, wall=None,
+           on_tick: Optional[Callable] = None,
            filter_mode: Optional[str] = None,
            catchup_speed: Optional[float] = CATCHUP_SPEED) -> bool:
     """从臂跟随环 —— 执行器与增益照搬 `joint_follow`，**参考生成改为直通 + 硬限速**。
@@ -713,6 +714,9 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
 
     ⚠ 节拍当前是 **250 Hz**（`DEFAULT_HZ`）。S4 起每拍只 1 次往返 ⇒ **硬件上能到 ~300 Hz**；
     250 是**主动选的保守值**，不是上限 —— 见 `DEFAULT_HZ` 的注释。
+
+    `on_tick(t, q_cmd, dq_cmd, q_meas, dq_meas)` 是可选的**诊断回调**（CSV 记录用），
+    每拍调用一次；它**不参与控制律**，抛错只记日志。
 
     ## 指令重建低通（2026-11-18 实测后加入）
 
@@ -919,6 +923,15 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                         ("  ⚠ 超速轴: " + "、".join(_over)) if _over else "",
                         [round(v, 3) for v in _snap.q])
                     _prev_fw = _cur
+
+            if on_tick is not None:
+                try:
+                    q_m = list(_snap.q) if _snap is not None else []
+                    dq_m = list(_snap.dq) if _snap is not None else []
+                    if len(q_m) == N_JOINTS and len(dq_m) == N_JOINTS:
+                        on_tick(time.time(), list(q_cmd), list(dq_cmd), q_m, dq_m)
+                except Exception:                    # noqa: BLE001 - 诊断不参与控制
+                    log.exception("on_tick 诊断回调异常（不影响跟随）")
 
             # 单拍**净**耗时（算到 sleep 之前 ⇒ 不含主动等待的那段）
             _work_s += time.monotonic() - _t_work0

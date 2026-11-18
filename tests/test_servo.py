@@ -358,6 +358,30 @@ def test_follow_hybrid_smooths_the_wrist_staircase():
     assert abs(end_hy - raw_end) < 0.0015
 
 
+def test_follow_calls_the_optional_tick_recorder():
+    """`on_tick` 每拍拿到 `(t, q_cmd, dq_cmd, q_meas, dq_meas)`，且不改变下发值。"""
+    arm = FakeArm()
+    seen = []
+
+    def on_tick(t, q_cmd, dq_cmd, q_meas, dq_meas):
+        seen.append((t, list(q_cmd), list(dq_cmd), list(q_meas), list(dq_meas)))
+
+    n = {"i": 0}
+
+    def stop():
+        n["i"] += 1
+        return n["i"] > 5
+
+    servo.follow(arm, lambda: [0.05] * N_JOINTS, should_stop=stop,
+                 engage_sec=0.0, hz=100.0, on_tick=on_tick)
+    # 第 1 次是 prime（循环外），之后每拍一次
+    assert len(seen) == len(arm.mit_calls) - 1
+    for t, q_cmd, dq_cmd, q_meas, dq_meas in seen:
+        assert t > 0
+        assert len(q_cmd) == len(dq_cmd) == len(q_meas) == len(dq_meas) == N_JOINTS
+        assert all(math.isfinite(v) for v in q_cmd + dq_cmd)
+
+
 def test_follow_catchup_limits_the_initial_swing():
     """对齐后主臂已走远时，起步先按 `catchup_speed` 追，不用正常 speed_limit 甩过去。
 
