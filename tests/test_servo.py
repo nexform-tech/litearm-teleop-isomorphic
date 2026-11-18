@@ -566,7 +566,7 @@ def test_align_failure_is_not_fatal():
                                  timeout=0.5) is None
 
 
-def test_align_warns_but_still_moves_on_a_large_slew(caplog):
+def test_align_warns_but_still_moves_on_a_large_slew(caplog, capsys):
     """⚠ 大位移**只预警、照样对齐**（用户裁决 2026-09-28：超时 3 s → 30 s）。
 
     30 s 在 J1 上约能走 9 rad ⇒ **限位内任何位移都够**，再"拒绝启动"就没意义了。
@@ -582,7 +582,12 @@ def test_align_warns_but_still_moves_on_a_large_slew(caplog):
         got = servo.align_to_master(arm, lambda: (payload, 0.0), _limits(), timeout=0.5)
     assert got is not None, "不该拒绝"
     assert arm.movej_calls, "应当**照样**执行 movej（只是先预警）"
-    assert any("偏大" in r.message for r in caplog.records), "大位移没预警"
+    # ⚠ 两种出口都认：正常环境下 caplog 能抓到记录；本机 pytest 6.2.5 的 caplog
+    #   不挂 handler，记录改走 `logging.lastResort` 进 stderr（最小用例即可复现）。
+    #   断言仍然是"预警必须出现"，只是不绑定到哪一种捕获方式。
+    err = capsys.readouterr().err
+    assert any("偏大" in r.message for r in caplog.records) or "偏大" in err, \
+        "大位移没预警"
 
 
 # ────────────────────────── 末端载荷（夹爪）──────────────────────────
