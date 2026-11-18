@@ -100,7 +100,8 @@ Why: the leader's ~98.5 Hz frames are held on the follower's 250 Hz loop, creati
 The 20 Hz path cuts that energy about 10x.
 The wrist One-Euro additionally cuts the 6–10 Hz jitter; `LITEARM_OE_KNEE=6` keeps that smoothing up to 6 rad/s and only opens above it.
 
-`LITEARM_J5_LP_HZ` addresses the fast-motion 10–45 Hz residue the One-Euro passes once its cutoff opens. On the same recorded trajectories, `12` lowers J5's 10–20 Hz command content from 1.69 to 1.04 mrad and 20–45 Hz from 1.23 to 0.23 mrad, with no slow-speed penalty.
+`LITEARM_J5_LP_HZ` addresses the fast-motion 10–45 Hz residue the One-Euro passes once its cutoff opens.
+On the same recorded trajectories, `12` lowers J5's 10–20 Hz command content from 1.69 to 1.04 mrad and 20–45 Hz from 1.23 to 0.23 mrad, with no slow-speed penalty.
 Do not replace it with a speed-scheduled switch or crossfade between the two filters: their phase differs, and blending raises the 6–10 Hz content from 3.04 to 8.16 mrad.
 
 Do not set `off` for normal use. Do not lower `LITEARM_OE_MIN_HZ` below 1.5 Hz without checking the added wrist lag.
