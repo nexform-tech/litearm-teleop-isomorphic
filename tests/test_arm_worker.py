@@ -183,17 +183,14 @@ def test_snapshot_role_is_undetermined_until_teleop_starts():
     assert w.snapshot().role == ROLE_SLAVE
 
 
-def test_master_pub_is_resident_but_rebuilt_when_params_change(monkeypatch):
-    """⚠⚠ 主臂的发布端**建一次、活一个进程**（跨遥操会话不重建），
-    但 `arm_id` / 端口是**遥操参数** ⇒ 它们变了必须重建。
+def test_master_pub_is_reused_within_a_session_and_rebuilt_on_param_change(monkeypatch):
+    """端口/arm_id 是**遥操参数** ⇒ 变了必须重建，并把旧的关掉。
 
-    ⚠ 为什么必须常驻：每轮遥操拆了重建有**两个**实测过的后果 ——
-    ① 停下时没人关 ⇒ 端口不释放 ⇒ 第二次「启动」报 `Address already in use`
-    （表现：**只能启动一次**）；② 就算补上关闭，同端口拆了重建会让匹配
-    **间歇性**建立不起来（实测 12 轮里 5 轮 `matching=False`）。
+    ⚠ 端点现在是**每会话**建/关（见 `_ensure_pub` 的 docstring 与
+    下一条 `test_ending_teleop_releases_the_master_port`）；本用例只钉住
+    "同一会话里不该反复建"与"参数变了必须换"。
 
-    判别力：改回"每轮新建"⇒ 前两条断言红；去掉 `_pub_meta` 比较 ⇒
-    最后那条「换了 arm_id 还复用旧端点」的断言红。
+    判别力：去掉 `_pub_meta` 比较 ⇒ 最后那条「换了 arm_id 还复用旧端点」的断言红。
     """
     made = []
 
@@ -224,6 +221,45 @@ def test_master_pub_is_resident_but_rebuilt_when_params_change(monkeypatch):
 
     w._close_pub()
     assert c.closed
+
+
+def test_ending_teleop_releases_the_master_port(monkeypatch):
+    """⚠⚠ 结束遥操必须**关掉监听端**，把端口还回去。
+
+    真机场景（2026-11-18）：两个窗口想对调主从角色 —— A 原来是主臂，占着 17445；
+    B 要改成主臂。A 只点「结束遥操」时旧实现**不关**监听端 ⇒ B 启动时报
+    `Can not create a new TCP listener ... 地址已在使用` ⇒ 只能断开 A 的臂
+    （`_teardown` 才会 `_close_pub`）再重连。
+
+    判别力：把 `_run_teleop` finally 里那句 `_close_pub()` 删掉，本用例会红。
+    """
+    class _FakePub:
+        matching = False
+
+        def __init__(self):
+            self.closed = False
+
+        def put(self, _b):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    w = ArmWorker()
+    pub = _FakePub()
+
+    def _fake_ensure(_p):
+        w._pub, w._pub_meta = pub, ("litearm/v4/armA/teleop", 17447)
+        return pub
+
+    monkeypatch.setattr(w, "_ensure_pub", _fake_ensure)
+    # 会话：拿到监听端就立刻结束（模拟用户点「结束遥操」）
+    monkeypatch.setattr(w, "_run_master", lambda p: w._ensure_pub(p))
+    w._params = TeleopParams(ROLE_MASTER, arm_id="armA", jport=17447)
+    w._teleop_want = True
+    w._run_teleop()
+    assert pub.closed, "结束遥操没关监听端 ⇒ 端口一直被占着"
+    assert w._pub is None, "关掉之后不能再拿着引用"
 
 
 class _TimeShim:

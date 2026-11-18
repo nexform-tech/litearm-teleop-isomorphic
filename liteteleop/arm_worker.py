@@ -81,6 +81,11 @@ MASTER_STALE_STOP_SECONDS = 0.5
 ENABLE_CMD = 0x10
 ENABLE_LATCHED_CODE = 0x06
 
+#: 主臂监听端建好之后，多久还没有订阅者（从臂）匹配上来就告警一次（秒）。
+#: ⚠ 这是给"拆了重建偶尔匹配不上"（实测 12 轮里 5 轮）兜底的**告警**，不是重试：
+#: 真赶上就停一次再启动遥操，会换一个全新的监听端 —— 不用重连臂。
+MATCH_WARN_SECONDS = 3.0
+
 
 @dataclass(frozen=True)
 class TeleopParams:
@@ -650,24 +655,34 @@ class ArmWorker:
     # ────────────────────────── zenoh 端点 ──────────────────────────
 
     def _ensure_pub(self, p: TeleopParams):
-        """主臂的发布端：**建一次、活一个进程**（跨遥操会话不重建）。
+        """主臂的发布端：**按会话**建，`_run_teleop` 收尾时 `_close_pub`。
 
-        ⚠⚠ 实测过两个坑，都出在"每轮遥操拆了重建"上：
-        ① 遥操停下时没人关 ⇒ TCP 端口一直被这个对象引用着 ⇒ 第二次「启动」抛
+        ⚠⚠ 历史（2026-09 的实测，仍然成立，别当成"现在已经没这回事"）：
+        ① 遥操停下时**不关** ⇒ TCP 端口一直被这个对象引用着 ⇒ 第二次「启动」抛
            `Can not create a new TCP listener bound to ...: Address already in use`，
-           **而且端口要等进程退出才回来**（表现：**只能启动一次**）；
-        ② 就算补上关闭，**同一端口上拆了重建**会让订阅↔发布的匹配**间歇性**
-           建立不起来（实测 12 轮里 5 轮 `matching=False`）。
-        参考实现也是这个形态：主臂发在**常驻** transport 上。
+           而且端口要等**进程退出**才回来（表现：只能启动一次）；
+        ② **同一端口上拆了重建**会让订阅↔发布的匹配**间歇性**建立不起来
+           （实测 12 轮里 5 轮 `matching=False`）。
 
-        ⚠ 但 `arm_id` / 端口是**遥操参数**（用户随时可改）⇒ 参数变了必须重建。
-        所以比 `_pub_meta` 决定复用还是重建。
+        早先因此把它做成"常驻一个进程"，代价是**端口永远不释放** ⇒ 两个窗口
+        想对调主从角色时，后来那个绑不上 17445，只能断开臂重连（2026-11-18 用户
+        报的就是这个）。现在改成**每会话建/关**：① 用"关"解决，② 用
+        `_run_master` 里的匹配告警兜住 —— 真赶上那 5/12，停一次再启动遥操
+        就能换一个全新的监听端（**不用重连臂**）。
         """
         meta = (p.key, int(p.jport))
         if self._pub is not None and self._pub_meta == meta:
             return self._pub
         self._close_pub()
-        self._pub = link.Listener(p.jport, p.key)
+        try:
+            self._pub = link.Listener(p.jport, p.key)
+        except Exception as e:                           # noqa: BLE001
+            # ⚠ 端口被占时的原始报错长这样（zenoh 原文）：
+            #   `Can not create a new TCP listener bound to tcp/0.0.0.0:17445: 地址已在使用`
+            #   ⇒ 用户只知道"启动失败"。这里补一句"谁占着"的提示。
+            raise RuntimeError(
+                f"主臂监听端口 {p.jport} 建不起来（另一个窗口/进程还占着它？"
+                f"先让那边点「结束遥操」再试）：{e}") from e
         self._pub_meta = meta
         return self._pub
 
@@ -718,8 +733,12 @@ class ArmWorker:
         finally:
             self._teleop_want = False
             self._link_reset()                           # 停了就该显示 `—`，不留旧数
-            # ⚠ 从臂的订阅是**每会话**建的 ⇒ 停遥操就得关（否则连接/端口不释放）
+            # ⚠ 两端的 zenoh 端点都是**每会话**建的 ⇒ 停遥操就得关：
+            #   · 从臂的 Connector 不 bind，关它是为了别留一条连出去的连接；
+            #   · 主臂的 Listener **bind** 着端口 —— 不关就永远占着 17445，
+            #     另一边的窗口想当主臂只能先断开臂再连（2026-11-18 用户报的坑）。
             self._close_sub()
+            self._close_pub()
             try:
                 servo.hold_at_current(self._arm)         # 受控接管
             except Exception as e:                       # noqa: BLE001
@@ -741,9 +760,24 @@ class ArmWorker:
         last_seq_t = time.monotonic()
         seq_seen = False
         stop_reason = None
+        unmatched_since = None
+        match_warned = False
         while self._teleop_want and not self._stop.is_set():
             st = arm.get_state(refresh=False).value
             now = time.monotonic()
+            # ── 匹配告警（不是重试）：绑上了端口但一直没有订阅者 ──
+            # ⚠ "拆了重建偶尔匹配不上"是测过的既有现象；现在监听端每会话重建
+            #   ⇒ 告警里给出**不用重连臂**的出路（停一次再启动）。
+            if getattr(pub, "matching", True):
+                unmatched_since = None
+                match_warned = False
+            elif unmatched_since is None:
+                unmatched_since = now
+            elif not match_warned and now - unmatched_since > MATCH_WARN_SECONDS:
+                match_warned = True
+                self._log(f"⚠ 端口 {p.jport} 已监听，但 {MATCH_WARN_SECONDS:.0f} s 内没有"
+                          f"从臂匹配上来 —— 若从臂已在跑，点一次「结束遥操」再「启动遥操」"
+                          f"重建监听端（不用重连臂）")
             if st is not None:
                 # ── 主臂自身失能/故障 ⇒ **立即结束遥操**（不再发帧）──
                 # 场景（2026-11-18 真机）：主臂掉电/急停后臂软掉，旧实现仍按缓存
