@@ -62,6 +62,17 @@ ALIGN_MOVE_TIMEOUT = 30.0
 #: 从臂 watchdog（照搬 `TeleopManager.watchdog_ms` 默认值）。**收到首帧之后才生效。**
 WATCHDOG_MS = 200.0
 
+#: 主臂自身失能/故障持续多少拍就**结束遥操**（200 Hz ⇒ 5 拍 = 25 ms）。
+#: 去抖是为了不被单帧瞬态（USB 抖动/CMODE 切换）误停；真正的掉电/急停
+#: 会让固件在 80–200 ms 内进入 EMERGENCY，远长于这个窗口。
+MASTER_LOST_STOP_TICKS = 5
+
+#: 主臂状态流静默多久就结束遥操（秒）。
+#: ⚠ 与从臂的 `WATCHDOG_MS` 是**两回事**：这里防的是"主臂 MCU 也没了"
+#: （USB 掉线时 `get_state(refresh=False)` 会一直返回最后一帧缓存，`seq` 不再前进），
+#: 那种情况下 `enabled` 位永远停在最后一次的真值，靠它判不出来。
+MASTER_STALE_STOP_SECONDS = 0.5
+
 
 @dataclass(frozen=True)
 class TeleopParams:
@@ -664,10 +675,45 @@ class ArmWorker:
         time.sleep(0.5)                                  # 等过 engage 段
         dt = 1.0 / PUB_HZ
         nxt = time.monotonic() + dt
+        lost_ticks = 0
+        last_seq = None
+        last_seq_t = time.monotonic()
+        seq_seen = False
+        stop_reason = None
         while self._teleop_want and not self._stop.is_set():
             st = arm.get_state(refresh=False).value
+            now = time.monotonic()
             if st is not None:
-                pub.put(wire.encode_teleop(st.q, st.dq, time.monotonic()))
+                # ── 主臂自身失能/故障 ⇒ **立即结束遥操**（不再发帧）──
+                # 场景（2026-11-18 真机）：主臂掉电/急停后臂软掉，旧实现仍按缓存
+                # 的 q 继续发帧 —— 从臂跟着一条下坠的臂走；重新上电后主臂 q 跳回，
+                # 从臂再朝它快速甩过去。停流后，从臂的 200 ms 看门狗会结束跟随
+                # 并 `hold_at_current` 持位。
+                # ⚠ `enabled` 是 flags bit9（固件 1.5.0 起上报）；旧固件恒 False，
+                #   用旧固件时本判据会立刻结束遥操 —— 这是刻意的：来源不可信就不跑。
+                seq = getattr(st, "seq", None)
+                if seq is not None:
+                    seq_seen = True
+                    if seq != last_seq:
+                        last_seq = seq
+                        last_seq_t = now
+                if not (getattr(st, "enabled", True) and
+                        not getattr(st, "faulted", False)):
+                    lost_ticks += 1
+                    if lost_ticks >= MASTER_LOST_STOP_TICKS:
+                        stop_reason = (f"主臂失能/故障（flags=0x{getattr(st, 'flags', 0):04x}"
+                                       f" joint_fault=0x{getattr(st, 'joint_fault', 0):04x}）")
+                        break
+                else:
+                    lost_ticks = 0
+            # ── 状态流静默（主臂 MCU 也没了）：缓存里的 enabled 永远是最后一次的真值 ──
+            # ⚠ 只有 SDK 真提供了 `seq`（现状如此）才判；没有 `seq` 的假臂/旧 SDK
+            #   不享受这条，也就不会因为"看不见帧序"被误停。
+            if seq_seen and now - last_seq_t > MASTER_STALE_STOP_SECONDS:
+                stop_reason = (f"主臂状态流 {MASTER_STALE_STOP_SECONDS:.1f} s 没有新帧")
+                break
+            if st is not None:
+                pub.put(wire.encode_teleop(st.q, st.dq, now))
                 self._frames_sent += 1
                 self._link_tick()                        # 统计**发布**速率
             self._drain(0.0)                             # 顺手处理 GUI 投来的命令
@@ -677,6 +723,9 @@ class ArmWorker:
             nxt += dt
             if nxt < time.monotonic():
                 nxt = time.monotonic() + dt
+        if stop_reason is not None:
+            self._log(f"⛔ {stop_reason} —— 结束遥操（从臂将由 {WATCHDOG_MS:.0f} ms "
+                      f"看门狗持位）")
         try:
             arm.zero_g_stop()
         except Exception as e:                           # noqa: BLE001

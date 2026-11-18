@@ -340,6 +340,87 @@ def test_master_loop_reports_a_publish_rate():
         w._close_pub()
 
 
+def _run_master_with_fake_arm(monkeypatch, st_factory, seconds=3.0):
+    """跑一次 `_run_master`，返回 (耗时, 日志, 发出的帧数)。
+
+    ⚠ 不建真 zenoh：把 `_ensure_pub` 换成一个只数数的假发布端。判据只关心
+    "主臂失能/断流后循环会不会自己退出"，与链路无关。
+    """
+    logs = []
+
+    class _Pub:
+        def __init__(self):
+            self.n = 0
+
+        def put(self, _payload):
+            self.n += 1
+
+    class _Arm:
+        def zero_g_start(self):
+            pass
+
+        def zero_g_stop(self):
+            pass
+
+        def get_state(self, refresh=False):
+            class _R:
+                value = st_factory()
+
+            return _R()
+
+    w = ArmWorker(on_log=logs.append)
+    w._arm = _Arm()
+    pub = _Pub()
+    w._ensure_pub = lambda _p: pub
+    p = TeleopParams(ROLE_MASTER, jport=17447)
+    w._teleop_want = True
+    t0 = time.monotonic()
+    w._run_master(p)
+    return time.monotonic() - t0, logs, pub.n
+
+
+def test_master_loop_ends_when_master_arm_loses_enable():
+    """⛔ 主臂失能/故障 ⇒ 主臂侧**立即结束遥操**（不再发帧）。
+
+    场景：主臂掉电/急停后臂软掉。旧实现按缓存 q 继续发 —— 从臂跟着下坠的臂走，
+    重新上电还会朝跳回去的 q 甩过去。停流后从臂由 200 ms 看门狗持位。
+    判别力：去掉 `_run_master` 里的失能判据时，本用例会跑满 `_teleop_want`
+    （不会自己退出）而失败。
+    """
+    ticks = {"n": 0}
+
+    def _st():
+        ticks["n"] += 1
+        s = _FakeState([0.0] * 7)
+        s.seq = ticks["n"]
+        s.enabled = ticks["n"] <= 20          # 0.1 s 后"掉电"
+        s.faulted = not s.enabled
+        s.flags = 0x0240 if s.enabled else 0x0185
+        s.joint_fault = 0 if s.enabled else 0x007F
+        return s
+
+    elapsed, logs, sent = _run_master_with_fake_arm(None, _st)
+    assert elapsed < 2.5, f"主臂失能后循环没有退出：{elapsed:.2f}s"
+    assert any("结束遥操" in m for m in logs), f"没有说明为什么结束：{logs}"
+    assert sent >= 10, f"失能前应该已经发过帧：{sent}"
+
+
+def test_master_loop_ends_when_status_stream_goes_silent():
+    """主臂 MCU 也掉（USB 断）时 `seq` 不再前进 ⇒ 同样结束遥操。
+
+    ⚠ 这条与 `enabled` 判据是**两回事**：链路死掉时缓存里的 `enabled`
+    永远停在最后一次的真值（True），只看它永远判不出来。
+    """
+    def _st():
+        s = _FakeState([0.0] * 7)
+        s.seq = 7                              # 冻结
+        return s
+
+    elapsed, logs, _sent = _run_master_with_fake_arm(None, _st)
+    assert elapsed < 2.5, f"状态流静默后循环没有退出：{elapsed:.2f}s"
+    assert any("没有新帧" in m for m in logs), f"没有报告断流：{logs}"
+
+
 def test_starting_teleop_requires_params():
     """启动遥操**必须**给 params（角色/arm_id/peer/端口都在里面）。
 
