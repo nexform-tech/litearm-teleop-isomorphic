@@ -17,6 +17,18 @@ from liteteleop import servo
 from liteteleop.wire import N_JOINTS
 
 
+def _tone_amp(values, times, freq):
+    """单频幅度：投影到 sin/cos 基（窗口含整数周期时就是幅度）。
+
+    ⚠ 不用 numpy —— CI 只装 pytest + zenoh + pyserial，而 `servo` 本身也刻意
+    不依赖 numpy/scipy（`_LowPass2` 是手写的双二次）。
+    """
+    n = len(values)
+    re = sum(v * math.cos(2 * math.pi * freq * t) for v, t in zip(values, times))
+    im = sum(v * math.sin(2 * math.pi * freq * t) for v, t in zip(values, times))
+    return 2.0 * math.hypot(re, im) / n
+
+
 class _JP:
     """`JointParam` 的最小替身。"""
 
@@ -238,30 +250,28 @@ def test_j5_extra_lp_env_and_label(monkeypatch):
 
 def test_hybrid_j5_extra_lp_only_touches_j5():
     """J5 的追加二阶低通只作用在 J5：6/10 的响应保持不变，J5 的 20 Hz 被压下去。"""
-    import numpy as np
     fs, dt = 250.0, 1.0 / 250.0
     n = int(fs * 2)
-    t = np.arange(n) * dt
-    x = np.sin(2 * np.pi * 20.0 * t)
+    ts = [k * dt for k in range(n)]
+    x = [math.sin(2 * math.pi * 20.0 * t) for t in ts]
     base = servo._HybridFilter(20.0, fs, (2.0, 5.0, 25.0, 0.0))
     extra = servo._HybridFilter(20.0, fs, (2.0, 5.0, 25.0, 0.0), j5_lp_hz=12.0)
-    yb, ye = [], []
+    yb4, ye4, yb5, ye5 = [], [], [], []
     for k in range(n):
         row = [x[k]] * 7
         spd = [0.0] * 7
-        yb.append(base.process(row, spd))
-        ye.append(extra.process(row, spd))
-    yb, ye = np.array(yb), np.array(ye)
-    seg = slice(n // 2, None)
+        b, e = base.process(row, spd), extra.process(row, spd)
+        yb4.append(b[4])
+        ye4.append(e[4])
+        yb5.append(b[5])
+        ye5.append(e[5])
+    seg, tt = int(fs), ts[int(fs):]
 
     def amp(v):
-        X = np.vstack([np.sin(2 * np.pi * 20.0 * t[seg]),
-                       np.cos(2 * np.pi * 20.0 * t[seg])]).T
-        co, *_ = np.linalg.lstsq(X, v[seg], rcond=None)
-        return float(np.hypot(*co))
+        return _tone_amp(v[seg:], tt, 20.0)
 
-    assert amp(ye[:, 4]) < 0.5 * amp(yb[:, 4]), "J5 的 20 Hz 应被追加低通压掉一半以上"
-    assert abs(amp(ye[:, 5]) - amp(yb[:, 5])) < 1e-9, "J6 不应受 J5 的追加低通影响"
+    assert amp(ye4) < 0.5 * amp(yb4), "J5 的 20 Hz 应被追加低通压掉一半以上"
+    assert abs(amp(ye5) - amp(yb5)) < 1e-9, "J6 不应受 J5 的追加低通影响"
 
 
 def test_j5_lp_only_env_and_label(monkeypatch):
@@ -286,18 +296,19 @@ def test_hybrid_j5_lp_only_routes_j5_through_the_second_order_path():
 
     判别力：去掉 `j5_lp_only` 分支，J5 走 OE，和 J1 的差异会远大于浮点误差。
     """
-    import numpy as np
     fs, dt = 250.0, 1.0 / 250.0
     n = int(fs * 2)
-    t = np.arange(n) * dt
-    x = np.sin(2 * np.pi * 8.0 * t) * 0.5
+    ts = [k * dt for k in range(n)]
+    x = [math.sin(2 * math.pi * 8.0 * t) * 0.5 for t in ts]
     f = servo._HybridFilter(20.0, fs, (2.0, 5.0, 12.0, 0.0), j5_lp_only=True)
-    y = np.array([f.process([x[k]] * 7, [2.0] * 7) for k in range(n)])
-    seg = slice(n // 2, None)
-    assert np.max(np.abs(y[seg, 4] - y[seg, 0])) < 1e-12, "J5 应与 J1 走同一条二阶路径"
+    y = [f.process([x[k]] * 7, [2.0] * 7) for k in range(n)]
+    seg = range(int(fs), n)
+    d_only = max(abs(y[k][4] - y[k][0]) for k in seg)
+    assert d_only < 1e-12, "J5 应与 J1 走同一条二阶路径"
     g = servo._HybridFilter(20.0, fs, (2.0, 5.0, 12.0, 0.0))
-    z = np.array([g.process([x[k]] * 7, [2.0] * 7) for k in range(n)])
-    assert np.max(np.abs(z[seg, 4] - z[seg, 0])) > 1e-3, "不开时 J5 应走 OE，与 J1 不同"
+    z = [g.process([x[k]] * 7, [2.0] * 7) for k in range(n)]
+    d_oe = max(abs(z[k][4] - z[k][0]) for k in seg)
+    assert d_oe > 1e-3, "不开时 J5 应走 OE，与 J1 不同"
 
 
 def test_adaptive_lp_knee_keeps_filtering_at_high_speed():
@@ -305,21 +316,16 @@ def test_adaptive_lp_knee_keeps_filtering_at_high_speed():
 
     判别力：把 knee 置 0，截止频率会开到 25 Hz，6 Hz 几乎原样通过，本用例红。
     """
-    import numpy as np
     dt = 1.0 / 250.0
     fs = 250.0
     n = int(fs * 3)
-    t = np.arange(n) * dt
-    x = np.sin(2 * np.pi * 6.0 * t)
+    ts = [k * dt for k in range(n)]
+    x = [math.sin(2 * math.pi * 6.0 * t) for t in ts]
 
     def amp(knee):
         f = servo._AdaptiveLP(2.0, 5.0, 25.0, knee, dt)
-        y = np.array([f.process(v, 5.0) for v in x])
-        s = slice(int(fs), None)
-        X = np.vstack([np.sin(2 * np.pi * 6.0 * t[s]),
-                       np.cos(2 * np.pi * 6.0 * t[s])]).T
-        co, *_ = np.linalg.lstsq(X, y[s], rcond=None)
-        return float(np.hypot(*co))
+        y = [f.process(v, 5.0) for v in x]
+        return _tone_amp(y[int(fs):], ts[int(fs):], 6.0)
 
     assert amp(6.0) < 0.5, "knee=6 时 6 Hz 在 5 rad/s 下仍应被压到 0.5 以下"
     assert amp(0.0) > 0.8, "knee=0 时应基本放开（对照）"
