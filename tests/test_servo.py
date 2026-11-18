@@ -3,7 +3,7 @@
 覆盖三件真机上不好反复验的事：
   1. **K/B 逐帧下发的是本仓的增益**（基线取自 `litearm.yaml` 的 `joint_follow:` 段，
      但 2026-09-29 起**有意整体放大**以压制快速拖动下的过冲 —— 依据见 `servo.SETUP_K`）
-  2. 参考生成确实经过 `slew_target`（速度/加速度受限、且**永不发 NaN**）
+  2. 参考生成是**直通 + 每拍硬限速**（正常速度逐拍原样通过、且**永不发 NaN**）
   3. 实测 **23 ms** 量级的 `all_joint_params()` **只在启动时读一次**，绝不进循环
   4. `joint_follow` 的帧**只有四组**（q/dq/kp/kd）—— **没有 `tau`**，`G` 由固件算
 """
@@ -106,8 +106,8 @@ class FakeArm:
 
 
 
-def test_follow_slew_respects_speed_limit():
-    """逐拍位移不得超过 `speed_limit·dt` —— 这是 `slew_target` 存在的理由。"""
+def test_follow_respects_the_per_tick_speed_limit():
+    """逐拍位移不得超过 `speed_limit·dt` —— 大跳变仍被硬限速，不是直通。"""
     arm = FakeArm()
     far = [1.0] * N_JOINTS                      # 一步之遥的目标
     calls = []
@@ -131,8 +131,255 @@ def test_follow_slew_respects_speed_limit():
         if prev is not None:
             step = max(abs(a - b) for a, b in zip(q, prev))
             assert step <= max(servo.DEFAULT_SPEED_LIMIT) * dt * 1.5, (
-                f"单拍位移 {step} 过大 —— 参考没经过 slew_target？")
+                f"单拍位移 {step} 过大 —— 每拍硬限速失效？")
         prev = q
+
+
+def test_follow_passes_a_normal_speed_target_through_without_lag():
+    """正常手拖速度（低于 `speed_limit`）⇒ 参考**逐拍等于主臂目标**，无稳态滞后。
+
+    判别力：把制动距离 / 加速度限幅加回来（旧 `slew_target`），最后一拍的下发
+    q 会落后主臂目标 `v²/(2a)`，本用例立刻红。
+    """
+    arm = FakeArm()
+    v = 0.5                                     # rad/s，J1 上限 2.8
+    n = {"i": 0}
+    q_target = [0.0] * N_JOINTS
+    dq_target = [v] + [0.0] * (N_JOINTS - 1)
+
+    def provider():
+        n["i"] += 1
+        q_target[0] += v / 250.0
+        return list(q_target), list(dq_target)
+
+    def stop():
+        return n["i"] >= 40
+
+    # 这里验的是**未经滤波**的直通路径；默认 hybrid 会引入滤波，故显式 off。
+    servo.follow(arm, provider, should_stop=stop, engage_sec=0.0, hz=250.0,
+                 filter_mode="off")
+    q_sent, dq_sent, *_ = arm.mit_calls[-1]
+    assert q_sent == pytest.approx(q_target, abs=1e-12), (
+        f"下发 q {q_sent} 落后主臂目标 {q_target} —— 参考路径又加了平滑？")
+    assert dq_sent == pytest.approx(dq_target, abs=1e-12), (
+        f"速度前馈应为帧里的主臂 dq {dq_target}，实际 {dq_sent}")
+
+
+def _staircase_run(mode):
+    """模拟主臂 ≈98.5 Hz 的零阶保持：前 60 拍每 3 拍跳 10 mrad，之后保持不动。"""
+    arm = FakeArm()
+    n = {"i": 0}
+
+    def provider():
+        n["i"] += 1
+        k = min(n["i"] - 1, 59)                     # 60 拍后目标不再变化
+        return [0.010 * (k // 3)] + [0.0] * (N_JOINTS - 1), [0.0] * N_JOINTS
+
+    def stop():
+        return n["i"] >= 100
+
+    servo.follow(arm, provider, should_stop=stop, engage_sec=0.0, hz=250.0,
+                 filter_mode=mode)
+    steps = [abs(b[0][0] - a[0][0])
+             for a, b in zip(arm.mit_calls[1:-1], arm.mit_calls[2:])]
+    return arm, max(steps), arm.mit_calls[-1][0][0]
+
+
+def test_follow_lowpass_smooths_the_forwarded_staircase():
+    """`lp20` 必须把 10 mrad 的 ZOH 台阶摊开；`off` 则原样一步到位。
+
+    判别力：把 `filter_mode` 写死成 off，`lp20` 的最大单拍跳变会等于 10 mrad，本用例红。
+    """
+    arm_off, step_off, end_off = _staircase_run("off")
+    arm_lp, step_lp, end_lp = _staircase_run("lp20")
+    assert step_off > 0.009, f"off 应原样跟随台阶，实际最大跳变 {step_off:.4f}"
+    assert step_lp < 0.006, f"lp20 没把台阶摊开：最大跳变 {step_lp:.4f}"
+    raw_end = 0.010 * (59 // 3)
+    assert abs(end_off - raw_end) < 1e-6
+    assert abs(end_lp - raw_end) < 0.0015, "低通不能把目标吃掉：目标停住后应基本到位"
+
+
+def test_filter_mode_label_and_env(monkeypatch):
+    monkeypatch.delenv("LITEARM_CMD_FILTER", raising=False)
+    monkeypatch.delenv("LITEARM_OE_MIN_HZ", raising=False)
+    monkeypatch.delenv("LITEARM_OE_BETA", raising=False)
+    monkeypatch.delenv("LITEARM_OE_MAX_HZ", raising=False)
+    monkeypatch.delenv("LITEARM_OE_KNEE", raising=False)
+    assert servo.filter_mode_label() == \
+        "hybrid (J1-J4 lp20 Hz + J5-J7 OE 2/5/25 Hz, knee 6)"
+    monkeypatch.setenv("LITEARM_CMD_FILTER", "lp20")
+    assert servo.filter_mode_label() == "lp20 (20 Hz)"
+    monkeypatch.setenv("LITEARM_CMD_FILTER", "hybrid")
+    assert servo.filter_mode_label() == \
+        "hybrid (J1-J4 lp20 Hz + J5-J7 OE 2/5/25 Hz, knee 6)"
+    monkeypatch.setenv("LITEARM_CMD_FILTER", "off")
+    assert servo.filter_mode_label() == "off"
+    monkeypatch.setenv("LITEARM_CMD_FILTER", "bogus")
+    assert servo.filter_mode_label() == "off"
+
+
+def test_j5_extra_lp_env_and_label(monkeypatch):
+    """`LITEARM_J5_LP_HZ` 的解析与日志标注；0/负数/坏值都视为关闭。"""
+    monkeypatch.setenv("LITEARM_CMD_FILTER", "hybrid")
+    for name, default in (("LITEARM_OE_MIN_HZ", None), ("LITEARM_OE_BETA", None),
+                          ("LITEARM_OE_MAX_HZ", None), ("LITEARM_OE_KNEE", None),
+                          ("LITEARM_J5_LP_HZ", None)):
+        monkeypatch.delenv(name, raising=False)
+    assert servo._j5_lp_hz() == 0.0
+    assert "J5 lp" not in servo.filter_mode_label()
+    monkeypatch.setenv("LITEARM_J5_LP_HZ", "12")
+    assert servo._j5_lp_hz() == 12.0
+    assert servo.filter_mode_label().endswith("+ J5 lp12 Hz)")
+    monkeypatch.setenv("LITEARM_J5_LP_HZ", "-3")
+    assert servo._j5_lp_hz() == 0.0
+    monkeypatch.setenv("LITEARM_J5_LP_HZ", "abc")
+    assert servo._j5_lp_hz() == 0.0
+
+
+def test_hybrid_j5_extra_lp_only_touches_j5():
+    """J5 的追加二阶低通只作用在 J5：6/10 的响应保持不变，J5 的 20 Hz 被压下去。"""
+    import numpy as np
+    fs, dt = 250.0, 1.0 / 250.0
+    n = int(fs * 2)
+    t = np.arange(n) * dt
+    x = np.sin(2 * np.pi * 20.0 * t)
+    base = servo._HybridFilter(20.0, fs, (2.0, 5.0, 25.0, 0.0))
+    extra = servo._HybridFilter(20.0, fs, (2.0, 5.0, 25.0, 0.0), j5_lp_hz=12.0)
+    yb, ye = [], []
+    for k in range(n):
+        row = [x[k]] * 7
+        spd = [0.0] * 7
+        yb.append(base.process(row, spd))
+        ye.append(extra.process(row, spd))
+    yb, ye = np.array(yb), np.array(ye)
+    seg = slice(n // 2, None)
+
+    def amp(v):
+        X = np.vstack([np.sin(2 * np.pi * 20.0 * t[seg]),
+                       np.cos(2 * np.pi * 20.0 * t[seg])]).T
+        co, *_ = np.linalg.lstsq(X, v[seg], rcond=None)
+        return float(np.hypot(*co))
+
+    assert amp(ye[:, 4]) < 0.5 * amp(yb[:, 4]), "J5 的 20 Hz 应被追加低通压掉一半以上"
+    assert abs(amp(ye[:, 5]) - amp(yb[:, 5])) < 1e-9, "J6 不应受 J5 的追加低通影响"
+
+
+def test_j5_lp_only_env_and_label(monkeypatch):
+    """`LITEARM_J5_LP_ONLY` 的解析与日志标注；只有显式真值才开。"""
+    monkeypatch.setenv("LITEARM_CMD_FILTER", "hybrid")
+    for name in ("LITEARM_OE_MIN_HZ", "LITEARM_OE_BETA", "LITEARM_OE_MAX_HZ",
+                 "LITEARM_OE_KNEE", "LITEARM_J5_LP_HZ", "LITEARM_J5_LP_ONLY"):
+        monkeypatch.delenv(name, raising=False)
+    assert servo._j5_lp_only() is False
+    assert "只走二阶低通" not in servo.filter_mode_label()
+    for v in ("1", "true", "YES", " on "):
+        monkeypatch.setenv("LITEARM_J5_LP_ONLY", v)
+        assert servo._j5_lp_only() is True, v
+        assert servo.filter_mode_label().endswith("+ J5 只走二阶低通)")
+    for v in ("", "0", "no", "off"):
+        monkeypatch.setenv("LITEARM_J5_LP_ONLY", v)
+        assert servo._j5_lp_only() is False, v
+
+
+def test_hybrid_j5_lp_only_routes_j5_through_the_second_order_path():
+    """`j5_lp_only` 下 J5 与 J1 **逐拍完全相同**（同输入），且不再经过 One-Euro。
+
+    判别力：去掉 `j5_lp_only` 分支，J5 走 OE，和 J1 的差异会远大于浮点误差。
+    """
+    import numpy as np
+    fs, dt = 250.0, 1.0 / 250.0
+    n = int(fs * 2)
+    t = np.arange(n) * dt
+    x = np.sin(2 * np.pi * 8.0 * t) * 0.5
+    f = servo._HybridFilter(20.0, fs, (2.0, 5.0, 12.0, 0.0), j5_lp_only=True)
+    y = np.array([f.process([x[k]] * 7, [2.0] * 7) for k in range(n)])
+    seg = slice(n // 2, None)
+    assert np.max(np.abs(y[seg, 4] - y[seg, 0])) < 1e-12, "J5 应与 J1 走同一条二阶路径"
+    g = servo._HybridFilter(20.0, fs, (2.0, 5.0, 12.0, 0.0))
+    z = np.array([g.process([x[k]] * 7, [2.0] * 7) for k in range(n)])
+    assert np.max(np.abs(z[seg, 4] - z[seg, 0])) > 1e-3, "不开时 J5 应走 OE，与 J1 不同"
+
+
+def test_adaptive_lp_knee_keeps_filtering_at_high_speed():
+    """`knee` 之下保持重平滑：6 Hz 抖动在 5 rad/s 时也应被明显衰减。
+
+    判别力：把 knee 置 0，截止频率会开到 25 Hz，6 Hz 几乎原样通过，本用例红。
+    """
+    import numpy as np
+    dt = 1.0 / 250.0
+    fs = 250.0
+    n = int(fs * 3)
+    t = np.arange(n) * dt
+    x = np.sin(2 * np.pi * 6.0 * t)
+
+    def amp(knee):
+        f = servo._AdaptiveLP(2.0, 5.0, 25.0, knee, dt)
+        y = np.array([f.process(v, 5.0) for v in x])
+        s = slice(int(fs), None)
+        X = np.vstack([np.sin(2 * np.pi * 6.0 * t[s]),
+                       np.cos(2 * np.pi * 6.0 * t[s])]).T
+        co, *_ = np.linalg.lstsq(X, y[s], rcond=None)
+        return float(np.hypot(*co))
+
+    assert amp(6.0) < 0.5, "knee=6 时 6 Hz 在 5 rad/s 下仍应被压到 0.5 以下"
+    assert amp(0.0) > 0.8, "knee=0 时应基本放开（对照）"
+
+
+def test_follow_hybrid_smooths_the_wrist_staircase():
+    """hybrid 的 J5–J7 One-Euro 必须把腕部台阶摊开（比 off 小），且最终到位。"""
+    def run(mode):
+        arm = FakeArm()
+        n = {"i": 0}
+
+        def provider():
+            n["i"] += 1
+            k = min(n["i"] - 1, 59)
+            q = [0.0] * N_JOINTS
+            q[4] = 0.010 * (k // 3)                 # J5 每 3 拍跳 10 mrad
+            dq = [0.0] * N_JOINTS
+            dq[4] = 1.0                             # 主臂速度 1 rad/s ⇒ OE 截止频率升高
+            return q, dq
+
+        def stop():
+            return n["i"] >= 200          # 60 拍后目标停住，留足时间让 One-Euro 收敛
+
+        servo.follow(arm, provider, should_stop=stop, engage_sec=0.0, hz=250.0,
+                     filter_mode=mode)
+        steps = [abs(b[0][4] - a[0][4])
+                 for a, b in zip(arm.mit_calls[1:-1], arm.mit_calls[2:])]
+        return max(steps), arm.mit_calls[-1][0][4]
+
+    step_off, end_off = run("off")
+    step_hy, end_hy = run("hybrid")
+    assert step_off > 0.009, f"off 应原样跟随台阶，实际 {step_off:.4f}"
+    assert step_hy < 0.006, f"hybrid 没把腕部台阶摊开：{step_hy:.4f}"
+    raw_end = 0.010 * (59 // 3)
+    assert abs(end_off - raw_end) < 1e-6
+    assert abs(end_hy - raw_end) < 0.0015
+
+
+def test_follow_catchup_limits_the_initial_swing():
+    """对齐后主臂已走远时，起步先按 `catchup_speed` 追，不用正常 speed_limit 甩过去。
+
+    判别力：去掉 catch-up，J1 的首拍会是 2.8×0.01=0.028 rad，本用例立刻红。
+    """
+    arm = FakeArm()
+    n = {"i": 0}
+
+    def provider():
+        n["i"] += 1
+        return [0.5] + [0.0] * (N_JOINTS - 1)
+
+    def stop():
+        return n["i"] >= 150
+
+    servo.follow(arm, provider, should_stop=stop, engage_sec=0.0, hz=100.0,
+                 filter_mode="off", catchup_speed=0.5)
+    steps = [abs(b[0][0] - a[0][0])
+             for a, b in zip(arm.mit_calls[1:-1], arm.mit_calls[2:])]
+    assert max(steps[:50]) <= 0.0051, (
+        f"起步首拍走了 {max(steps[:50]):.4f} rad —— 没有限速追赶？（正常 J1 是 0.028）")
+    assert abs(arm.mit_calls[-1][0][0] - 0.5) < 1e-3, "追赶结束后应到位"
 
 
 def test_follow_never_sends_non_finite():
@@ -162,6 +409,40 @@ def test_follow_holds_when_provider_returns_none():
     # 目标恒为初始实测位姿 ⇒ 不该走动
     for q, _dq, *_ in arm.mit_calls[1:]:
         assert max(abs(v) for v in q) < 1e-6, "返回 None 时不该往别处走"
+
+
+def test_catchup_survives_a_target_that_arrives_after_the_first_tick():
+    """起步追赶**不能**在收到主臂帧之前就放掉。
+
+    真机现场（`rec-20261118-200745-j5-lp-only`）：对齐因「5 s 没收到主臂帧」被跳过，
+    循环首拍 `provider()` 仍返回 `None` ⇒ `q_raw_target` 还是从臂自己的位姿 ⇒
+    误差 0 ⇒ 保护首拍自释；1 s 后首帧到达，J2 按 3.4 rad/s 甩了 **0.907 rad**。
+
+    判别力：把 `if catching_up:` 上的 `and have_target` 去掉，本用例立刻红
+    （单拍位移会到 J 的 `speed_limit·dt`，是 0.5 rad/s 的 5.6 倍以上）。
+    """
+    arm = FakeArm()
+    far = [0.9] * N_JOINTS
+    seen = {"n": 0}
+
+    def provider():
+        seen["n"] += 1
+        return None if seen["n"] <= 10 else far
+
+    def stop():
+        return len(arm.mit_calls) > 60
+
+    servo.follow(arm, provider, should_stop=stop, engage_sec=0.0, hz=100.0)
+
+    dt = 1.0 / 100.0
+    prev = arm.mit_calls[0][0]
+    worst = 0.0
+    for q, *_ in arm.mit_calls[1:]:
+        worst = max(worst, max(abs(a - b) for a, b in zip(q, prev)))
+        prev = q
+    assert worst <= servo.CATCHUP_SPEED * dt * 1.2, (
+        f"单拍位移 {worst:.4f} rad 超过起步追赶上限 "
+        f"{servo.CATCHUP_SPEED * dt:.4f} —— 保护在首帧到达前就被放掉了")
 
 
 # ────────────────────── MIT 透传：照搬 server 的 K/B ──────────────────────
@@ -332,7 +613,7 @@ def test_speed_limit_stays_within_the_firmware_velocity_envelope():
     「从臂永远在追」（实测滞后 0.35 rad / 20°）。现已给 joint_follow 加专用表
     （`control_loop.c` 的 `s_jf_vel_max`，逐值照抄 server）。
 
-    为什么仍要"≤"：两级 slew **串联**（PC `slew_target` → 固件 `slew_linear`），
+    为什么仍要"≤"：两级硬限速 **串联**（PC `follow` 的每拍上限 → 固件 `slew_linear`），
     **谁小谁说了算**。PC 若大于固件那张表，多出来的部分不会变成速度，
     只会让 `q_cmd` 空超前、跟踪误差读数虚高。
 

@@ -24,6 +24,7 @@ GUI 只做两件事：**投命令**、**读快照**。任何 SDK 调用都发生
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -827,14 +828,14 @@ class ArmWorker:
             self._log(f"⚠ zero_g_stop 失败: {e}")
 
     def _run_slave(self, p: TeleopParams) -> None:
-        """从臂：订阅 → 钳位 → `slew_target` → `joint_follow`（0x08）（spec §5）。"""
+        """从臂：订阅 → 钳位 → 直通 + 每拍硬限速 → `joint_follow`（0x08）（spec §5）。"""
         arm = self._arm
         self._limits = read_safe_limits(arm)             # 读不到会抛 ⇒ 拒启动
         self._log(f"软限位 {list(zip(self._limits.lo, self._limits.hi))}")
         self._link_reset()                               # 新会话 ⇒ 速率从 0 起算
         self._open_sub(p)
         # ── 对齐（照搬 `_do_align`）：等首帧 → 钳位 → **低速 movej** ──
-        # ⚠ 少了这一步，从臂会由 `slew_target` 直接拉过去，速度上限是 `speed_limit`
+        # ⚠ 少了这一步，从臂会由直通路径直接拉过去，速度上限是 `speed_limit`
         #    （J1 到 2.8 rad/s），比 `align_speed=0.15` 快近 20 倍 —— 那是**大幅甩动**。
         #
         self._log("等待主臂首帧并对齐 …")
@@ -871,6 +872,9 @@ class ArmWorker:
                   f"（⚠ 不是 yaml 默认档 —— 2026-09-29 起有意整体放大以压过冲，"
                   f"见 servo.SETUP_K 注释；随 0x08 帧每拍下发）")
         self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
+        self._log(f"指令重建低通: {servo.filter_mode_label()}")
+        self._log(f"起步追赶: ≤{servo.CATCHUP_SPEED:g} rad/s，误差 ≤{servo.CATCHUP_TOL:g} rad "
+                  f"后切正常限速")
         self._log(f"每拍 1 次下发（CMD_JOINT_FOLLOW；G + 限位墙由**固件**算）"
                   f"⇒ 节拍 {SLAVE_HZ:.0f} Hz（收尾会打印实测值）")
 
@@ -883,7 +887,12 @@ class ArmWorker:
             except Exception:                            # noqa: BLE001
                 return None
             clamped, _sat = clamp_to_limits(frame["q"], self._limits)
-            return clamped
+            # 主臂实测速度随帧转发，作为从臂的速度前馈（不再由 PC 的 slew 生成）。
+            # 坏值丢弃即可：位置仍安全，follow() 会回落到差分。
+            dq = list(frame["dq"])
+            if not all(math.isfinite(v) for v in dq):
+                dq = [0.0] * N_JOINTS
+            return clamped, dq
 
         def should_stop() -> bool:
             if not self._teleop_want or self._stop.is_set():
