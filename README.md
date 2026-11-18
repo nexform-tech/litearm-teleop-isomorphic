@@ -81,6 +81,32 @@ the arm's CDC port:
 sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 ```
 
+## Command filter
+
+The follower filters the forwarded command before the per-tick speed limit. It is on by default and needs no flag.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `LITEARM_CMD_FILTER=hybrid` | yes | J1–J4 second-order 20 Hz; J5–J7 One-Euro |
+| `LITEARM_CMD_FILTER=lp20` / `lp25` | | all axes, fixed second-order |
+| `LITEARM_CMD_FILTER=off` | | A/B only; restores the 98.5 Hz staircase |
+| `LITEARM_OE_MIN_HZ` | `2` | hybrid: lower = smoother at low speed, more lag |
+| `LITEARM_OE_BETA` | `5` | hybrid: higher = cutoff rises faster with speed (less lag in fast motion) |
+| `LITEARM_OE_MAX_HZ` | `25` | hybrid: upper cutoff |
+| `LITEARM_OE_KNEE` | `6` | hybrid: below this speed the wrist stays at `MIN_HZ`; raise = keep filtering at faster motion (more lag) |
+| `LITEARM_J5_LP_HZ` | `0` (off) | hybrid: second-order low-pass added after J5's One-Euro; `12` cuts the 10–45 Hz wrist content at speed for about 20 ms of extra lag |
+
+Why: the leader's ~98.5 Hz frames are held on the follower's 250 Hz loop, creating a 30–120 Hz staircase.
+The 20 Hz path cuts that energy about 10x.
+The wrist One-Euro additionally cuts the 6–10 Hz jitter; `LITEARM_OE_KNEE=6` keeps that smoothing up to 6 rad/s and only opens above it.
+
+`LITEARM_J5_LP_HZ` addresses the fast-motion 10–45 Hz residue the One-Euro passes once its cutoff opens. On the same recorded trajectories, `12` lowers J5's 10–20 Hz command content from 1.69 to 1.04 mrad and 20–45 Hz from 1.23 to 0.23 mrad, with no slow-speed penalty.
+Do not replace it with a speed-scheduled switch or crossfade between the two filters: their phase differs, and blending raises the 6–10 Hz content from 3.04 to 8.16 mrad.
+
+Do not set `off` for normal use. Do not lower `LITEARM_OE_MIN_HZ` below 1.5 Hz without checking the added wrist lag.
+
+After alignment, if the master has moved, the follower catches up at **0.5 rad/s** until within **0.02 rad**, then returns to the normal speed limit.
+
 ## Scope
 
 | | |
@@ -115,10 +141,11 @@ condensed from are not published.
 
 ### Motion and feedforward
 
-- Do not feed the leader's measured `dq` as the follower's velocity reference. In `move_js`, `dq` has two roles.
-- Its magnitude caps the slew rate of `q_ref`, **and** its value enters the motor's velocity feedforward as `kd·(dq_ref − dq)`.
-- Use the reference generator's own output instead. This repository's `slew_target` returns it as `dq_cmd`.
+- Do not feed the leader's measured `dq` as the follower's velocity reference **on `move_js`**: there it caps the `q_ref` slew rate *and* enters the feedforward.
+- On `joint_follow` (`0x08`) the rate is capped by `speed_limit·dt` and `slew_linear`; `dq` only feeds the velocity term. `servo.follow` forwards leader `dq` as `dq_cmd`.
+- That forwarding is what removes the steady-state lag: a target below `speed_limit` passes through unchanged, with no braking-distance offset.
 - Do not substitute a constant for it. That fabricates a feedforward torque.
+- `safety.slew_target` is now reference-only. The live path does not call it.
 - An axis pinned by a limit gets `dq = 0`, which freezes it.
 - Do not trust `DEVELOPER_GUIDE.md` here. It states only that `dq` is "not a limit", which is half the story.
 - Do not extrapolate the `dq` feedforward beyond what was measured. The hardware evidence covers up to 0.5 rad/s only; the script capped it and the actual peak was 0.032 rad/s.

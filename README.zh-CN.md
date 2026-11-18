@@ -65,6 +65,29 @@ worker 一概加载随包 SDK 的**出厂标定**（`litegrip/factory_calibratio
 sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 ```
 
+## 指令滤波
+
+从臂在每拍硬限速之前对转发的目标做滤波，**默认开启**，不需要命令行参数。
+
+| 设置 | 默认值 | 作用 |
+| --- | --- | --- |
+| `LITEARM_CMD_FILTER=hybrid` | 是 | J1–J4 二阶 20 Hz；J5–J7 One-Euro |
+| `LITEARM_CMD_FILTER=lp20` / `lp25` | | 全轴固定二阶 |
+| `LITEARM_CMD_FILTER=off` | | 只用于 A/B；会恢复 98.5 Hz 阶梯 |
+| `LITEARM_OE_MIN_HZ` | `2` | hybrid：调低 = 低速更平滑、更拖 |
+| `LITEARM_OE_BETA` | `5` | hybrid：调高 = 截止频率随速度上升更快、快速段更跟手 |
+| `LITEARM_OE_MAX_HZ` | `25` | hybrid：截止频率上限 |
+| `LITEARM_OE_KNEE` | `6` | hybrid：低于此速度腕部保持 `MIN_HZ` 重平滑；调高 = 高速也继续滤波（更拖） |
+| `LITEARM_J5_LP_HZ` | `0`（关闭） | hybrid：在 J5 的 One-Euro 之后再串一级二阶低通；`12` 压低高速段 10–45 Hz，代价是约 20 ms 额外滞后 |
+
+原因：主臂约 98.5 Hz 的帧在从臂 250 Hz 环上保持成阶梯，产生 30–120 Hz 的末端抖动；20 Hz 路径把这段能量压到约 1/10。腕部 One-Euro 再压 6–10 Hz；`LITEARM_OE_KNEE=6` 让它在 6 rad/s 以内保持重平滑，超过后才放开。
+
+`LITEARM_J5_LP_HZ` 处理 One-Euro 截止随速度放开后仍然通过的 10–45 Hz 残余。同一批真机轨迹离线复算：设 `12` 后 J5 的指令 10–20 Hz 从 1.69 降到 1.04 mrad、20–45 Hz 从 1.23 降到 0.23 mrad，低速段不劣化。**不要**改成"按速度在 One-Euro 与二阶之间切换/淡入"：两者相位不同，混合会让 6–10 Hz 从 3.04 涨到 8.16 mrad。
+
+正常使用**不要**设 `off`；把 `LITEARM_OE_MIN_HZ` 降到 1.5 Hz 以下前先确认腕部延迟可接受。
+
+对齐后如果主臂已经移动，从臂先按 **0.5 rad/s** 追到误差 **0.02 rad** 以内，再切回正常限速。
+
 ## 适用范围
 
 | | |
@@ -96,10 +119,10 @@ sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up
 
 ### 运动与前馈
 
-- **不要**把主臂实测的 `dq` 当作从臂的速度参考。在 `move_js` 里 `dq` 有两个身份。
-- 它的**幅值**限制 `q_ref` 的走位速率，它的**值**又进电机速度前馈，即 `kd·(dq_ref − dq)`。
-- 应当用参考生成器自己的输出。本仓的 `slew_target` 把它作为 `dq_cmd` 返回。
+- **不要**在 `move_js` 路径上把主臂实测的 `dq` 当作从臂的速度参考。在 `move_js` 里 `dq` 有两个身份：它的**幅值**限制 `q_ref` 的走位速率，它的**值**又进电机速度前馈，即 `kd·(dq_ref − dq)`。
+- `joint_follow`（`0x08`）路径没有这层耦合：参考由 PC 的 `speed_limit·dt` 与固件 `slew_linear` 限速，`dq` 只进速度前馈并被同一张表钳住。`servo.follow` 因此把主臂实测 `dq` 原样作为 `dq_cmd` 转发 —— 这正是消除稳态滞后的做法。
 - **不要**拿常数顶上，那是凭空编造一个前馈力矩。
+- 参考生成器现在是**每拍硬限速**，不是平滑器：低于 `speed_limit` 的目标逐拍原样通过。`safety.slew_target` 只保留为钉住的参照实现，运行路径不再调用。
 - 被限位钉住的轴会被置 `dq = 0`，等于冻结该轴。
 - **不要**在这里信 `DEVELOPER_GUIDE.md`。它只说了 `dq`"不是 limit"，那是半句话。
 - **不要**把 `dq` 前馈外推到没测过的量级。真机证据只覆盖到 0.5 rad/s，脚本写死了上限，实际峰值 0.032 rad/s。
