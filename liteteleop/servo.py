@@ -33,21 +33,37 @@ skip_position=True)` **主动豁免**那两条判据 —— 固件没有这个�
 22 倍，手感**不可能**一样。真机判据：「跟随太慢，有明显的延迟」。唯一能改它的办法是
 写固件参数，而**那条路已证伪**（见 `SETUP_K` 上面那段）。
 
-控制律的**参考生成**（`slew_target`）、**参数真值**、**watchdog**、**对齐**、**钳位**
-仍逐条照 litearm-server，见 spec §5、§9.1。
+**参数真值**、**watchdog**、**对齐**、**钳位** 仍逐条照 litearm-server，见 spec §5、§9.1。
 
-⚠ **PC 侧的 `slew_target` 刻意保留**：固件的 `slew_linear` 用 `vel_max` 兜底，而这里的
-`speed_limit`/`accel_limit` 更保守 —— 两层不冲突（同值时自然退化为一层），且 PC 侧这一
-层交给固件的是**平滑目标**而不是阶跃。由 `test_safety.py` 与 pylitearm 原版逐拍对拍锁定。
+## 参考生成：直通 + 每拍硬限速（2026-11-18 起）
+
+从臂把主臂目标**逐拍直通**下发，只保留一条**硬限速**：单拍位移不超过
+`speed_limit·dt`（与固件 `s_jf_vel_max` 逐值相同）。**不再经过** `safety.slew_target`
+——它里面的加速度限幅与「制动距离」分支会在匀速拖动时让参考恒定落后主臂
+`v²/(2a)`（J1 在 2 rad/s 下实测 0.137 rad），而正常手拖速度远低于 `speed_limit`
+⇒ 直通后这一段滞后为 0。
+
+⚠ 速度上限仍有**两层**：本条 PC 侧硬限速 + 固件 `slew_linear`。正常情况下两层都是
+**原样通过**（主臂速度低于上限）；超过上限时谁小谁说了算，不会被任何一层"平滑"。
+⚠ 位置护栏（`clamp_to_limits` + 固件 `law_wall` + 固件 `q_meas ± 0.20` 窗口）一条没动。
+
+## 指令重建滤波（默认开启）
+
+主臂有效帧率 ≈98.5 Hz，从臂 250 Hz 消费 ⇒ 保持后的指令是阶梯，30–120 Hz 的能量
+会激起末端抖动。默认 `hybrid`：J1–J4 二阶 20 Hz 低通，J5–J7 One-Euro 自适应低通
+（抑制腕部 6–10 Hz，1–5 Hz 意图动作的 30–40 ms 链路延迟不变）。`LITEARM_CMD_FILTER`
+可切 `hybrid|lp20|lp25|off`；腕部参数见 `_oe_params()` / README。
 """
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from .safety import clamp_to_limits, slew_target
+from .safety import clamp_to_limits
 from .wire import N_JOINTS
 from .wire import decode_teleop as wire_decode
 
@@ -58,7 +74,7 @@ __all__ = [
     "align_to_master", "DEFAULT_PAYLOAD_MASS", "DEFAULT_PAYLOAD_COM",
     "read_payload", "apply_payload",
     "SETUP_K", "SETUP_B", "ENGAGE_KP", "ENGAGE_KD",
-    "DEFAULT_SPEED_LIMIT", "DEFAULT_ACCEL_LIMIT",
+    "DEFAULT_SPEED_LIMIT",
     "DEFAULT_ENGAGE_SEC", "DEFAULT_HZ", "hold_at_current", "follow",
 ]
 
@@ -80,22 +96,22 @@ __all__ = [
 #:
 #: ## 两处必须同时改才生效
 #:
-#:     PC 侧（本表）              决定 `slew_target` 放行多快
+#:     PC 侧（本表）              决定 `follow()` 每拍最多推进多少（硬限速）
 #:     固件 `s_jf_vel_max`        决定 `slew_linear` 放行多快（**只对 joint_follow 会话**）
 #:
 #: ⚠ **固件那张表是逐值照抄本表的**（`control_loop.c` 的 `s_jf_vel_max`）——
-#:   改这里必须同步改那里：两级 serially 串联，**谁小谁说了算**。
+#:   改这里必须同步改那里：两级串联，**谁小谁说了算**。正常手拖（1–2 rad/s）低于
+#:   两者 ⇒ **逐拍原样通过，不产生滞后**；超过上限时才被限住。
 #: ⚠ 通用路径（`move_j` / `move_js` / `move_mit_all`）仍受 `jp->vel_max` 约束，
 #:   一点没变 —— 这是刻意的，见 spec §5 第 4 条（通用路径不得被削弱）。
 #: ⚠ 位置护栏（`clamp_to_limits` + 固件 `law_wall`）**仍然保留**：server 也保留它，
 #:   关掉会让从臂撞机械限位（J4 上端只有 2°）。
 DEFAULT_SPEED_LIMIT = [2.8, 3.4, 5.0, 5.0, 10.0, 8.0, 13.0]
-DEFAULT_ACCEL_LIMIT = [14.0, 22.0, 24.0, 24.0, 45.0, 40.0, 60.0]
 DEFAULT_ENGAGE_SEC = 0.3
 
 #: **从臂伺服环**的节拍频率（`follow()` 用 `sleep` 主动对齐到点，不是"能跑多快"）。
-#: `dt_nom = 1/hz` 会**直接进 `slew_target`** ⇒ 这个数**必须等于实际循环周期**，
-#: 否则限速参考按错周期算（每拍推进量 = `speed_limit × dt_nom`）。
+#: `dt_nom = 1/hz` 会**直接进每拍硬限速** ⇒ 这个数**必须等于实际循环周期**，
+#: 否则限速按错周期算（每拍上限 = `speed_limit × dt_nom`）。
 #:
 #: ⚠ **S4 之后每拍只 1 次往返**（`CMD_JOINT_FOLLOW` 一次下发；`get_gravity` 已由固件
 #:   内算取代）⇒ 实测单往返 3.333 ms ⇒ 硬件上限 ~300 Hz。取 **250**，与 litearm-server
@@ -317,6 +333,12 @@ SETUP_K = [200.0, 200.0, 200.0, 200.0, 80.0, 80.0, 80.0]
 #:     · **J5 纹丝不动**（两种都解释不了） ⇒ 是**腕部机械弹性**，轨迹层够不着 ——
 #:       与 §C 已有的「J4-J7 减速末小振铃 = 弹性模态」同一条，**不必再追**。
 #:   ⚠ 无论哪个方向，本轮 **J1~J4 不动** ⇒ 它们的数字应与上一轮基本一致，可作对照。
+#: ⚠⚠ **腕部 B 保持 1.5 —— 2026-11-18 傍晚的 1.5→3.0 试验已回退**：同一轮真机数据里，
+#: 从臂**实测/自身指令**的同源比值（4–6 rad/s、6–20 Hz）由 J5 1.09× / J6 1.19× / J7 0.94×
+#: 变成 1.37× / 1.40× / 1.28×，20–45 Hz 放大到 1.4–2.8× ⇒ 腕部加阻尼激发了弹性/高频模态
+#: （`defaults.c` 里腕部 `kd_extra=0` 的注释即此意）。高速抖动的病根在**指令**里：
+#: 高速段从臂实测对**自身指令**的 6–10 Hz 相干性 0.97–0.99、增益 ≈1.0 ⇒ 压它要压指令
+#: 高频（`LITEARM_OE_MAX_HZ`），不是加 `B`。详见 `litearm-teleop-command-filter-tuning`。
 SETUP_B = [3.0, 5.0, 3.0, 3.0, 1.5, 1.5, 1.5]
 
 #: `joint_follow.engage()` 的托举增益（`engage_kp=15.0, engage_kd=0.8`）——
@@ -430,15 +452,251 @@ def _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall=None) -> None:
     arm.joint_follow(list(q_cmd), list(dq_cmd), list(kp), kd_sent)
 
 
+#: 从臂指令重建低通 —— 把主臂 ~98.5 Hz 的零阶保持阶梯平滑掉（2026-11-18 实测）。
+#: `LITEARM_CMD_FILTER=hybrid|lp20|lp25|off`；默认 `hybrid`（J1–J4 lp20，
+#: J5–J7 One-Euro）。`lp20`/`lp25` 为全轴二阶；`off` 只用于 A/B 对照。
+DEFAULT_FILTER_MODE = "hybrid"
+
+#: 对齐后的起步追赶：主臂在对齐期间移动过时，先用这个速度追齐，避免按正常硬限速
+#: （J1 2.8 … J7 13 rad/s）突然甩过去。误差进入 `CATCHUP_TOL` 后切回正常限速。
+CATCHUP_SPEED = 0.5
+CATCHUP_TOL = 0.02
+CATCHUP_WARN_SECONDS = 5.0
+
+
+class _AdaptiveLP:
+    """One-Euro 式自适应一阶低通：截止频率 = min + beta·|dq|（逐轴）。
+
+    用**主臂实测 dq**（不是微分保持后的 q）估计速度，避免把零阶保持的台阶
+    误当成高速运动。速度估计本身再走 1 Hz 低通，抑制 `dq` 噪声。
+    """
+
+    def __init__(self, min_cut, beta, max_cut, knee, dt, d_cut=1.0):
+        self.min_cut = float(min_cut)
+        self.beta = float(beta)
+        self.max_cut = float(max_cut)
+        self.knee = max(0.0, float(knee))
+        self.dt = float(dt)
+        self.d_cut = float(d_cut)
+        self.y = None
+        self.speed_hat = 0.0
+
+    def process(self, x, speed):
+        x = float(x)
+        if self.y is None:
+            self.y = x
+            self.speed_hat = abs(float(speed))
+            return x
+        a_d = 1.0 - math.exp(-2.0 * math.pi * self.d_cut * self.dt)
+        self.speed_hat += a_d * (abs(float(speed)) - self.speed_hat)
+        cut = self.min_cut + self.beta * max(0.0, self.speed_hat - self.knee)
+        cut = min(self.max_cut, max(self.min_cut, cut))
+        a = 1.0 - math.exp(-2.0 * math.pi * cut * self.dt)
+        self.y += a * (x - self.y)
+        return self.y
+
+
+class _LowPass2:
+    """二阶 Butterworth 低通（RBJ 双二次），逐轴状态；不依赖 scipy。"""
+
+    def __init__(self, fc: float, fs: float):
+        q = 1.0 / math.sqrt(2.0)
+        w0 = 2.0 * math.pi * float(fc) / float(fs)
+        alpha = math.sin(w0) / (2.0 * q)
+        cw = math.cos(w0)
+        a0 = 1.0 + alpha
+        self.b0 = (1.0 - cw) / 2.0 / a0
+        self.b1 = (1.0 - cw) / a0
+        self.b2 = self.b0
+        self.a1 = (-2.0 * cw) / a0
+        self.a2 = (1.0 - alpha) / a0
+        self._x1 = self._x2 = self._y1 = self._y2 = None
+
+    def process(self, x, speed=None):
+        x = [float(v) for v in x]
+        if self._x1 is None:
+            # 初值取第一拍输入 ⇒ 无启动瞬态
+            self._x1 = list(x)
+            self._x2 = list(x)
+            self._y1 = list(x)
+            self._y2 = list(x)
+            return x
+        y = [
+            self.b0 * x[i] + self.b1 * self._x1[i] + self.b2 * self._x2[i]
+            - self.a1 * self._y1[i] - self.a2 * self._y2[i]
+            for i in range(len(x))
+        ]
+        self._x2, self._x1 = self._x1, x
+        self._y2, self._y1 = self._y1, y
+        return y
+
+
+class _HybridFilter:
+    """J1–J4 二阶 20 Hz 低通；J5–J7 用 One-Euro 自适应滤波。
+
+    `j5_lp_hz`（>0 时）在 J5 的 One-Euro **之后**再串一级二阶低通 —— 见
+    `_j5_lp_hz()` 的注释：腕部高速段的 10–45 Hz 残余靠 OE 压不下去。
+
+    `j5_lp_only`（`LITEARM_J5_LP_ONLY`）把 J5 整个退回 **J1–J4 那条路**：只走
+    固定二阶低通、不经过 One-Euro。用途是 A/B 用户反馈的那个观感 ——
+    最早全轴 lp20 时 J5 只有偶发单帧抖动，换成 OE 后低速也开始抖。
+    """
+
+    def __init__(self, fc, fs, oe_params, j5_lp_hz=None, j5_lp_only=False):
+        self.lp = _LowPass2(fc, fs)
+        dt = 1.0 / float(fs)
+        self.oe = [_AdaptiveLP(*oe_params, dt=dt) for _ in range(3)]
+        self.j5_lp = _LowPass2(j5_lp_hz, fs) if j5_lp_hz else None
+        self.j5_lp_only = bool(j5_lp_only)
+
+    def process(self, x, speed=None):
+        y = self.lp.process(x)
+        if speed is None:
+            speed = [0.0] * len(x)
+        for j, i in enumerate(range(4, 7)):
+            if i < len(x) and not (i == 4 and self.j5_lp_only):
+                y[i] = self.oe[j].process(x[i], speed[i])
+        if self.j5_lp is not None and len(x) > 4 and not self.j5_lp_only:
+            y[4] = self.j5_lp.process([y[4]])[0]
+        return y
+
+
+def _oe_params():
+    """`LITEARM_OE_MIN_HZ / BETA / MAX_HZ / KNEE`（带默认值）。
+
+    `KNEE`（rad/s）是高速段也继续滤波的拐点：`|dq| ≤ KNEE` 时保持 `MIN_HZ`
+    重平滑，超过后才按 `BETA` 放开。默认 6 rad/s。
+    """
+    def num(name, default):
+        try:
+            return float(os.environ.get(name, default))
+        except ValueError:
+            log.warning("环境变量 %s 不是数字 —— 用默认值 %s", name, default)
+            return float(default)
+
+    min_cut = max(0.2, num("LITEARM_OE_MIN_HZ", 2.0))
+    beta = max(0.0, num("LITEARM_OE_BETA", 5.0))
+    max_cut = max(min_cut, num("LITEARM_OE_MAX_HZ", 25.0))
+    knee = max(0.0, num("LITEARM_OE_KNEE", 6.0))
+    return min_cut, beta, max_cut, knee
+
+
+def _j5_lp_hz() -> float:
+    """`LITEARM_J5_LP_HZ`：J5 在 One-Euro 之后追加的二阶低通截止（Hz，0=关闭）。
+
+    为什么只给 J5：类人臂的 J5 是腕部第一个轴，惯量小、又直接暴露在末端。
+    真机（`rec-20261118-185235` / `rec-20261118-190315` 三条轨迹离线复算）里，
+    同一段高速运动下 `指令 10–20 Hz` 用 OE 是 1.69 mrad，串一级 12 Hz 二阶降到
+    1.04、`20–45 Hz` 从 1.23 降到 0.23；低速段不劣化（6–10 Hz 1.53→1.46）。
+    ⚠ 别改成"按速度在 OE 与二阶之间切换/淡入"：两者相位不同，混合处会产生调制
+    （实测 6–10 Hz 从 3.04 涨到 8.16 mrad），比不切还差。
+    代价是意图滞后 +20 ms（12→32 ms）。
+    """
+    try:
+        v = float(os.environ.get("LITEARM_J5_LP_HZ", 0.0))
+    except ValueError:
+        log.warning("环境变量 LITEARM_J5_LP_HZ 不是数字 —— 视为关闭")
+        return 0.0
+    return max(0.0, v)
+
+
+def _j5_lp_only() -> bool:
+    """`LITEARM_J5_LP_ONLY`：J5 只用二阶低通（与 J1–J4 同一条路），不走 One-Euro。
+
+    用户反馈（2026-11-18）：最早全轴 lp20 时 J5 只有**偶发单帧**抖动；换成 hybrid 的
+    One-Euro 之后低速也开始抖。机理上说得通 —— OE 低速截止只有 2 Hz（≈80 ms 滞后），
+    手一起停就欠着滞后再追，1–3 Hz 上形成摆动；而 lp20 相位固定、不随速度变，
+    起停时没有"追"的过程。代价是主臂 6–10 Hz 的内容会 1:1 通过（同源实测
+    0.7–1.2 mrad），这正是当初引入 OE 要压的那一段。A/B 用，不是默认。
+    """
+    raw = (os.environ.get("LITEARM_J5_LP_ONLY", "") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _filter_spec(mode=None):
+    """解析 `off|lpNN|hybrid`；返回 `(kind, fc, label)`。"""
+    raw = os.environ.get("LITEARM_CMD_FILTER", DEFAULT_FILTER_MODE) \
+        if mode is None else mode
+    raw = (raw or "").strip().lower()
+    if raw in ("", "off", "none", "0"):
+        return "off", None, "off"
+    if raw in ("hybrid", "oe"):
+        return "hybrid", 20.0, "hybrid"
+    if raw.startswith("lp"):
+        try:
+            fc = float(raw[2:])
+        except ValueError:
+            fc = -1.0
+        if fc > 0.0:
+            return "lp", fc, raw
+    log.warning("未知的 LITEARM_CMD_FILTER=%r —— 按 off 处理", raw)
+    return "off", None, "off"
+
+
+def filter_mode_label(mode=None) -> str:
+    """给日志用的低通描述：`off`、`lp20 (20 Hz)` 或 `hybrid (...)`。"""
+    kind, fc, label = _filter_spec(mode)
+    if kind == "off":
+        return "off"
+    if kind == "hybrid":
+        mn, beta, mx, knee = _oe_params()
+        j5 = _j5_lp_hz()
+        if _j5_lp_only():
+            extra = " + J5 只走二阶低通"
+        else:
+            extra = f" + J5 lp{j5:g} Hz" if j5 else ""
+        return (f"hybrid (J1-J4 lp{fc:g} Hz + J5-J7 OE "
+                f"{mn:g}/{beta:g}/{mx:g} Hz, knee {knee:g}{extra})")
+    return f"{label} ({fc:g} Hz)"
+
+
+def _split_target(got):
+    """把 `target_provider` 的返回值拆成 `(q, dq 或 None)`。
+
+    支持两种返回：7 个关节角；或 `(q, dq)` 二元组（`dq` 作为速度前馈）。
+    非有限值一律拒（位置由调用方保证、速度坏值丢弃后回落到差分值）。
+    """
+    if (len(got) == 2
+            and isinstance(got[0], (list, tuple))
+            and isinstance(got[1], (list, tuple))):
+        q_raw, dq_raw = got
+    else:
+        q_raw, dq_raw = got, None
+    if len(q_raw) != N_JOINTS:
+        raise ValueError(f"目标必须是 {N_JOINTS} 元素，收到 {len(q_raw)}")
+    q = [float(v) for v in q_raw]
+    if not all(math.isfinite(v) for v in q):
+        raise ValueError("目标关节角含非有限值")
+    dq = None
+    if dq_raw is not None:
+        if len(dq_raw) != N_JOINTS:
+            raise ValueError(f"目标速度必须是 {N_JOINTS} 元素，收到 {len(dq_raw)}")
+        dq = [float(v) for v in dq_raw]
+        if not all(math.isfinite(v) for v in dq):
+            dq = None                       # 坏速度丢弃：位置仍安全，前馈回落到差分
+    return q, dq
+
+
 def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
-           K=None, B=None, speed_limit=None, accel_limit=None,
+           K=None, B=None, speed_limit=None,
            engage_sec: float = DEFAULT_ENGAGE_SEC, hz: float = DEFAULT_HZ,
            should_stop: Callable[[], bool] = lambda: False,
-           duration_s: Optional[float] = None, wall=None) -> bool:
-    """从臂跟随环 —— **逐条照搬 `joint_follow`**（`pylitearm/control/joint_follow.py`）。
+           duration_s: Optional[float] = None, wall=None,
+           on_tick: Optional[Callable] = None,
+           filter_mode: Optional[str] = None,
+           catchup_speed: Optional[float] = CATCHUP_SPEED) -> bool:
+    """从臂跟随环 —— 执行器与增益照搬 `joint_follow`，**参考生成改为直通 + 硬限速**。
 
-    `target_provider()` 返回**目标关节角序列**；返回 `None` 时**保持上一拍的
-    `q_cmd/dq_cmd` 不动**（照搬 `joint_follow` 那一支 —— "首帧到达前原地不动"）。
+    `target_provider()` 返回 7 个关节角，或 `(q, dq)` 二元组（`dq` 作为速度前馈）；
+
+    返回 `None` 时**保持上一拍的位置目标**（"首帧到达前原地不动"），速度前馈在
+    50 ms 内保持（容忍主臂 100 Hz 状态帧与 250 Hz 环之间的空隙），之后归零。
+
+    ⚠ **不再经过 `safety.slew_target`**（2026-11-18）：它的加速度限幅 + 制动距离
+    分支会在匀速拖动时让参考恒定落后主臂 `v²/(2a)`（J1 在 2 rad/s 下 0.137 rad）。
+    现在只保留**每拍硬限速** `speed_limit·dt`（与固件 `s_jf_vel_max` 同值）：正常手拖
+    速度低于该上限 ⇒ 参考**逐拍原样通过**；超过上限时才被限住（固件 `slew_linear`
+    还会再限一次，两级串联、谁小谁说了算）。
 
     ## ⚠⚠ 执行器是 `arm.joint_follow`（`CMD_JOINT_FOLLOW 0x08`，**伺服环在固件里**）
 
@@ -454,13 +712,50 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
     `move_js` 的 K/B 是**固件出厂参数，没有随帧通道**；唯一能改的办法是写固件参数，
     而那条路已证伪（动态跟随断轴 + 连带改坏 `movej`）。⇒ **要 server 的手感就得换执行器。**
 
-    ⚠ 节拍当前是 **150 Hz**（`DEFAULT_HZ`）。S4 起每拍只 1 次往返 ⇒ **硬件上能到 ~300 Hz**；
-    150 是**主动选的保守值**，不是上限 —— 见 `DEFAULT_HZ` 的注释。
+    ⚠ 节拍当前是 **250 Hz**（`DEFAULT_HZ`）。S4 起每拍只 1 次往返 ⇒ **硬件上能到 ~300 Hz**；
+    250 是**主动选的保守值**，不是上限 —— 见 `DEFAULT_HZ` 的注释。
+
+    `on_tick(t, q_cmd, dq_cmd, q_meas, dq_meas)` 是可选的**诊断回调**（CSV 记录用），
+    每拍调用一次；它**不参与控制律**，抛错只记日志。
+
+    ## 指令重建低通（2026-11-18 实测后加入）
+
+    主臂有效帧率 ≈98.5 Hz，从臂 250 Hz 消费 ⇒ 保持后的指令是阶梯（J4/J6/J7 单拍
+    可达 50–64 mrad），实测在 30–150 Hz 产生的能量会激起从臂末端抖动。`filter_mode`
+    在**每拍硬限速之前**对保持后的目标做二阶 Butterworth 低通（`dq` 同截止频率）：
+
+        lp20     默认：20 Hz 全轴二阶；2 Hz 幅值 1.000、延迟约 11 ms，98.5 Hz 衰减 0.8%
+        lp25     25 Hz 全轴二阶：延迟约 9 ms，98.5 Hz 衰减 1.3%
+        hybrid   J1–J4 用 lp20；J5–J7 用 One-Euro 自适应低通（可选实验）
+        off      关闭（只用于 A/B 对照）
+
+    可用环境变量 `LITEARM_CMD_FILTER=lp20|lp25|hybrid|off` 选择，不必改代码。
+
+    `catchup_speed`：对齐后的起步追赶限速（默认 `CATCHUP_SPEED`=0.5 rad/s）。
+    主臂在对齐期间移动过、导致从臂落后时，先用这个速度追到 `CATCHUP_TOL`（0.02 rad），
+    再切回正常 `speed_limit`；`None` 关闭。
     """
     try:
         sp = list(speed_limit or DEFAULT_SPEED_LIMIT)
-        ac = list(accel_limit or DEFAULT_ACCEL_LIMIT)
         dt_nom = 1.0 / max(hz, 1.0)
+        kind, fc, _fname = _filter_spec(filter_mode)
+        if kind != "off" and fc >= 0.45 * max(hz, 1.0):
+            log.warning("指令低通 %.1f Hz 对 %.0f Hz 环路太高 —— 按 off 处理", fc, hz)
+            kind = "off"
+        lp_q = lp_dq = None
+        if kind == "lp":
+            lp_q = _LowPass2(fc, max(hz, 1.0))
+            lp_dq = _LowPass2(fc, max(hz, 1.0))
+        elif kind == "hybrid":
+            oe = _oe_params()
+            j5_lp = _j5_lp_hz()
+            if j5_lp and j5_lp >= 0.45 * max(hz, 1.0):
+                log.warning("J5 追加低通 %.1f Hz 对 %.0f Hz 环路太高 —— 忽略",
+                            j5_lp, hz)
+                j5_lp = 0.0
+            j5_only = _j5_lp_only()
+            lp_q = _HybridFilter(fc, max(hz, 1.0), oe, j5_lp or None, j5_only)
+            lp_dq = _HybridFilter(fc, max(hz, 1.0), oe, j5_lp or None, j5_only)
         kp = [float(x) for x in (K if K is not None else SETUP_K)]
         kd = [float(x) for x in (B if B is not None else SETUP_B)]
 
@@ -483,7 +778,21 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         # ── start：指令/目标都初始化成【当前实测】──
         q_cmd = _q_meas(arm)
         dq_cmd = [0.0] * N_JOINTS
-        q_target = list(q_cmd)
+        q_raw_target = list(q_cmd)                    # 保持后的主臂目标（未滤波）
+        dq_raw_target = None                          # 主臂速度前馈（有新帧才更新）
+        q_target = list(q_raw_target)
+        dq_target = None
+        last_target_t = time.monotonic()
+        # 起步追赶（对齐期间主臂可能已移动 ⇒ 先低速追齐，别按正常限速甩过去）
+        catching_up = catchup_speed is not None and catchup_speed > 0.0
+        catchup_t0 = time.monotonic()
+        catchup_warned = False
+        q_meas_last = list(q_cmd)
+        # ⚠⚠ 追赶判据必须等**真正收到过一帧主臂目标**才允许退出。
+        #   否则首拍 `provider()` 返回 `None` ⇒ `q_raw_target` 还是从臂自己的位姿
+        #   ⇒ 误差 0 ⇒ 保护在首拍就放掉。真机踩过（`rec-20261118-200745`）：对齐因
+        #   「5 s 没收到主臂帧」被跳过，首帧晚到 1 s，J2 按 3.4 rad/s 甩了 0.907 rad。
+        have_target = False
 
         base = time.monotonic()
         next_tick = base + dt_nom
@@ -491,7 +800,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
         _prev_fw = None
         # 节拍统计 —— **纯观测，不进控制律**。用来回答"这个 hz 填得住吗"：
         # `dt_nom` 必须贴近真实周期，而真实周期只有跑起来才知道（Python 那圈还有
-        # slew / 钳位 / 状态监视的开销，光按 CDC 单次往返算会高估）。
+        # 钳位 / 状态监视的开销，光按 CDC 单次往返算会高估）。
         _ticks = 0
         _work_s = 0.0
         # 逐轴跟踪误差极值：`q_cmd − q_meas` 的最大值（滞后）与最小值（**过冲**）。
@@ -508,17 +817,66 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
 
             try:
                 got = target_provider()
+                if got is not None:
+                    q_raw_target, dq_raw_target = _split_target(got)
+                    last_target_t = time.monotonic()
+                    have_target = True
             except Exception:                        # noqa: BLE001 - 照搬：先持位再上抛
                 log.exception("target_provider 异常，受控接管")
                 hold_at_current(arm)
                 return False
-            if got is not None:
-                if len(got) != N_JOINTS:
-                    raise ValueError(f"目标必须是 {N_JOINTS} 元素，收到 {len(got)}")
-                q_target = [float(v) for v in got]
+            # 主臂帧的固有间隔（100 Hz 状态 / 200 Hz 发布）远小于 50 ms ⇒ 速度前馈
+            # 在帧间保持；真正断流时归零并交由 watchdog 结束遥操。
+            if time.monotonic() - last_target_t > 0.05:
+                dq_raw_target = None
 
-            # 参考生成：**逐字照抄 joint_follow**（梯形速度曲线 + 制动距离）
-            q_cmd, dq_cmd = slew_target(q_target, q_cmd, dq_cmd, sp, ac, dt_nom)
+            # 指令重建：滤波的是**保持后的原始目标**（每拍都滤），不是上一拍滤波输出。
+            q_target = list(q_raw_target)
+            dq_target = None if dq_raw_target is None else list(dq_raw_target)
+            speed = ([abs(v) for v in dq_raw_target]
+                     if dq_raw_target is not None else [0.0] * N_JOINTS)
+            if lp_q is not None:
+                q_target = lp_q.process(q_target, speed)
+                if dq_target is not None:
+                    dq_target = lp_dq.process(dq_target, speed)
+
+            # 起步追赶：用**未滤波**的目标与实测比较，进入容差后立刻切回正常限速。
+            # 没收到过主臂目标之前一律不判 —— 那时 `q_raw_target` 只是从臂自己的位姿，
+            # 拿它当"误差 0"会把保护提前放掉（见上面 `have_target` 的注释）。
+            if catching_up and have_target:
+                err = max(abs(a - b) for a, b in zip(q_raw_target, q_meas_last))
+                if err <= CATCHUP_TOL:
+                    if time.monotonic() - catchup_t0 > 0.2:
+                        log.info("✓ 起步追赶完成：最大误差 %.3f rad（耗时 %.1f s）",
+                                 err, time.monotonic() - catchup_t0)
+                    catching_up = False
+                elif (not catchup_warned
+                      and time.monotonic() - catchup_t0 > CATCHUP_WARN_SECONDS):
+                    catchup_warned = True
+                    log.warning(
+                        "⚠ 起步追赶超过 %.0f s 仍未追齐（当前最大误差 %.3f rad）—— "
+                        "请把主臂带回或停下；从臂仍按 %.2f rad/s 追赶",
+                        CATCHUP_WARN_SECONDS, err, float(catchup_speed))
+
+            # 参考生成：**直通（或滤波后直通）+ 每拍硬限速**（无加速度限幅 / 制动距离）
+            prev_q_cmd = q_cmd
+            q_cmd = list(q_target)
+            dq_cmd = [0.0] * N_JOINTS
+            for i in range(N_JOINTS):
+                v_limit = max(1e-4, sp[i])
+                if catching_up:
+                    v_limit = min(v_limit, float(catchup_speed))
+                step = q_target[i] - prev_q_cmd[i]
+                max_step = v_limit * dt_nom
+                if abs(step) > max_step:
+                    # 超过速度上限：本拍按上限推进，速度前馈取上限本身
+                    q_cmd[i] = prev_q_cmd[i] + math.copysign(max_step, step)
+                    dq_cmd[i] = math.copysign(v_limit, step)
+                elif dq_target is not None:
+                    dq_cmd[i] = max(-v_limit, min(v_limit, dq_target[i]))
+                else:
+                    # 没有主臂速度：用本拍实际推进量反推（参考生成器自己的输出）
+                    dq_cmd[i] = step / dt_nom
 
             try:
                 _send_joint_follow(arm, q_cmd, dq_cmd, kp, kd, wall)
@@ -536,6 +894,8 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             #    这一段让故障**发生的那一拍**就留下 `flags`/`joint_fault`/`err` 与跟踪误差。
             _snap = arm.get_state(refresh=False).value
             if _snap is not None and hasattr(_snap, "joints"):
+                if len(_snap.q) == N_JOINTS:
+                    q_meas_last = list(_snap.q)
                 for _i in range(min(N_JOINTS, len(_snap.q))):
                     _d = q_cmd[_i] - float(_snap.q[_i])
                     if _d > _err_hi[_i]:
@@ -564,6 +924,15 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
                         [round(v, 3) for v in _snap.q])
                     _prev_fw = _cur
 
+            if on_tick is not None:
+                try:
+                    q_m = list(_snap.q) if _snap is not None else []
+                    dq_m = list(_snap.dq) if _snap is not None else []
+                    if len(q_m) == N_JOINTS and len(dq_m) == N_JOINTS:
+                        on_tick(time.time(), list(q_cmd), list(dq_cmd), q_m, dq_m)
+                except Exception:                    # noqa: BLE001 - 诊断不参与控制
+                    log.exception("on_tick 诊断回调异常（不影响跟随）")
+
             # 单拍**净**耗时（算到 sleep 之前 ⇒ 不含主动等待的那段）
             _work_s += time.monotonic() - _t_work0
             _ticks += 1
@@ -586,7 +955,7 @@ def follow(arm, target_provider: Callable[[], Optional[Sequence[float]]],
             if _hz < hz * 0.9:
                 log.warning(
                     "⚠ 实测节拍 %.1f Hz 明显低于设定 %.0f Hz —— 说明 `dt_nom` 与真实周期"
-                    "不符，`slew_target` 的每拍推进量会偏小（跟随变慢）。"
+                    "不符，每拍硬限速的上限 `speed_limit·dt_nom` 会偏小（主臂高速时跟不动）。"
                     "把 `DEFAULT_HZ` 调到 ≈ %.0f 或更低。",
                     _hz, hz, _hz)
             # 逐轴过冲/滞后（过冲阈值 2 mrad —— 低于它算正常跟踪噪声，不报）

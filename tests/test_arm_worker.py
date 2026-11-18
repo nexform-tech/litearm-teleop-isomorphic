@@ -183,17 +183,14 @@ def test_snapshot_role_is_undetermined_until_teleop_starts():
     assert w.snapshot().role == ROLE_SLAVE
 
 
-def test_master_pub_is_resident_but_rebuilt_when_params_change(monkeypatch):
-    """⚠⚠ 主臂的发布端**建一次、活一个进程**（跨遥操会话不重建），
-    但 `arm_id` / 端口是**遥操参数** ⇒ 它们变了必须重建。
+def test_master_pub_is_reused_within_a_session_and_rebuilt_on_param_change(monkeypatch):
+    """端口/arm_id 是**遥操参数** ⇒ 变了必须重建，并把旧的关掉。
 
-    ⚠ 为什么必须常驻：每轮遥操拆了重建有**两个**实测过的后果 ——
-    ① 停下时没人关 ⇒ 端口不释放 ⇒ 第二次「启动」报 `Address already in use`
-    （表现：**只能启动一次**）；② 就算补上关闭，同端口拆了重建会让匹配
-    **间歇性**建立不起来（实测 12 轮里 5 轮 `matching=False`）。
+    ⚠ 端点现在是**每会话**建/关（见 `_ensure_pub` 的 docstring 与
+    下一条 `test_ending_teleop_releases_the_master_port`）；本用例只钉住
+    "同一会话里不该反复建"与"参数变了必须换"。
 
-    判别力：改回"每轮新建"⇒ 前两条断言红；去掉 `_pub_meta` 比较 ⇒
-    最后那条「换了 arm_id 还复用旧端点」的断言红。
+    判别力：去掉 `_pub_meta` 比较 ⇒ 最后那条「换了 arm_id 还复用旧端点」的断言红。
     """
     made = []
 
@@ -224,6 +221,45 @@ def test_master_pub_is_resident_but_rebuilt_when_params_change(monkeypatch):
 
     w._close_pub()
     assert c.closed
+
+
+def test_ending_teleop_releases_the_master_port(monkeypatch):
+    """⚠⚠ 结束遥操必须**关掉监听端**，把端口还回去。
+
+    真机场景（2026-11-18）：两个窗口想对调主从角色 —— A 原来是主臂，占着 17445；
+    B 要改成主臂。A 只点「结束遥操」时旧实现**不关**监听端 ⇒ B 启动时报
+    `Can not create a new TCP listener ... 地址已在使用` ⇒ 只能断开 A 的臂
+    （`_teardown` 才会 `_close_pub`）再重连。
+
+    判别力：把 `_run_teleop` finally 里那句 `_close_pub()` 删掉，本用例会红。
+    """
+    class _FakePub:
+        matching = False
+
+        def __init__(self):
+            self.closed = False
+
+        def put(self, _b):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    w = ArmWorker()
+    pub = _FakePub()
+
+    def _fake_ensure(_p):
+        w._pub, w._pub_meta = pub, ("litearm/v4/armA/teleop", 17447)
+        return pub
+
+    monkeypatch.setattr(w, "_ensure_pub", _fake_ensure)
+    # 会话：拿到监听端就立刻结束（模拟用户点「结束遥操」）
+    monkeypatch.setattr(w, "_run_master", lambda p: w._ensure_pub(p))
+    w._params = TeleopParams(ROLE_MASTER, arm_id="armA", jport=17447)
+    w._teleop_want = True
+    w._run_teleop()
+    assert pub.closed, "结束遥操没关监听端 ⇒ 端口一直被占着"
+    assert w._pub is None, "关掉之后不能再拿着引用"
 
 
 class _TimeShim:
@@ -338,6 +374,87 @@ def test_master_loop_reports_a_publish_rate():
     finally:
         w._teleop_want = False
         w._close_pub()
+
+
+def _run_master_with_fake_arm(monkeypatch, st_factory, seconds=3.0):
+    """跑一次 `_run_master`，返回 (耗时, 日志, 发出的帧数)。
+
+    ⚠ 不建真 zenoh：把 `_ensure_pub` 换成一个只数数的假发布端。判据只关心
+    "主臂失能/断流后循环会不会自己退出"，与链路无关。
+    """
+    logs = []
+
+    class _Pub:
+        def __init__(self):
+            self.n = 0
+
+        def put(self, _payload):
+            self.n += 1
+
+    class _Arm:
+        def zero_g_start(self):
+            pass
+
+        def zero_g_stop(self):
+            pass
+
+        def get_state(self, refresh=False):
+            class _R:
+                value = st_factory()
+
+            return _R()
+
+    w = ArmWorker(on_log=logs.append)
+    w._arm = _Arm()
+    pub = _Pub()
+    w._ensure_pub = lambda _p: pub
+    p = TeleopParams(ROLE_MASTER, jport=17447)
+    w._teleop_want = True
+    t0 = time.monotonic()
+    w._run_master(p)
+    return time.monotonic() - t0, logs, pub.n
+
+
+def test_master_loop_ends_when_master_arm_loses_enable():
+    """⛔ 主臂失能/故障 ⇒ 主臂侧**立即结束遥操**（不再发帧）。
+
+    场景：主臂掉电/急停后臂软掉。旧实现按缓存 q 继续发 —— 从臂跟着下坠的臂走，
+    重新上电还会朝跳回去的 q 甩过去。停流后从臂由 200 ms 看门狗持位。
+    判别力：去掉 `_run_master` 里的失能判据时，本用例会跑满 `_teleop_want`
+    （不会自己退出）而失败。
+    """
+    ticks = {"n": 0}
+
+    def _st():
+        ticks["n"] += 1
+        s = _FakeState([0.0] * 7)
+        s.seq = ticks["n"]
+        s.enabled = ticks["n"] <= 20          # 0.1 s 后"掉电"
+        s.faulted = not s.enabled
+        s.flags = 0x0240 if s.enabled else 0x0185
+        s.joint_fault = 0 if s.enabled else 0x007F
+        return s
+
+    elapsed, logs, sent = _run_master_with_fake_arm(None, _st)
+    assert elapsed < 2.5, f"主臂失能后循环没有退出：{elapsed:.2f}s"
+    assert any("结束遥操" in m for m in logs), f"没有说明为什么结束：{logs}"
+    assert sent >= 10, f"失能前应该已经发过帧：{sent}"
+
+
+def test_master_loop_ends_when_status_stream_goes_silent():
+    """主臂 MCU 也掉（USB 断）时 `seq` 不再前进 ⇒ 同样结束遥操。
+
+    ⚠ 这条与 `enabled` 判据是**两回事**：链路死掉时缓存里的 `enabled`
+    永远停在最后一次的真值（True），只看它永远判不出来。
+    """
+    def _st():
+        s = _FakeState([0.0] * 7)
+        s.seq = 7                              # 冻结
+        return s
+
+    elapsed, logs, _sent = _run_master_with_fake_arm(None, _st)
+    assert elapsed < 2.5, f"状态流静默后循环没有退出：{elapsed:.2f}s"
+    assert any("没有新帧" in m for m in logs), f"没有报告断流：{logs}"
 
 
 def test_starting_teleop_requires_params():
@@ -538,6 +655,98 @@ def test_a_successful_maintenance_clears_the_previous_error():
     w.reset_arm()
     _drain_once(w)
     assert w._snap.error == "", f"成功之后该清空，实际 {w._snap.error!r}"
+
+
+# ────────────── 锁存态恢复：使能 → ERR[10,6] → 清错→复位→使能 ──────────────
+
+class _Rejected(Exception):
+    """假 `CommandRejectedError` —— 判锁存只看 `.cmd` / `.code` 两个字段。"""
+
+    def __init__(self, cmd=arm_worker.ENABLE_CMD, code=arm_worker.ENABLE_LATCHED_CODE):
+        super().__init__(f"enable 被固件拒绝: ERR [{cmd:02x},{code}]")
+        self.cmd = cmd
+        self.code = code
+
+
+class _LatchedArm:
+    """真机复现的形态：锁存期间 `enable` 恒拒；`reset` 之后才放行。"""
+
+    def __init__(self, latched=True, recovery_works=True):
+        self.latched = latched
+        self.recovery_works = recovery_works
+        self.calls = []
+
+    def get_state(self, refresh=False):
+        st = type("S", (), {"enabled": not self.latched,
+                            "faulted": self.latched,
+                            "joint_fault": 1 if self.latched else 0,
+                            "fault_detail": "锁存"})()
+        return type("M", (), {"value": st})()
+
+    def enable(self):
+        self.calls.append("enable")
+        if self.latched:
+            raise _Rejected()
+
+    def clear_faults(self):
+        self.calls.append("clear_faults")
+
+    def reset(self):
+        self.calls.append("reset")
+        if self.recovery_works:
+            self.latched = False
+
+
+def test_enable_recovers_from_a_firmware_latch():
+    """⚠⚠ 断整机电源之后 `enable` 恒回 `ERR[10,6]` —— 必须自动走完恢复顺序。
+
+    判别力：把 `_enable_with_recovery` 里的三步删掉，本用例会红。
+    """
+    logs = []
+    w = ArmWorker(on_log=logs.append)
+    w._arm = _LatchedArm()
+    w.enable_arm()
+    _drain_once(w)
+    assert w._arm.calls == ["enable", "clear_faults", "reset", "enable"], w._arm.calls
+    assert any("锁存已解除" in x for x in logs), logs
+    assert w._snap.error == "", "自动恢复成功就不该留错误，实际 " + repr(w._snap.error)
+
+
+def test_enable_does_not_mask_other_failures():
+    """非锁存错误（总线/超时）**原样报错**，不许拿 清错/复位 瞎重试。"""
+    w = ArmWorker()
+    arm = _MaintArm(boom="enable")
+    w._arm = arm
+    w.enable_arm()
+    _drain_once(w)
+    assert w._arm.calls == ["enable"], w._arm.calls
+    assert "使能失败" in w._snap.error and "炸了" in w._snap.error, w._snap.error
+
+
+def test_connect_keeps_the_link_when_enable_fails():
+    """⚠⚠ 连接时的自动使能失败**不得拆连接** —— 否则界面未连接 ⇒ 复位键灰掉 ⇒
+    用户被卡死（2026-11-18 真机就是靠命令行才救回来的）。
+
+    判别力：把这个异常放出去让 `_run` 走 `_teardown`，本用例会红。
+    """
+    logs = []
+    w = ArmWorker(on_log=logs.append)
+    arm = _LatchedArm(recovery_works=False)      # 连自动恢复都救不回来
+    w._arm = arm
+    w._enable_at_connect(arm)                    # 不许抛
+    assert any("连接保持不变" in x for x in logs), logs
+    assert w._snap.error == "", "别写 error —— 它会把安全确认勾选永久摘掉"
+
+
+def test_connect_enable_success_under_the_normal_path():
+    """没锁存的臂：只发一次 ENABLE，日志「已使能」。"""
+    logs = []
+    w = ArmWorker(on_log=logs.append)
+    arm = _LatchedArm(latched=False)
+    w._arm = arm
+    w._enable_at_connect(arm)
+    assert arm.calls == ["enable"], arm.calls
+    assert any("已使能" in x for x in logs), logs
 
 
 def test_maintenance_on_a_missing_arm_says_so():

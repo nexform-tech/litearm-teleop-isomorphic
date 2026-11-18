@@ -114,7 +114,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.page.arm_action.connect(self._arm_action)
 
         self._relock()
+        #: worker 的心跳轮询。**没有它就会出现死结**（2026-11-18 真机）：
+        #: 快照只靠状态帧推送更新，而"连接失败/线程已退出"恰恰**没有状态帧**
+        #: ⇒ 界面永远停在旧快照 ⇒「连接臂」一直是灰的，用户必须先点「断开」
+        #: 才能重连（而口插晚了、第一次打开失败时，这体验尤其莫名其妙）。
+        self._poll = QtCore.QTimer(self)
+        self._poll.setInterval(500)
+        self._poll.timeout.connect(self._poll_worker)
+        self._poll.start()
         self._log("就绪。⚠ 一个 CDC 口只允许一个进程。")
+
+    def _poll_worker(self) -> None:
+        """定期把 worker 的快照捞上来；**线程没了就自动解除连接**。
+
+        ⚠ 判据是 `is_alive()` 而不是快照里的 `connected`：连接失败（口不存在/
+        被占用）时 worker 线程已经收尾，而界面这边可能一个状态帧都没收到。
+        自动解除后「连接臂」立刻可点 —— 不用先点一次「断开」。
+        """
+        w = self.worker
+        if w is None:
+            return
+        self._on_state(w.snapshot())                     # 顺带把速率/载荷等刷新
+        if w.is_alive():
+            return
+        self.worker = None
+        self._last = Snapshot()
+        self.page.apply(self._last, self.s.peer, self.s.jport, self.s.arm_id)
+        self.top.update_from(self._last)
+        self.top.set_connection(False, "未连接")
+        self.top.set_detail("—")
+        self.page.log_badge.set_state("未连接", "outline")
+        self._relock()
+        self._log("⚠ 连接线程已退出（口打不开 / 连接失败 / 异常）—— 已解除连接，"
+                  "确认 USB 与端口后可再点「连接臂」")
 
     def _show_grip_defaults(self) -> None:
         """把 `GripWorker` 的构造默认值显示到夹爪卡的只读格子里（**只是显示**）。"""
@@ -165,6 +197,8 @@ class MainWindow(QtWidgets.QMainWindow):
         save_settings(self.s)
 
     def _connect(self) -> None:
+        if self.worker is not None and not self.worker.is_alive():
+            self.worker = None                           # 线程早退（口打不开等）⇒ 直接重连
         if self.worker is not None:
             self._log("已经连接（先点顶栏的「断开」）")
             return

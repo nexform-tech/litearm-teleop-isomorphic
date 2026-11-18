@@ -1,6 +1,7 @@
 """safety.py —— 纯逻辑层（不 import litearm，不碰硬件）。
 
-⭐ 核心判据：移植的 `slew_target` 与 `pylitearm` 原版**同一组输入逐拍全等**。
+⭐ 核心判据：`slew_target`（当前是**参照实现**，运行路径已改为直通 + 硬限速）
+与 `pylitearm` 原版**同一组输入逐拍全等**。
 这是"照抄而非重写"的唯一硬证据；没有它，"我照抄了"只是自述。
 """
 import math

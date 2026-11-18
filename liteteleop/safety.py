@@ -1,4 +1,4 @@
-"""安全层 —— 纯逻辑：软限位钳位 + 跟随平滑（`slew_target`）。
+"""安全层 —— 纯逻辑：软限位钳位 + 参考平滑的**参照实现**（`slew_target`）。
 
 设计依据 spec §5.1 / §7.1，**逻辑照 litearm-server**（用户裁决「必须严格按照它来写」）。
 
@@ -21,11 +21,16 @@
   状态机**：它的 `active` 由 `TeleopManager.is_running` **派生**，watchdog 超时调
   `request_stop()` 让控制环退出，`active` 自动变假。自造一台状态机是"乱来"。
 
-## 保留的那一条是硬要求
+## `slew_target` 当前**不在运行路径上**（2026-11-18 起）
 
-⚠ `slew_target` **逐字移植自** `pylitearm/src/pylitearm/control/joint_follow.py:45-100`
-（用户在 spec 里裁决过：跟随手感与制动距离**只有**这一个来源，"照抄"才有既有真机
-行为的可预期性；任何"改进"都必须先报用户裁决）。
+⚠ 从臂的参考生成已改为 `servo.follow()` 内的**直通 + 每拍硬限速**：`slew_target` 的
+加速度限幅与「制动距离」分支会在匀速拖动时让参考恒定落后主臂 `v²/(2a)`（J1 在
+2 rad/s 下实测 0.137 rad），而正常手拖速度低于 `speed_limit` ⇒ 直通后这段滞后为 0。
+`servo.py` 不再 import 它。
+
+⚠ 本函数**保留作参照实现与离线对拍**（`tests/test_safety.py` 逐拍对照 pylitearm 原版）。
+若将来要把它接回运行路径，先按 `README.md` 的 Known traps 与真机滞后数据重新评估 ——
+"照抄原版"本身不再是理由。
 """
 from __future__ import annotations
 
@@ -178,6 +183,9 @@ def read_safe_limits(arm, margin: float = DEFAULT_LIMIT_MARGIN) -> Limits:
 
 def slew_target(raw_target, q_cmd, dq_cmd, speed_limit, accel_limit, dt):
     """速度/加速度限制的目标位置平滑（梯形速度曲线）。
+
+    ⛔ **当前无运行期调用点**（`servo.follow` 已改为直通 + 每拍硬限速）——
+    保留作参照实现，见模块 docstring。
 
     ⚠ **逐字移植自 `pylitearm/src/pylitearm/control/joint_follow.py:45-100`**
     （唯一偏离：原版循环上界是模块常量 `N = 7`，这里取 `len(raw_target)`；

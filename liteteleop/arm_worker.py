@@ -24,6 +24,7 @@ GUI 只做两件事：**投命令**、**读快照**。任何 SDK 调用都发生
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -31,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 from . import link, servo, wire
+from .record import from_env as _recorders_from_env
 from .settings import DEFAULT_PEER
 from .wall import JointLimitWall
 from .safety import clamp_to_limits, read_safe_limits
@@ -61,6 +63,30 @@ ALIGN_MOVE_TIMEOUT = 30.0
 
 #: 从臂 watchdog（照搬 `TeleopManager.watchdog_ms` 默认值）。**收到首帧之后才生效。**
 WATCHDOG_MS = 200.0
+
+#: 主臂自身失能/故障持续多少拍就**结束遥操**（200 Hz ⇒ 5 拍 = 25 ms）。
+#: 去抖是为了不被单帧瞬态（USB 抖动/CMODE 切换）误停；真正的掉电/急停
+#: 会让固件在 80–200 ms 内进入 EMERGENCY，远长于这个窗口。
+MASTER_LOST_STOP_TICKS = 5
+
+#: 主臂状态流静默多久就结束遥操（秒）。
+#: ⚠ 与从臂的 `WATCHDOG_MS` 是**两回事**：这里防的是"主臂 MCU 也没了"
+#: （USB 掉线时 `get_state(refresh=False)` 会一直返回最后一帧缓存，`seq` 不再前进），
+#: 那种情况下 `enabled` 位永远停在最后一次的真值，靠它判不出来。
+MASTER_STALE_STOP_SECONDS = 0.5
+
+#: `CMD_ENABLE 0x10` 被固件拒绝时的**锁存码**：0x06 = EMERGENCY 或 `joint_fault` 非 0，
+#: 语义是「须先 RESET」，**重发无用**。恢复顺序（真机验证过）：
+#: `clear_faults()` → `reset()` → `enable()`。
+#: ⚠ 同一个 `0x06` 在运动命令上是「掉线刚性持位锁存 (`drop_hold`)」，两者判据不同
+#: —— 这里只看 ENABLE 这一档（vendored SDK 的 `CommandRejectedError.cmd/.code`）。
+ENABLE_CMD = 0x10
+ENABLE_LATCHED_CODE = 0x06
+
+#: 主臂监听端建好之后，多久还没有订阅者（从臂）匹配上来就告警一次（秒）。
+#: ⚠ 这是给"拆了重建偶尔匹配不上"（实测 12 轮里 5 轮）兜底的**告警**，不是重试：
+#: 真赶上就停一次再启动遥操，会换一个全新的监听端 —— 不用重连臂。
+MATCH_WARN_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -218,6 +244,8 @@ class ArmWorker:
         self._link_n = 0
         self._link_t0 = 0.0
         self._link_hz = 0.0
+        # 诊断记录器（`LITEARM_RECORD_DIR` 未设置时是 None，调用点全部短路）
+        self._rec = _recorders_from_env()
 
     # ────────────────────────── 生命周期 ──────────────────────────
     def start(self) -> None:
@@ -243,6 +271,16 @@ class ArmWorker:
             t.join(timeout=timeout)
             if t.is_alive():
                 self._log("⚠ ArmWorker 未在超时内退出")
+        self._close_recorders()
+
+    def _close_recorders(self) -> None:
+        rec, self._rec = self._rec, None
+        if rec:
+            for r in rec.values():
+                try:
+                    r.close()
+                except Exception:                        # noqa: BLE001 - 收尾不抛
+                    pass
 
     # ────────────────────────── GUI 用的投递口 ──────────────────────────
     def post(self, fn: Callable[[], None]) -> None:
@@ -331,14 +369,71 @@ class ArmWorker:
                 self._log(f"✓ {name}已执行")
         self.post(_do)
 
+    def _enable_at_connect(self, arm) -> None:
+        """连接后的一次性使能。**失败也不拆连接**。
+
+        ⚠⚠ 2026-11-18 真机踩到的死结：臂因断整机电源锁存后，界面「重连」会在
+        连接成功的那一刻自动使能 → 固件回 `ERR[10,6]` → 旧代码把它当致命错误
+        交给 `_teardown` ⇒ 界面回到「未连接」；而「清错/复位」只在**已连接**
+        时才可点 ⇒ 用户被彻底卡死，只剩命令行能救（当天正是这么救的）。
+        所以这里把使能失败的处置降级为**日志 + 停在未使能**，连接保持不动，
+        手动恢复三键（清错/复位/使能）始终可用。
+
+        ⚠ 故意**不写** `snap.error`：它会让 `_relock` 把安全确认勾选永久摘掉，
+          而那正是用户接下来要勾的东西。状态位（flags/joint_fault）已经把
+          "为什么没使能"说清楚了。
+        """
+        try:
+            self._enable_with_recovery(arm)
+            st = arm.get_state(refresh=True).value
+            if st is None or not st.enabled or st.faulted or st.joint_fault:
+                raise RuntimeError(f"起始状态不干净: {st and st.fault_detail}")
+            self._log("已使能")
+        except Exception as e:                           # noqa: BLE001
+            self._log(f"⚠ 使能失败: {e} —— **连接保持不变**，"
+                      f"请点「清错」→「复位」→「使能」")
+
+    def _enable_with_recovery(self, arm) -> None:
+        """使能；遇到固件的**锁存**拒绝就自动 清错 → 复位 → 使能。
+
+        ⚠⚠ 为什么必须有它（2026-11-18 真机踩到）：主臂**断整机电源**之后
+        `joint_fault` 非 0、或从臂整臂掉反馈进 EMERGENCY —— 此时固件对 ENABLE
+        恒回 `ERR[10,6]「锁存, 须先 RESET」`，而界面的「使能」被安全确认勾选门控，
+        故障态下勾选又被 `_relock` 自动摘掉 ⇒ **用户既勾不上、也点不动复位**，
+        只剩"重连"，而重连又会自动使能一次、再被拒 ⇒ 死循环。
+        恢复顺序是固件定死的，照做即可。
+
+        ⚠⚠ 只在**锁存码**上自动恢复；其它错误（未连接/超时/总线不通）原样抛出
+        —— 那些不是"点两下就好"的问题，自动重试只会掩盖真相。
+        ⚠ `reset()` 会让臂**瞬间失能**（固件语义），所以这条路径只在"本来就
+        没使能"的锁存态下走；已使能的臂 `enable()` 不会回这个码。
+        """
+        try:
+            arm.enable()
+            return
+        except Exception as e:                           # noqa: BLE001
+            if (getattr(e, "cmd", None) != ENABLE_CMD
+                    or getattr(e, "code", None) != ENABLE_LATCHED_CODE):
+                raise
+            self._log("⚠ 使能被拒（锁存：EMERGENCY 或 joint_fault 非 0）"
+                      " —— 自动执行「清错 → 复位 → 使能」")
+        arm.clear_faults()
+        arm.reset()
+        arm.enable()
+        self._log("✓ 锁存已解除（清错 → 复位 → 使能）")
+
     def enable_arm(self) -> None:
         """使能全关节。
 
         ⚠ **是一条运动类动作**：臂若正被自重压着（例如刚失能过），使能瞬间会
         "弹"到保持位 —— 所以界面把它与「回零」一起按运动类门控（要勾安全确认）。
         重试策略在 SDK 里（只对固件明说可重试的码重试）。
+
+        ⚠ 卡在**锁存态**（掉电/急停之后）时，固件对 ENABLE 恒回 `ERR[10,6]`，
+        重发无用 —— 这里自动走一次 **清错 → 复位 → 使能**，让"一键使能"真的
+        能救回来。见 `_enable_with_recovery`。
         """
-        self._arm_action("使能", lambda a: a.enable())
+        self._arm_action("使能", lambda a: self._enable_with_recovery(a))
 
     def clear_faults(self) -> None:
         """清故障码（逐轴；**健康轴零触碰**）。
@@ -477,7 +572,7 @@ class ArmWorker:
         self._link_hz = 0.0
 
     def _push(self, st) -> None:
-        """在 **SDK 读线程**上被调用 ⇒ 只写槽，不做别的。"""
+        """在 **SDK 读线程**上被调用 ⇒ 只写槽；诊断记录是可选、纯文件写入。"""
         self._state_tick()
         with self._lock:
             s = self._snap
@@ -494,6 +589,19 @@ class ArmWorker:
             s.flags = st.flags
             s.flag_names = list(st.flag_names)
             s.seq = st.seq
+        if self._rec:
+            try:
+                # tau / tmos 与 q / dq 同帧，列数固定 7 —— 短了补 nan，别让后面的
+                # 身份列整体错位（CSV 错位是静默的，读回时才会发现对不上）。
+                _tau = [float(v) for v in st.tau][:7]
+                _tmos = [float(j.t_mos) for j in st.joints][:7]
+                _tau += [float("nan")] * (7 - len(_tau))
+                _tmos += [float("nan")] * (7 - len(_tmos))
+                self._rec["state"].row(
+                    [*st.q, *st.dq, *_tau, *_tmos, int(st.enabled), int(st.flags),
+                     int(st.joint_fault), int(getattr(st, "seq", -1))])
+            except Exception:                            # noqa: BLE001 - 记录不参与控制
+                pass
         if self._on_state is not None:
             try:
                 self._on_state(self.snapshot())
@@ -529,11 +637,7 @@ class ArmWorker:
             self._log(f"已连接 {self._arm.firmware!r} n={self._arm.n}")
             if self._arm.n != N_JOINTS:
                 raise RuntimeError(f"只支持 {N_JOINTS} 关节整臂，当前 n={self._arm.n}")
-            self._arm.enable()
-            st = self._arm.get_state(refresh=True).value
-            if st is None or not st.enabled or st.faulted or st.joint_fault:
-                raise RuntimeError(f"起始状态不干净: {st and st.fault_detail}")
-            self._log("已使能")
+            self._enable_at_connect(self._arm)
             self.refresh_payload()                       # 读回当前载荷（含出厂默认）
 
             while not self._stop.is_set():
@@ -578,24 +682,34 @@ class ArmWorker:
     # ────────────────────────── zenoh 端点 ──────────────────────────
 
     def _ensure_pub(self, p: TeleopParams):
-        """主臂的发布端：**建一次、活一个进程**（跨遥操会话不重建）。
+        """主臂的发布端：**按会话**建，`_run_teleop` 收尾时 `_close_pub`。
 
-        ⚠⚠ 实测过两个坑，都出在"每轮遥操拆了重建"上：
-        ① 遥操停下时没人关 ⇒ TCP 端口一直被这个对象引用着 ⇒ 第二次「启动」抛
+        ⚠⚠ 历史（2026-09 的实测，仍然成立，别当成"现在已经没这回事"）：
+        ① 遥操停下时**不关** ⇒ TCP 端口一直被这个对象引用着 ⇒ 第二次「启动」抛
            `Can not create a new TCP listener bound to ...: Address already in use`，
-           **而且端口要等进程退出才回来**（表现：**只能启动一次**）；
-        ② 就算补上关闭，**同一端口上拆了重建**会让订阅↔发布的匹配**间歇性**
-           建立不起来（实测 12 轮里 5 轮 `matching=False`）。
-        参考实现也是这个形态：主臂发在**常驻** transport 上。
+           而且端口要等**进程退出**才回来（表现：只能启动一次）；
+        ② **同一端口上拆了重建**会让订阅↔发布的匹配**间歇性**建立不起来
+           （实测 12 轮里 5 轮 `matching=False`）。
 
-        ⚠ 但 `arm_id` / 端口是**遥操参数**（用户随时可改）⇒ 参数变了必须重建。
-        所以比 `_pub_meta` 决定复用还是重建。
+        早先因此把它做成"常驻一个进程"，代价是**端口永远不释放** ⇒ 两个窗口
+        想对调主从角色时，后来那个绑不上 17445，只能断开臂重连（2026-11-18 用户
+        报的就是这个）。现在改成**每会话建/关**：① 用"关"解决，② 用
+        `_run_master` 里的匹配告警兜住 —— 真赶上那 5/12，停一次再启动遥操
+        就能换一个全新的监听端（**不用重连臂**）。
         """
         meta = (p.key, int(p.jport))
         if self._pub is not None and self._pub_meta == meta:
             return self._pub
         self._close_pub()
-        self._pub = link.Listener(p.jport, p.key)
+        try:
+            self._pub = link.Listener(p.jport, p.key)
+        except Exception as e:                           # noqa: BLE001
+            # ⚠ 端口被占时的原始报错长这样（zenoh 原文）：
+            #   `Can not create a new TCP listener bound to tcp/0.0.0.0:17445: 地址已在使用`
+            #   ⇒ 用户只知道"启动失败"。这里补一句"谁占着"的提示。
+            raise RuntimeError(
+                f"主臂监听端口 {p.jport} 建不起来（另一个窗口/进程还占着它？"
+                f"先让那边点「结束遥操」再试）：{e}") from e
         self._pub_meta = meta
         return self._pub
 
@@ -646,8 +760,12 @@ class ArmWorker:
         finally:
             self._teleop_want = False
             self._link_reset()                           # 停了就该显示 `—`，不留旧数
-            # ⚠ 从臂的订阅是**每会话**建的 ⇒ 停遥操就得关（否则连接/端口不释放）
+            # ⚠ 两端的 zenoh 端点都是**每会话**建的 ⇒ 停遥操就得关：
+            #   · 从臂的 Connector 不 bind，关它是为了别留一条连出去的连接；
+            #   · 主臂的 Listener **bind** 着端口 —— 不关就永远占着 17445，
+            #     另一边的窗口想当主臂只能先断开臂再连（2026-11-18 用户报的坑）。
             self._close_sub()
+            self._close_pub()
             try:
                 servo.hold_at_current(self._arm)         # 受控接管
             except Exception as e:                       # noqa: BLE001
@@ -664,12 +782,67 @@ class ArmWorker:
         time.sleep(0.5)                                  # 等过 engage 段
         dt = 1.0 / PUB_HZ
         nxt = time.monotonic() + dt
+        lost_ticks = 0
+        last_seq = None
+        last_seq_t = time.monotonic()
+        seq_seen = False
+        stop_reason = None
+        unmatched_since = None
+        match_warned = False
         while self._teleop_want and not self._stop.is_set():
             st = arm.get_state(refresh=False).value
+            now = time.monotonic()
+            # ── 匹配告警（不是重试）：绑上了端口但一直没有订阅者 ──
+            # ⚠ "拆了重建偶尔匹配不上"是测过的既有现象；现在监听端每会话重建
+            #   ⇒ 告警里给出**不用重连臂**的出路（停一次再启动）。
+            if getattr(pub, "matching", True):
+                unmatched_since = None
+                match_warned = False
+            elif unmatched_since is None:
+                unmatched_since = now
+            elif not match_warned and now - unmatched_since > MATCH_WARN_SECONDS:
+                match_warned = True
+                self._log(f"⚠ 端口 {p.jport} 已监听，但 {MATCH_WARN_SECONDS:.0f} s 内没有"
+                          f"从臂匹配上来 —— 若从臂已在跑，点一次「结束遥操」再「启动遥操」"
+                          f"重建监听端（不用重连臂）")
             if st is not None:
-                pub.put(wire.encode_teleop(st.q, st.dq, time.monotonic()))
+                # ── 主臂自身失能/故障 ⇒ **立即结束遥操**（不再发帧）──
+                # 场景（2026-11-18 真机）：主臂掉电/急停后臂软掉，旧实现仍按缓存
+                # 的 q 继续发帧 —— 从臂跟着一条下坠的臂走；重新上电后主臂 q 跳回，
+                # 从臂再朝它快速甩过去。停流后，从臂的 200 ms 看门狗会结束跟随
+                # 并 `hold_at_current` 持位。
+                # ⚠ `enabled` 是 flags bit9（固件 1.5.0 起上报）；旧固件恒 False，
+                #   用旧固件时本判据会立刻结束遥操 —— 这是刻意的：来源不可信就不跑。
+                seq = getattr(st, "seq", None)
+                if seq is not None:
+                    seq_seen = True
+                    if seq != last_seq:
+                        last_seq = seq
+                        last_seq_t = now
+                if not (getattr(st, "enabled", True) and
+                        not getattr(st, "faulted", False)):
+                    lost_ticks += 1
+                    if lost_ticks >= MASTER_LOST_STOP_TICKS:
+                        stop_reason = (f"主臂失能/故障（flags=0x{getattr(st, 'flags', 0):04x}"
+                                       f" joint_fault=0x{getattr(st, 'joint_fault', 0):04x}）")
+                        break
+                else:
+                    lost_ticks = 0
+            # ── 状态流静默（主臂 MCU 也没了）：缓存里的 enabled 永远是最后一次的真值 ──
+            # ⚠ 只有 SDK 真提供了 `seq`（现状如此）才判；没有 `seq` 的假臂/旧 SDK
+            #   不享受这条，也就不会因为"看不见帧序"被误停。
+            if seq_seen and now - last_seq_t > MASTER_STALE_STOP_SECONDS:
+                stop_reason = (f"主臂状态流 {MASTER_STALE_STOP_SECONDS:.1f} s 没有新帧")
+                break
+            if st is not None:
+                pub.put(wire.encode_teleop(st.q, st.dq, now))
                 self._frames_sent += 1
                 self._link_tick()                        # 统计**发布**速率
+                if self._rec:
+                    try:
+                        self._rec["pub"].row([*st.q, *st.dq])
+                    except Exception:                    # noqa: BLE001 - 记录不参与控制
+                        pass
             self._drain(0.0)                             # 顺手处理 GUI 投来的命令
             r = nxt - time.monotonic()
             if r > 0:
@@ -677,20 +850,23 @@ class ArmWorker:
             nxt += dt
             if nxt < time.monotonic():
                 nxt = time.monotonic() + dt
+        if stop_reason is not None:
+            self._log(f"⛔ {stop_reason} —— 结束遥操（从臂将由 {WATCHDOG_MS:.0f} ms "
+                      f"看门狗持位）")
         try:
             arm.zero_g_stop()
         except Exception as e:                           # noqa: BLE001
             self._log(f"⚠ zero_g_stop 失败: {e}")
 
     def _run_slave(self, p: TeleopParams) -> None:
-        """从臂：订阅 → 钳位 → `slew_target` → `joint_follow`（0x08）（spec §5）。"""
+        """从臂：订阅 → 钳位 → 直通 + 每拍硬限速 → `joint_follow`（0x08）（spec §5）。"""
         arm = self._arm
         self._limits = read_safe_limits(arm)             # 读不到会抛 ⇒ 拒启动
         self._log(f"软限位 {list(zip(self._limits.lo, self._limits.hi))}")
         self._link_reset()                               # 新会话 ⇒ 速率从 0 起算
         self._open_sub(p)
         # ── 对齐（照搬 `_do_align`）：等首帧 → 钳位 → **低速 movej** ──
-        # ⚠ 少了这一步，从臂会由 `slew_target` 直接拉过去，速度上限是 `speed_limit`
+        # ⚠ 少了这一步，从臂会由直通路径直接拉过去，速度上限是 `speed_limit`
         #    （J1 到 2.8 rad/s），比 `align_speed=0.15` 快近 20 倍 —— 那是**大幅甩动**。
         #
         self._log("等待主臂首帧并对齐 …")
@@ -727,6 +903,9 @@ class ArmWorker:
                   f"（⚠ 不是 yaml 默认档 —— 2026-09-29 起有意整体放大以压过冲，"
                   f"见 servo.SETUP_K 注释；随 0x08 帧每拍下发）")
         self._log(f"speed_limit={sl}（照抄 litearm-server 配置）  hz={SLAVE_HZ:.0f}")
+        self._log(f"指令重建低通: {servo.filter_mode_label()}")
+        self._log(f"起步追赶: ≤{servo.CATCHUP_SPEED:g} rad/s，误差 ≤{servo.CATCHUP_TOL:g} rad "
+                  f"后切正常限速")
         self._log(f"每拍 1 次下发（CMD_JOINT_FOLLOW；G + 限位墙由**固件**算）"
                   f"⇒ 节拍 {SLAVE_HZ:.0f} Hz（收尾会打印实测值）")
 
@@ -739,7 +918,18 @@ class ArmWorker:
             except Exception:                            # noqa: BLE001
                 return None
             clamped, _sat = clamp_to_limits(frame["q"], self._limits)
-            return clamped
+            # 主臂实测速度随帧转发，作为从臂的速度前馈（不再由 PC 的 slew 生成）。
+            # 坏值丢弃即可：位置仍安全，follow() 会回落到差分。
+            dq = list(frame["dq"])
+            if not all(math.isfinite(v) for v in dq):
+                dq = [0.0] * N_JOINTS
+            if self._rec:
+                try:
+                    self._rec["rx"].row(
+                        [float(frame["timestamp"]), *frame["q"], *frame["dq"]])
+                except Exception:                        # noqa: BLE001 - 记录不参与控制
+                    pass
+            return clamped, dq
 
         def should_stop() -> bool:
             if not self._teleop_want or self._stop.is_set():
@@ -753,8 +943,15 @@ class ArmWorker:
             self._drain(0.0)
             return False
 
+        on_tick = None
+        if self._rec:
+            rec_loop = self._rec["loop"]
+
+            def on_tick(t, q_cmd, dq_cmd, q_meas, dq_meas):   # noqa: E306 - 闭包
+                rec_loop.row([*q_cmd, *dq_cmd, *q_meas, *dq_meas], t=t)
+
         servo.follow(arm, provider, should_stop=should_stop, hz=SLAVE_HZ, wall=wall,
-                     speed_limit=sl)
+                     speed_limit=sl, on_tick=on_tick)
 
     def _peer_host(self) -> str:
         # 保留给测试/调试：真源已挪到 `TeleopParams.peer_host()`
