@@ -28,9 +28,9 @@ from .settings import DEFAULT_PEER
 log = logging.getLogger("liteteleop.grip")
 
 __all__ = ["ROLE_MASTER", "ROLE_SLAVE", "GRIP_RATE_HZ", "GRIP_WATCHDOG_MS",
-           "POLL_S", "DEFAULT_PEER", "TORQUE_LIMIT_NM", "VENDORED_SDK_DIR",
-           "GripTeleopParams", "GripNotReady", "GripSdkUnavailable",
-           "GripSnapshot", "GripWorker", "import_grip_sdk",
+           "POLL_S", "DEFAULT_PEER", "TORQUE_LIMIT_NM",
+           "VENDORED_SDK_DIR", "GripTeleopParams", "GripNotReady",
+           "GripSdkUnavailable", "GripSnapshot", "GripWorker", "import_grip_sdk",
            "factory_calibration_path", "check_ready", "travel_mm_of"]
 
 ROLE_MASTER = "master"
@@ -45,11 +45,14 @@ GRIP_WATCHDOG_MS = 200.0
 #: 界面快照的刷新周期（秒）。SDK 自己按 `rate_hz` 跑环，这里只是**读**它的状态。
 POLL_S = 0.1
 
-#: 从端夹爪的**力矩上限**（Nm）默认值。超过就卸力（SDK 侧 `torque_limit_nm`）。
+#: 从端夹爪的**力矩上限**（Nm）。超过即**限力保持**：以这个力矩继续压住工件
+#: （SDK 侧 `torque_limit_nm` + `torque_guard_action="hold"`）。
+#: ⚠ 默认 **0 = 关闭判定**：从端是纯位置跟随，夹持力由位置误差决定，
+#: 不会在抓取瞬间切到纯力矩而顿一下。需要保护脆的打印件时再打开。
 #: ⚠ 这个值取决于**打印件有多脆**，是 per-machine 的，不是型号常量：
-#: 先用 1.0 起步，第一次跑起来看界面上的 `torque_nm` 再定。
+#: 打开时先用 1.0 起步，看界面上的 `torque_nm` 峰值再定。
 #: ⚠ 与跟随增益强相关 —— `kp` 是 Nm/rad，所以 1.0 Nm 只对应一点点位置误差。
-TORQUE_LIMIT_NM = 1.0
+TORQUE_LIMIT_NM = 0.0
 
 #: 主从 `travel_mm` 偏差超过这个比例就告警（spec §7.3）。
 _MISMATCH_TOL = 0.15
@@ -230,8 +233,8 @@ class GripSnapshot:
     fault: str = ""                     # 夹爪自己报的 error_code != 1（§8 rule 10）
     # ── 从端力矩保护（SDK 的 `torque_limit_nm`，见 issue #20）──
     torque_nm: float = 0.0              # 从端**自己**的力矩读数（= 电流信号）
-    over_torque: bool = False           # 已超限卸力（锁存中）
-    torque_trips: int = 0               # 本次会话卸力次数
+    over_torque: bool = False           # 已超限，限力保持中（锁存）
+    torque_trips: int = 0               # 本次会话触发次数
     mismatch: str = ""                  # 主从标定不一致告警（§7.3），空 = 无
     error: str = ""
 
@@ -453,7 +456,9 @@ class GripWorker:
             port=p.gport, grip_id=p.grip_id,
             kp=self.kp, kd=self.kd, align=p.align,
             watchdog_s=self.watchdog_ms / 1000.0, rate_hz=self.rate_hz,
-            torque_limit_nm=p.torque_limit_nm)
+            torque_limit_nm=p.torque_limit_nm,
+            # 过力矩不再卸力，而是限力保持 —— 这正是「夹住不掉」的修复。
+            torque_guard_action="hold")
         self._session = True
         self._prev_over_torque = False
         if p.role == ROLE_MASTER:
@@ -461,7 +466,7 @@ class GripWorker:
                       f" · {self.rate_hz:.0f} Hz")
         else:
             limit = ("关闭" if p.torque_limit_nm == 0.0
-                     else f"{p.torque_limit_nm:.2f} Nm")
+                     else f"{p.torque_limit_nm:.2f} Nm（限力保持）")
             self._log(f"从端夹爪：订阅 {p.topic} @ {p.peer_host()}:{p.gport} "
                       f"· align={p.align} · watchdog={self.watchdog_ms:.0f} ms "
                       f"· 力矩上限 {limit}")
@@ -511,8 +516,8 @@ class GripWorker:
         if s.over_torque and not self._prev_over_torque:
             limit = 0.0 if p is None else p.torque_limit_nm
             self._log(f"⚠ 从端夹爪力矩超限（{s.torque_nm:+.2f} Nm 对上限 "
-                      f"{limit:.2f} Nm）—— **就地卸力**，夹爪不再顶住；"
-                      "主端张开一点即自动恢复跟随")
+                      f"{limit:.2f} Nm）—— **限力保持**：以 {limit:.2f} Nm 继续"
+                      "压住工件（夹住不掉）；主端张开一点即自动恢复跟随")
         self._prev_over_torque = s.over_torque
         with self._lock:
             s.watchdog_trips = self._watchdog_trips

@@ -42,9 +42,10 @@ class Settings:
     gpeer: str = DEFAULT_PEER            # 从端填：主端 IP（**独立字段**，回环）
     gport: int = 17448                   # 夹爪 zenoh 端口（独立 session ⇒ 必须独立端口）
     grip_id: str = "gripA"               # 决定夹爪 topic
-    # 从端夹爪的力矩上限（Nm）：超过就卸力，护住打印件。0 = 关闭该保护。
-    # ⚠ 这是 **per-machine 的值** —— 取决于打印件有多脆，不是夹爪型号。
-    grip_torque_limit_nm: float = 1.0
+    # 从端夹爪的力矩上限（Nm）：超过即限力保持，护住打印件。默认 0 = 关闭判定
+    # （纯位置跟随）。⚠ 这是 **per-machine 的值** —— 取决于打印件有多脆，
+    # 不是夹爪型号；要开保护时先看正常夹取的力矩峰值再定。
+    grip_torque_limit_nm: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
 
 

@@ -767,6 +767,24 @@ def test_grip_panel_defaults_to_disabled_and_independent(qapp):
     w.close()
 
 
+def test_grip_over_torque_reads_hold_not_release(qapp):
+    """从端超限渲染「限力保持」——**不是**「已卸力」。
+
+    判别力：沿用旧的零刚度文案（"已卸力"）会误导操作者以为钳口不顶料，
+    实际现在是以力矩限值压住工件（夹住不掉）。
+    """
+    from liteteleop.grip_worker import GripSnapshot
+
+    w = MainWindow(Settings())
+    s = GripSnapshot(role="slave", connected=True, over_torque=True,
+                     torque_nm=1.42)
+    w._on_grip_state(s)
+    txt = w.page.lab_grip.text()
+    assert "限力保持" in txt, txt
+    assert "已卸力" not in txt, "旧文案会误导：现在是以限力矩继续压住工件"
+    w.close()
+
+
 def test_grip_button_is_clickable_from_construction(qapp):
     """⚠⚠ 死锁回归：夹爪按钮**不能**初始禁用。
 
